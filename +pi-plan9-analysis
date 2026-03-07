@@ -796,8 +796,8 @@ Flush handler must cancel both pending_output and pending_event on disconnect.
        src/fs.h + src/fs.c + src/fstest.c: 30 unit + 10 live tests — all pass.
   [12] Session persistence — /session/id, /session/new, /session/load, /session/save
        agentsessload() + /session/save + /session/load wired; 50 tests — all pass.  ✓ DONE
-  [13] Anthropic Messages request builder + SSE event parser (add alongside OAI)
-       Test: one-shot POST with claude-sonnet-4.5, stream text to stdout
+  [13] Anthropic Messages request builder + SSE event parser (add alongside OAI)  ✓ DONE
+       src/ant.h + src/ant.c + src/anttest.c: 7 req-builder + 2 fixture + 6 live tests (39 total) — all pass.  ✓ DONE
   [14] Agent loop extended: Anthropic format + thinking blocks
        Test: full tool loop with claude-sonnet-4.5; thinking events in /event
   [15] 9ai-acme — fresh acme integration script
