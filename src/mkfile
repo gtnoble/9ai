@@ -9,6 +9,7 @@ OFILES=\
 	json.$O\
 	oauth.$O\
 	models.$O\
+	sse.$O\
 
 HFILES=\
 	9ai.h\
@@ -16,6 +17,7 @@ HFILES=\
 	json.h\
 	oauth.h\
 	models.h\
+	sse.h\
 
 <$PLAN9/src/mkone
 
@@ -52,3 +54,10 @@ $O.modelstest: modelstest.$O port.$O http.$O json.$O oauth.$O models.$O
 
 test-models:V: $O.modelstest
 	./$O.modelstest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
+
+# Stage 6: SSE line parser
+$O.ssetest: ssetest.$O port.$O http.$O json.$O oauth.$O sse.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-sse:V: $O.ssetest
+	./$O.ssetest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
