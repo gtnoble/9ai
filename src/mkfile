@@ -5,11 +5,23 @@ TARG=9ai
 OFILES=\
 	main.$O\
 	port.$O\
+	http.$O\
 
-HFILES=9ai.h\
+HFILES=\
+	9ai.h\
+	http.h\
 
 <$PLAN9/src/mkone
 
-# Verify port.c helpers build and run correctly
-test:V: $O.$TARG
+# Stage 1: smoke-test port.c helpers
+test-port:V: $O.$TARG
 	./$O.$TARG
+
+# Stage 2: test HTTP client via 9aitls proxy
+# Start proxy first:  ./9aitls &
+# Requires ~/lib/9ai/token (GitHub access token)
+$O.httptest: httptest.$O port.$O http.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-http:V: $O.httptest
+	./$O.httptest

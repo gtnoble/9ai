@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+9aitls — TLS proxy for 9ai
+
+Listens on a Unix domain socket and forwards each connection to the
+Copilot API over TLS.  One request/response per connection; no
+keep-alive, no pipelining.
+
+Usage:
+    9aitls [-s sockpath] [-h host] [-p port]
+
+Defaults:
+    sockpath  ~/lib/9ai/proxy.sock
+    host      api.individual.githubcopilot.com
+    port      443
+
+On connect:
+    1. Read the full HTTP request (headers + body) from the Unix socket.
+    2. Open a TLS TCP connection to upstream.
+    3. Write the request verbatim.
+    4. Stream the response back until the upstream closes.
+    5. Close both sides.
+
+Plan 9 native port:
+    Replace this script with an rc script that uses tlssrv(8) as a
+    filter.  The Unix socket interface and the C client code are
+    unchanged.
+"""
+
+import os
+import sys
+import ssl
+import socket
+import threading
+import argparse
+import signal
+
+DEFAULT_HOST = "api.individual.githubcopilot.com"
+DEFAULT_PORT = 443
+DEFAULT_SOCK = os.path.expanduser("~/lib/9ai/proxy.sock")
+
+CHUNK = 65536
+
+
+def forward(src, dst):
+    """Copy bytes from src to dst until EOF."""
+    try:
+        while True:
+            data = src.recv(CHUNK)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+
+
+def read_request(sock):
+    """
+    Read one complete HTTP/1.1 request from sock.
+
+    Returns the raw request bytes (headers + body), or b'' on EOF/error.
+
+    Strategy:
+      - Read until we see the end-of-headers marker (CRLFCRLF or LFLF).
+      - If a Content-Length header is present, read that many additional
+        bytes for the body.
+      - Transfer-Encoding: chunked is not handled (Copilot requests are
+        never chunked from 9ai).
+    """
+    buf = b""
+    while True:
+        chunk = sock.recv(CHUNK)
+        if not chunk:
+            return b""
+        buf += chunk
+        # Locate end of headers
+        for sep in (b"\r\n\r\n", b"\n\n"):
+            idx = buf.find(sep)
+            if idx != -1:
+                header_end = idx + len(sep)
+                headers_raw = buf[:header_end]
+                body_so_far = buf[header_end:]
+
+                # Parse Content-Length
+                content_length = 0
+                for line in headers_raw.split(b"\n"):
+                    line = line.strip()
+                    if line.lower().startswith(b"content-length:"):
+                        try:
+                            content_length = int(line.split(b":", 1)[1].strip())
+                        except ValueError:
+                            pass
+                        break
+
+                # Read remainder of body
+                while len(body_so_far) < content_length:
+                    need = content_length - len(body_so_far)
+                    more = sock.recv(min(need, CHUNK))
+                    if not more:
+                        break
+                    body_so_far += more
+
+                return headers_raw + body_so_far
+
+
+def read_response_headers(upstream):
+    """
+    Read the HTTP response status line and headers from upstream.
+
+    Returns (status_line, headers_dict, raw_header_bytes, is_chunked).
+    headers_dict keys are lowercased.
+    """
+    buf = b""
+    while True:
+        chunk = upstream.recv(CHUNK)
+        if not chunk:
+            break
+        buf += chunk
+        for sep in (b"\r\n\r\n", b"\n\n"):
+            idx = buf.find(sep)
+            if idx != -1:
+                header_block = buf[:idx]
+                leftover = buf[idx + len(sep):]
+                lines = header_block.split(b"\n")
+                status_line = lines[0].strip()
+                headers = {}
+                for line in lines[1:]:
+                    line = line.strip()
+                    if b":" in line:
+                        k, _, v = line.partition(b":")
+                        headers[k.strip().lower()] = v.strip()
+                is_chunked = headers.get(b"transfer-encoding", b"").lower() == b"chunked"
+                return status_line, headers, header_block + sep, leftover, is_chunked
+    return None, {}, buf, b"", False
+
+
+def decode_chunked(upstream, leftover):
+    """
+    Decode a chunked transfer-encoded response body from upstream.
+
+    Yields decoded body bytes.  Handles data already buffered in leftover.
+    """
+    buf = leftover
+    while True:
+        # Accumulate until we have a complete chunk-size line
+        while b"\n" not in buf:
+            more = upstream.recv(CHUNK)
+            if not more:
+                return
+            buf += more
+        line_end = buf.index(b"\n") + 1
+        size_line = buf[:line_end].strip()
+        buf = buf[line_end:]
+        # Strip chunk extensions (e.g. "1a3f;ext=val")
+        size_line = size_line.split(b";")[0].strip()
+        try:
+            chunk_size = int(size_line, 16)
+        except ValueError:
+            return
+        if chunk_size == 0:
+            return  # last chunk
+        # Read chunk_size bytes
+        while len(buf) < chunk_size:
+            more = upstream.recv(CHUNK)
+            if not more:
+                yield buf
+                return
+            buf += more
+        yield buf[:chunk_size]
+        buf = buf[chunk_size:]
+        # Consume trailing CRLF after chunk data
+        while buf and buf[0:1] in (b"\r", b"\n"):
+            buf = buf[1:]
+
+
+def handle(client_sock, upstream_host, upstream_port):
+    """Handle one client connection."""
+    request = read_request(client_sock)
+    if not request:
+        client_sock.close()
+        return
+
+    # Ask upstream not to use chunked encoding where possible, but we handle
+    # it regardless.  Rewrite the request to advertise HTTP/1.0 if needed — 
+    # actually easier to just decode chunked on the way back.
+
+    ctx = ssl.create_default_context()
+    try:
+        raw = socket.create_connection((upstream_host, upstream_port), timeout=30)
+        upstream = ctx.wrap_socket(raw, server_hostname=upstream_host)
+    except OSError as e:
+        print(f"9aitls: upstream connect failed: {e}", file=sys.stderr)
+        client_sock.close()
+        return
+
+    try:
+        upstream.sendall(request)
+
+        status_line, headers, raw_headers, leftover, is_chunked = \
+            read_response_headers(upstream)
+
+        if is_chunked:
+            # Send a minimal clean header block, then stream the decoded body.
+            # Forwarding upstream headers verbatim risks passing Transfer-Encoding
+            # through with a broken blank-line terminator after line rewriting.
+            status_str = status_line.decode(errors="replace")
+            clean_headers = (
+                f"{status_str}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode()
+            client_sock.sendall(clean_headers)
+            for chunk in decode_chunked(upstream, leftover):
+                client_sock.sendall(chunk)
+        else:
+            # Plain body: forward raw headers then stream body verbatim
+            client_sock.sendall(raw_headers)
+            if leftover:
+                client_sock.sendall(leftover)
+            while True:
+                data = upstream.recv(CHUNK)
+                if not data:
+                    break
+                client_sock.sendall(data)
+
+    except OSError as e:
+        print(f"9aitls: relay error: {e}", file=sys.stderr)
+    finally:
+        try:
+            upstream.close()
+        except OSError:
+            pass
+        try:
+            client_sock.close()
+        except OSError:
+            pass
+
+
+def serve(sockpath, upstream_host, upstream_port):
+    # Remove stale socket
+    try:
+        os.unlink(sockpath)
+    except FileNotFoundError:
+        pass
+
+    os.makedirs(os.path.dirname(sockpath), exist_ok=True)
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(sockpath)
+    os.chmod(sockpath, 0o600)
+    server.listen(16)
+
+    print(f"9aitls: listening on {sockpath} → {upstream_host}:{upstream_port}",
+          file=sys.stderr)
+
+    # Clean up socket on exit
+    def _cleanup(sig, frame):
+        try:
+            os.unlink(sockpath)
+        except OSError:
+            pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGINT, _cleanup)
+
+    while True:
+        try:
+            conn, _ = server.accept()
+        except OSError:
+            break
+        t = threading.Thread(target=handle, args=(conn, upstream_host, upstream_port),
+                             daemon=True)
+        t.start()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="TLS proxy for 9ai")
+    ap.add_argument("-s", "--sock", default=DEFAULT_SOCK,
+                    help=f"Unix socket path (default: {DEFAULT_SOCK})")
+    ap.add_argument("-H", "--host", default=DEFAULT_HOST,
+                    help=f"Upstream host (default: {DEFAULT_HOST})")
+    ap.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
+                    help=f"Upstream port (default: {DEFAULT_PORT})")
+    args = ap.parse_args()
+
+    serve(args.sock, args.host, args.port)
+
+
+if __name__ == "__main__":
+    main()

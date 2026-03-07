@@ -1,2 +1,3 @@
 *.o
 o.*
+src/__pycache__/
