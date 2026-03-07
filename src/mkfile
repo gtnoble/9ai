@@ -106,3 +106,10 @@ $O.anttest: anttest.$O port.$O http.$O json.$O oauth.$O sse.$O ant.$O
 
 test-ant:V: $O.anttest
 	./$O.anttest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
+
+# Stage 15: 9ai-acme — acme integration client
+$O.9ai-acme: 9ai-acme.$O port.$O
+	$LD $LDFLAGS -o $target $prereq -l9pclient
+
+9ai-acme:V: $O.9ai-acme
+	cp $O.9ai-acme $HOME/bin/acme/9ai-acme

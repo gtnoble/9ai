@@ -802,7 +802,19 @@ Flush handler must cancel both pending_output and pending_event on disconnect.
        agentrunant() in agent.c; Fmt_Ant dispatch in fs.c; antmsgtooluse/result;
        thinking→event+session only (not API history); empty text block fix in ant.c;
        claude-sonnet-4.5 full tool loop verified live; 7+1 unit+live tests all pass.
-  [15] 9ai-acme — fresh acme integration script
-       Test: full interactive session in acme; model picker shows /models output
+  [15] 9ai-acme — C acme integration  ✓ DONE
+       src/9ai-acme.c: opens +9ai window; tag commands Send Stop Steer New Clear
+       Models Sessions; outproc + aiproc each use private CFsys connections
+       (ainewconn) to avoid "concurrent reads" errors from stale parked Req*
+       across restarts; flag&2 expansion event text captured into e->text so tag
+       commands are correctly dispatched; prompttext() reads current dot selection
+       or last paragraph; winappend/winappendstr/winclean under winlk.
+       Bugs fixed: (1) acme sends tag-command events with empty text + flag=2
+       expansion event — expansion text must replace e->text not be discarded;
+       (2) outproc spinning on fsread=-1 "concurrent reads on /output not
+       supported" when stale pending_output Req* left from prior client — fixed
+       by per-proc private connections with fsopen-failure reconnect loop.
+       Verified: full interactive session in acme; response text streams into
+       window; separator written at turn end; model/session display updated.
   [16] 9ai-sessions companion script
        Test: verify listing after step 12
