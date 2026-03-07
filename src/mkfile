@@ -10,6 +10,8 @@ OFILES=\
 	oauth.$O\
 	models.$O\
 	sse.$O\
+	oai.$O\
+	exec.$O\
 
 HFILES=\
 	9ai.h\
@@ -18,6 +20,8 @@ HFILES=\
 	oauth.h\
 	models.h\
 	sse.h\
+	oai.h\
+	exec.h\
 
 <$PLAN9/src/mkone
 
@@ -61,3 +65,17 @@ $O.ssetest: ssetest.$O port.$O http.$O json.$O oauth.$O sse.$O
 
 test-sse:V: $O.ssetest
 	./$O.ssetest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
+
+# Stage 7: OpenAI Completions request builder + SSE delta parser
+$O.oaitest: oaitest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-oai:V: $O.oaitest
+	./$O.oaitest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
+
+# Stage 8: exec tool — parse args, threadspawn, collect output
+$O.exectest: exectest.$O port.$O json.$O exec.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-exec:V: $O.exectest
+	./$O.exectest
