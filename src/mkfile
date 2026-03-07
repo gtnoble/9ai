@@ -13,6 +13,7 @@ OFILES=\
 	oai.$O\
 	exec.$O\
 	agent.$O\
+	fs.$O\
 
 HFILES=\
 	9ai.h\
@@ -24,6 +25,7 @@ HFILES=\
 	oai.h\
 	exec.h\
 	agent.h\
+	fs.h\
 
 <$PLAN9/src/mkone
 
@@ -88,3 +90,10 @@ $O.agenttest: agenttest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O exec.$
 
 test-agent:V: $O.agenttest
 	./$O.agenttest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
+
+# Stage 11: 9P server
+$O.fstest: fstest.$O port.$O http.$O json.$O oauth.$O models.$O sse.$O oai.$O exec.$O agent.$O fs.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-fs:V: $O.fstest
+	./$O.fstest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
