@@ -1,0 +1,15 @@
+<$PLAN9/src/mkhdr
+
+TARG=9ai
+
+OFILES=\
+	main.$O\
+	port.$O\
+
+HFILES=9ai.h\
+
+<$PLAN9/src/mkone
+
+# Verify port.c helpers build and run correctly
+test:V: $O.$TARG
+	./$O.$TARG
