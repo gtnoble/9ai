@@ -3,5 +3,6 @@
  */
 
 /* port.c */
-char *homedir(void);
-char *configpath(char *name);
+char    *homedir(void);
+char    *configpath(char *name);
+Waitmsg *portwaitnohang(void);

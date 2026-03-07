@@ -499,7 +499,7 @@ test_live_oai(char *session, char *sockpath)
 	hdrs[nhdrs].name = "Copilot-Integration-Id"; hdrs[nhdrs].value = "vscode-chat";               nhdrs++;
 	hdrs[nhdrs].name = "Openai-Intent";          hdrs[nhdrs].value = "conversation-edits";        nhdrs++;
 
-	c = httpdial(sockpath);
+	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
 	if(c == nil) sysfatal("httpdial: %r");
 
 	r = httppost(c, "/chat/completions", "api.individual.githubcopilot.com",
@@ -579,7 +579,7 @@ test_live_ant(char *session, char *sockpath)
 	hdrs[nhdrs].name = "Editor-Plugin-Version";  hdrs[nhdrs].value = "copilot-chat/0.35.0";       nhdrs++;
 	hdrs[nhdrs].name = "Copilot-Integration-Id"; hdrs[nhdrs].value = "vscode-chat";               nhdrs++;
 
-	c = httpdial(sockpath);
+	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
 	if(c == nil) sysfatal("httpdial: %r");
 
 	r = httppost(c, "/v1/messages", "api.individual.githubcopilot.com",

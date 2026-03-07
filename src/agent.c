@@ -103,11 +103,11 @@ mkdirpath(char *path)
 	char *p, *q, buf[512];
 	int n;
 
-	n = strlcpy(buf, path, sizeof buf);
-	if(n >= (int)sizeof buf) {
+	if(strlen(path) >= sizeof buf) {
 		werrstr("mkdirpath: path too long");
 		return -1;
 	}
+	n = snprint(buf, sizeof buf, "%s", path);
 
 	for(p = buf + 1; *p != '\0'; p++) {
 		if(*p != '/')
@@ -839,12 +839,12 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			return -1;
 		}
 
-		c = httpdial(cfg->sockpath);
+		c = portdial("api.individual.githubcopilot.com", "443", cfg->sockpath);
 		if(c == nil) {
 			free(body);
 			oauthtokenfree(tok);
 			free(textbuf);
-			werrstr("agentrun: httpdial: %r");
+			werrstr("agentrun: portdial: %r");
 			return -1;
 		}
 
@@ -1212,12 +1212,12 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			return -1;
 		}
 
-		c = httpdial(cfg->sockpath);
+		c = portdial("api.individual.githubcopilot.com", "443", cfg->sockpath);
 		if(c == nil) {
 			free(body);
 			oauthtokenfree(tok);
 			free(textbuf);
-			werrstr("agentrunant: httpdial: %r");
+			werrstr("agentrunant: portdial: %r");
 			return -1;
 		}
 

@@ -48,6 +48,7 @@
 #include <thread.h>
 
 #include "json.h"
+#include "9ai.h"
 #include "exec.h"
 
 /* ── execparse ──────────────────────────────────────────────────────── */
@@ -368,7 +369,7 @@ execabort(int pid)
 	/* poll for up to 2 seconds */
 	for(i = 0; i < 20; i++) {
 		sleep(100);
-		w = waitnohang();
+		w = portwaitnohang();
 		if(w != nil) {
 			int dead = (w->pid == pid);
 			free(w);

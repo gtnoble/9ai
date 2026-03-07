@@ -1,0 +1,102 @@
+# 9ai: 9front Port — Implementation Tracker
+
+## Status: COMPLETE (pending hardware test on 9front)
+
+All source changes are done.  The plan9port build is verified clean (`mk clean && mk`
+builds every binary; all unit tests pass).
+
+---
+
+## Changes by File
+
+| File | What changed |
+|------|-------------|
+| `port.c` | `portwaitnohang()` (waitnohang vs nbrecvp); `portdial()` (httpdial vs dial+tlsClient); `#include <libsec.h>` guarded |
+| `9ai.h` | Declared `portwaitnohang()` |
+| `http.h` | Declared `portdial()` alongside `httpdial()` |
+| `exec.c` | `waitnohang()` → `portwaitnohang()`; added `#include "9ai.h"` |
+| `agent.c` | `httpdial()` → `portdial()`; `strlcpy` → `snprint` in mkdirpath |
+| `oauth.c` | `httpdial()` → `portdial()`; added `#include "9ai.h"` |
+| `models.c` | `httpdial()` → `portdial()`; added `#include "9ai.h"` |
+| `fs.c` | All `p9strdup/free/malloc/realloc/close/open/pipe` → unprefixed |
+| `main.c` | Default paths guarded: `#ifdef PLAN9PORT` keeps `.cache`; else `configpath()` |
+| `9ai-sessions.c` | `strlcpy` → `strecpy`; default sessdir guarded by `#ifdef PLAN9PORT` |
+| `agenttest.c` | `strlcpy` → `snprint`; sessdir derivation guarded by `#ifdef PLAN9PORT` |
+| `anttest.c` | `httpdial(sockpath)` → `portdial("api.individual.githubcopilot.com","443",sockpath)` |
+| `oaitest.c` | same |
+| `ssetest.c` | same |
+| `oauthtest.c` | same |
+| `httptest.c` | same |
+| `fstest.c` | same; default paths guarded by `#ifdef PLAN9PORT` |
+| `mkfile` | Added `-DPLAN9PORT` to `CFLAGS`; added `http.$O` to lightweight test link rules |
+| `mkfile.9front` | New — 9front build system (`</$objtype/mkfile`, `<sys/src/cmd/mkone`) |
+| `9ai-acme-native.c` | New — 9front acme integration (direct `/mnt/acme` + `/mnt/9ai`, no lib9pclient) |
+
+---
+
+## `portdial()` contract
+
+```c
+/* plan9port: delegates to httpdial(sockpath) — proxy must be running */
+/* 9front:    dial("tcp!host!port") + tlsClient() — direct TLS, sockpath ignored */
+HTTPConn *portdial(char *host, char *port, char *sockpath);
+```
+
+All callers pass the real API hostname and "443".  On plan9port the proxy
+already speaks to that host; on 9front we dial it directly.
+
+---
+
+## `9ai-acme-native.c` architecture
+
+Three procs:
+- `outproc`   — reads `/mnt/9ai/output`; streams text into window body
+- `aiproc`    — reads `/mnt/9ai/event`; renders thinking/tool/status lines
+- `eventproc` — reads `/mnt/acme/<id>/event`; dispatches Send/Stop/Steer/New/Clear/Models/Sessions
+
+All window writes serialised with `winlk`.  `winappend()` uses `addr="$"` +
+`data` write to always append at the end regardless of cursor position.
+
+Tag commands:
+- **Send** — writes last paragraph (or dot selection) to `/mnt/9ai/message`
+- **Stop** — writes `abort\n` to `/mnt/9ai/ctl`
+- **Steer** — writes last paragraph to `/mnt/9ai/steer`
+- **New** — writes `new` to `/mnt/9ai/session/new`
+- **Clear** — writes `clear\n` to `/mnt/9ai/ctl`; erases body lines 2..$
+- **Models** — opens `+models` window from `/mnt/9ai/models`; middle-click a model id to switch
+- **Sessions** — opens `+sessions` window from `~/lib/9ai/sessions/`; middle-click a UUID to load
+
+---
+
+## Build
+
+### plan9port (existing)
+```
+cd src
+mk           # builds o.9ai
+mk o.9ai-acme
+mk o.9ai-sessions
+mk test-exec test-json   # unit tests
+```
+
+### 9front (new)
+```
+cd src
+mk -f mkfile.9front          # builds 9ai, installs to /$objtype/bin/
+mk -f mkfile.9front 9ai-acme
+mk -f mkfile.9front 9ai-sessions
+```
+
+---
+
+## Known 9front runtime considerations
+
+- **TLS cert verification** — `tlsClient()` with `serverName` set performs SNI.
+  Copilot endpoints have valid certs; should work out of the box.
+- **`threadwaitchan` race** — if `nbrecvp(threadwaitchan())` races with
+  internal thread cleanup, switch `portwaitnohang()` to use a dedicated watcher
+  proc that forward-sends to a private channel.
+- **`/mnt/acme` vs `$acmepath`** — some 9front setups mount acme elsewhere.
+  If needed, add `-A acmedir` flag to `9ai-acme`.
+- **`/mnt/9ai` mountpoint** — `9ai` must be started with `-m /mnt/9ai` before
+  running `9ai-acme`.

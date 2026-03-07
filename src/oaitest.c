@@ -573,7 +573,7 @@ test_live_text(char *sockpath, char *tokpath)
 	body = oaireqjson(req, nil, &bodylen);
 	CHECK(body != nil, "live: request JSON serialised");
 
-	c = httpdial(sockpath);
+	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
 	if(c == nil) {
 		fprint(2, "SKIP: httpdial failed: %r\n");
 		free(body);
@@ -679,7 +679,7 @@ test_live_tool(char *sockpath, char *tokpath)
 	body = oaireqjson(req, nil, &bodylen);
 	CHECK(body != nil, "live tool: request JSON serialised");
 
-	c = httpdial(sockpath);
+	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
 	if(c == nil) {
 		fprint(2, "SKIP: httpdial failed: %r\n");
 		free(body);

@@ -62,14 +62,22 @@ threadmain(int argc, char *argv[])
 	}ARGEND
 
 	if(sockpath == nil) {
+#ifdef PLAN9PORT
 		char *h = homedir();
 		sockpath = smprint("%s/.cache/9ai/proxy.sock", h);
 		free(h);
+#else
+		sockpath = nil;  /* unused on 9front: TLS dialed directly */
+#endif
 	}
 	if(tokpath == nil) {
+#ifdef PLAN9PORT
 		char *h = homedir();
 		tokpath = smprint("%s/.cache/9ai/token", h);
 		free(h);
+#else
+		tokpath = configpath("token");
+#endif
 	}
 
 	AiState *ai = aiinit(model, sockpath, tokpath);

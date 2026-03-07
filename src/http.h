@@ -54,8 +54,9 @@ struct HTTPResp {
 	HTTPConn *conn;     /* back-pointer; response does not own conn */
 };
 
-/* http.c */
+/* http.c / port.c */
 HTTPConn *httpdial(char *sockpath);
+HTTPConn *portdial(char *host, char *port, char *sockpath);
 void      httpclose(HTTPConn *c);
 HTTPResp *httpget(HTTPConn *c, char *path, char *host,
                   HTTPHdr *hdrs, int nhdrs);

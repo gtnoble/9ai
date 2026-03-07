@@ -618,8 +618,13 @@ threadmain(int argc, char *argv[])
 	} ARGEND
 	USED(argc); USED(argv);
 
+#ifdef PLAN9PORT
 	if(sockpath == nil) sockpath = smprint("%s/.cache/9ai/proxy.sock", getenv("HOME"));
 	if(tokpath  == nil) tokpath  = smprint("%s/.cache/9ai/token",      getenv("HOME"));
+#else
+	if(sockpath == nil) sockpath = nil;   /* portdial uses TLS directly */
+	if(tokpath  == nil) tokpath  = configpath("token");
+#endif
 
 	/* unique srvname to avoid clashing with a running 9ai */
 	snprint(srvname, sizeof srvname, "9ai-test");

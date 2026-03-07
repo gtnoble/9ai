@@ -20,6 +20,7 @@
 #include <bio.h>
 #include <thread.h>
 
+#include "9ai.h"
 #include "http.h"
 #include "json.h"
 #include "oauth.h"
@@ -59,7 +60,7 @@ postjson(char *sockpath, char *host, char *path,
 	char *js;
 	int n;
 
-	c = httpdial(sockpath);
+	c = portdial(host, "443", sockpath);
 	if(c == nil)
 		return nil;
 
@@ -104,7 +105,7 @@ getjson(char *sockpath, char *host, char *path,
 	char *js;
 	int n;
 
-	c = httpdial(sockpath);
+	c = portdial(host, "443", sockpath);
 	if(c == nil)
 		return nil;
 

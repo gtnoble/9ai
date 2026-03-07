@@ -546,7 +546,7 @@ test_live_text(char *sockpath, char *tokpath)
 	body = antreqjson(req, nil, &bodylen);
 	if(body == nil) { fprint(2, "FAIL: antreqjson nil\n"); failures++; oauthtokenfree(tok); antreqfree(req); return; }
 
-	c = httpdial(sockpath);
+	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
 	if(c == nil) { fprint(2, "SKIP: httpdial failed\n"); free(body); oauthtokenfree(tok); antreqfree(req); return; }
 
 	r = httppost(c, "/v1/messages", "api.individual.githubcopilot.com",
@@ -654,7 +654,7 @@ test_live_tool(char *sockpath, char *tokpath)
 	body = antreqjson(req, nil, &bodylen);
 	if(body == nil) { fprint(2, "FAIL: antreqjson nil\n"); failures++; oauthtokenfree(tok); antreqfree(req); return; }
 
-	c = httpdial(sockpath);
+	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
 	if(c == nil) { fprint(2, "SKIP: httpdial failed\n"); free(body); oauthtokenfree(tok); antreqfree(req); return; }
 
 	r = httppost(c, "/v1/messages", "api.individual.githubcopilot.com",

@@ -455,15 +455,19 @@ test_live_agent(char *sockpath, char *tokpath)
 	cfg.model    = "gpt-4o";
 	cfg.sockpath = sockpath;
 	cfg.tokpath  = tokpath;
-	/* derive session dir from sock path: strip last component, append sessions/ */
+	/* derive session dir */
+#ifdef PLAN9PORT
 	{
 		char  sockdup[512];
 		char *slash;
-		strlcpy(sockdup, sockpath, sizeof sockdup);
+		snprint(sockdup, sizeof sockdup, "%s", sockpath ? sockpath : "");
 		slash = strrchr(sockdup, '/');
 		if(slash != nil) *slash = '\0';
 		cfg.sessdir = smprint("%s/sessions/", sockdup);
 	}
+#else
+	cfg.sessdir = configpath("sessions/");
+#endif
 	cfg.system   = "You are a helpful assistant. "
 	               "When asked to list files, use the exec tool to run ls.";
 	cfg.ontext   = live_ontext;
@@ -542,15 +546,19 @@ test_live_agent_ant(char *sockpath, char *tokpath)
 	cfg.model    = "claude-sonnet-4.5";
 	cfg.sockpath = sockpath;
 	cfg.tokpath  = tokpath;
-	/* derive session dir from sock path: strip last component, append sessions/ */
+	/* derive session dir */
+#ifdef PLAN9PORT
 	{
 		char  sockdup[512];
 		char *slash;
-		strlcpy(sockdup, sockpath, sizeof sockdup);
+		snprint(sockdup, sizeof sockdup, "%s", sockpath ? sockpath : "");
 		slash = strrchr(sockdup, '/');
 		if(slash != nil) *slash = '\0';
 		cfg.sessdir = smprint("%s/sessions/", sockdup);
 	}
+#else
+	cfg.sessdir = configpath("sessions/");
+#endif
 	cfg.system   = "You are a helpful assistant. "
 	               "When asked to list files, use the exec tool to run ls.";
 	cfg.ontext   = live_ontext;

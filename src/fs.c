@@ -210,7 +210,7 @@ wbufappend(WriteBuf *w, void *data, long n)
 {
 	if(w->size + n + 1 > w->cap) {
 		long newcap = w->cap * 2 + n + 1;
-		char *tmp = p9realloc(w->buf, newcap);
+		char *tmp = realloc(w->buf, newcap);
 		if(tmp == nil)
 			sysfatal("realloc WriteBuf: %r");
 		w->buf = tmp;
@@ -226,8 +226,8 @@ wbuffree(WriteBuf *w)
 {
 	if(w == nil)
 		return;
-	p9free(w->buf);
-	p9free(w);
+	free(w->buf);
+	free(w);
 }
 
 /* ── QID helpers ───────────────────────────────────────────────────────── */
@@ -251,10 +251,10 @@ static void
 filldir(Dir *d, FileEntry *fe)
 {
 	memset(d, 0, sizeof *d);
-	d->name  = p9strdup(fe->name);
-	d->uid   = p9strdup("9ai");
-	d->gid   = p9strdup("9ai");
-	d->muid  = p9strdup("9ai");
+	d->name  = strdup(fe->name);
+	d->uid   = strdup("9ai");
+	d->gid   = strdup("9ai");
+	d->muid  = strdup("9ai");
 	d->qid   = mkqid(fe->qpath, (fe->perm & DMDIR) != 0);
 	d->mode  = fe->perm;
 	d->atime = 0;
@@ -494,7 +494,7 @@ fsread(Req *r)
 		}
 
 		/* write formatted model list into a pipe; read back as string */
-		if(p9pipe(pfd) < 0) {
+		if(pipe(pfd) < 0) {
 			modelsfree(mlist);
 			respond(r, "pipe: %r");
 			return;
@@ -504,16 +504,16 @@ fsread(Req *r)
 		modelsfree(mlist);
 		Bflush(&bio);
 		Bterm(&bio);
-		p9close(pfd[1]);
+		close(pfd[1]);
 
 		{
 			char *mbuf;
 			long  mcap = 4096, mlen = 0;
 			int   nr;
 
-			mbuf = p9malloc(mcap);
+			mbuf = malloc(mcap);
 			if(mbuf == nil) {
-				p9close(pfd[0]);
+				close(pfd[0]);
 				respond(r, "malloc");
 				return;
 			}
@@ -521,20 +521,20 @@ fsread(Req *r)
 				mlen += nr;
 				if(mlen + 1 >= mcap) {
 					mcap *= 2;
-					char *tmp = p9realloc(mbuf, mcap);
+					char *tmp = realloc(mbuf, mcap);
 					if(tmp == nil) {
-						p9free(mbuf);
-						p9close(pfd[0]);
+						free(mbuf);
+						close(pfd[0]);
 						respond(r, "realloc");
 						return;
 					}
 					mbuf = tmp;
 				}
 			}
-			p9close(pfd[0]);
+			close(pfd[0]);
 			mbuf[mlen] = '\0';
 			readbuf(r, mbuf, mlen);
-			p9free(mbuf);
+			free(mbuf);
 		}
 		respond(r, nil);
 		return;
@@ -559,7 +559,7 @@ fsread(Req *r)
 				r->ofcall.count = 0;
 			} else {
 				readstr(r, chunk);
-				p9free(chunk);
+				free(chunk);
 			}
 			respond(r, nil);
 			return;
@@ -586,7 +586,7 @@ fsread(Req *r)
 				r->ofcall.count = 0;
 			} else {
 				readbuf(r, rec, strlen(rec));
-				p9free(rec);
+				free(rec);
 			}
 			respond(r, nil);
 			return;
@@ -648,16 +648,16 @@ fswrite(Req *r)
 			return;
 		}
 		qlock(&g->lk);
-		p9free(g->model);
-		g->model = p9strdup(newmodel);
+		free(g->model);
+		g->model = strdup(newmodel);
 		/* update history model fields and wire format */
 		if(g->oaireq != nil) {
-			p9free(g->oaireq->model);
-			g->oaireq->model = p9strdup(newmodel);
+			free(g->oaireq->model);
+			g->oaireq->model = strdup(newmodel);
 		}
 		if(g->antreq != nil) {
-			p9free(g->antreq->model);
-			g->antreq->model = p9strdup(newmodel);
+			free(g->antreq->model);
+			g->antreq->model = strdup(newmodel);
 		}
 		/* infer format: "claude-" prefix → Anthropic Messages */
 		g->fmt = (strncmp(newmodel, "claude-", 7) == 0) ? Fmt_Ant : Fmt_Oai;
@@ -696,7 +696,7 @@ fswrite(Req *r)
 				Bflush(g->sess_bio);
 				Bterm(g->sess_bio);
 				close(fd2);
-				p9free(g->sess_bio);
+				free(g->sess_bio);
 				g->sess_bio = nil;
 			}
 			qunlock(&g->lk);
@@ -709,16 +709,16 @@ fswrite(Req *r)
 				return;
 			}
 			qlock(&g->lk);
-			p9free(g->model);
-			g->model = p9strdup(nm);
+			free(g->model);
+			g->model = strdup(nm);
 			/* update OAIReq and ANTReq model too */
 			if(g->oaireq != nil) {
-				p9free(g->oaireq->model);
-				g->oaireq->model = p9strdup(nm);
+				free(g->oaireq->model);
+				g->oaireq->model = strdup(nm);
 			}
 			if(g->antreq != nil) {
-				p9free(g->antreq->model);
-				g->antreq->model = p9strdup(nm);
+				free(g->antreq->model);
+				g->antreq->model = strdup(nm);
 			}
 			/* infer wire format from model id */
 			g->fmt = (strncmp(nm, "claude-", 7) == 0) ? Fmt_Ant : Fmt_Oai;
@@ -762,7 +762,7 @@ fsdestroyfid(Fid *fid)
 			req = mallocz(sizeof *req, 1);
 			if(req != nil) {
 				req->type = (path == Qmessage) ? AgentReqPrompt : AgentReqSteer;
-				req->text = p9strdup(w->buf);
+				req->text = strdup(w->buf);
 				chansendp(g->reqchan, req);
 			}
 		}
@@ -785,7 +785,7 @@ fsdestroyfid(Fid *fid)
 				Bflush(g->sess_bio);
 				Bterm(g->sess_bio);
 				close(fd2);
-				p9free(g->sess_bio);
+				free(g->sess_bio);
 				g->sess_bio = nil;
 			}
 			g->uuid[0] = '\0';
@@ -795,7 +795,7 @@ fsdestroyfid(Fid *fid)
 				/* emit session_new event */
 				char evbuf[64];
 				snprint(evbuf, sizeof evbuf, "session_new\x1f%s\x1e", g->uuid);
-				char *evcopy = p9strdup(evbuf);
+				char *evcopy = strdup(evbuf);
 				chansendp(g->eventchan, evcopy);
 			}
 			qunlock(&g->lk);
@@ -839,7 +839,7 @@ fsdestroyfid(Fid *fid)
 						Bflush(g->sess_bio);
 						Bterm(g->sess_bio);
 						close(fd2);
-						p9free(g->sess_bio);
+						free(g->sess_bio);
 						g->sess_bio = nil;
 					}
 					g->uuid[0] = '\0';
@@ -850,7 +850,7 @@ fsdestroyfid(Fid *fid)
 					/* AgentCfg for the load call */
 					AgentCfg tmpcfg;
 					memset(&tmpcfg, 0, sizeof tmpcfg);
-					tmpcfg.model   = p9strdup(g->model);
+					tmpcfg.model   = strdup(g->model);
 					tmpcfg.sessdir = nil;
 					tmpcfg.sess_bio = nil;
 
@@ -860,22 +860,22 @@ fsdestroyfid(Fid *fid)
 						qlock(&g->lk);
 						/* replace model if session had one */
 						if(tmpcfg.model != nil && tmpcfg.model[0] != '\0') {
-							p9free(g->model);
-							g->model = p9strdup(tmpcfg.model);
+							free(g->model);
+							g->model = strdup(tmpcfg.model);
 							if(g->oaireq != nil) {
-								p9free(g->oaireq->model);
-								g->oaireq->model = p9strdup(g->model);
+								free(g->oaireq->model);
+								g->oaireq->model = strdup(g->model);
 							}
 							if(g->antreq != nil) {
-								p9free(g->antreq->model);
-								g->antreq->model = p9strdup(g->model);
+								free(g->antreq->model);
+								g->antreq->model = strdup(g->model);
 							}
 							/* infer format from loaded model */
 							g->fmt = (strncmp(g->model, "claude-", 7) == 0) ? Fmt_Ant : Fmt_Oai;
 						}
 						/* replace OAI history (session file uses OAI format for load) */
 						oaireqfree(g->oaireq);
-						newreq->model = p9strdup(g->model);
+						newreq->model = strdup(g->model);
 						g->oaireq = newreq;
 						/* reset ANT history to empty for this model */
 						antreqfree(g->antreq);
@@ -885,7 +885,7 @@ fsdestroyfid(Fid *fid)
 						/* emit session_new event with loaded uuid */
 						char evbuf2[64];
 						snprint(evbuf2, sizeof evbuf2, "session_new\x1f%s\x1e", g->uuid);
-						char *evcopy2 = p9strdup(evbuf2);
+						char *evcopy2 = strdup(evbuf2);
 						chansendp(g->eventchan, evcopy2);
 						qunlock(&g->lk);
 					} else {
@@ -896,7 +896,7 @@ fsdestroyfid(Fid *fid)
 						rerrstr(g->errmsg, sizeof g->errmsg);
 						qunlock(&g->lk);
 					}
-					p9free(tmpcfg.model);
+					free(tmpcfg.model);
 				}
 			}
 		}
@@ -925,7 +925,7 @@ fsdestroyfid(Fid *fid)
 				if(g->sess_bio != nil) Bflush(g->sess_bio);
 				char uuid_copy[37];
 				memmove(uuid_copy, g->uuid, 37);
-				char *tp = p9strdup(g->tokpath);
+				char *tp = strdup(g->tokpath);
 				qunlock(&g->lk);
 
 				if(uuid_copy[0] != '\0') {
@@ -946,9 +946,9 @@ fsdestroyfid(Fid *fid)
 						}
 						close(sfd);
 					}
-					p9free(srcpath);
+					free(srcpath);
 				}
-				p9free(tp);
+				free(tp);
 			}
 		}
 		wbuffree(w);
@@ -972,10 +972,10 @@ fsstat(Req *r)
 	if(path == Qroot) {
 		Dir d;
 		memset(&d, 0, sizeof d);
-		d.name  = p9strdup("/");
-		d.uid   = p9strdup("9ai");
-		d.gid   = p9strdup("9ai");
-		d.muid  = p9strdup("9ai");
+		d.name  = strdup("/");
+		d.uid   = strdup("9ai");
+		d.gid   = strdup("9ai");
+		d.muid  = strdup("9ai");
 		d.qid   = mkqid(Qroot, 1);
 		d.mode  = DMDIR | 0555;
 		r->d = d;
@@ -1038,7 +1038,7 @@ static void
 outbuf_push(char *chunk)
 {
 	OutBuf *b = mallocz(sizeof *b, 1);
-	if(b == nil) { p9free(chunk); return; }
+	if(b == nil) { free(chunk); return; }
 	b->chunk = chunk;
 	b->next  = nil;
 	if(outbuf_tail != nil) outbuf_tail->next = b;
@@ -1056,7 +1056,7 @@ outbuf_pop(char **chunkp)
 	outbuf_head = b->next;
 	if(outbuf_head == nil) outbuf_tail = nil;
 	*chunkp = b->chunk;
-	p9free(b);
+	free(b);
 	return 1;
 }
 
@@ -1081,7 +1081,7 @@ outwatcher(void *v)
 			} else {
 				readstr(r, chunk);
 				respond(r, nil);
-				p9free(chunk);
+				free(chunk);
 			}
 		} else {
 			/* no reader parked — buffer the chunk for fsread to pick up */
@@ -1107,7 +1107,7 @@ static void
 evbuf_push(char *rec)
 {
 	EvBuf *b = mallocz(sizeof *b, 1);
-	if(b == nil) { p9free(rec); return; }
+	if(b == nil) { free(rec); return; }
 	b->rec  = rec;
 	b->next = nil;
 	if(evbuf_tail != nil) evbuf_tail->next = b;
@@ -1124,7 +1124,7 @@ evbuf_pop(char **recp)
 	evbuf_head = b->next;
 	if(evbuf_head == nil) evbuf_tail = nil;
 	*recp = b->rec;
-	p9free(b);
+	free(b);
 	return 1;
 }
 
@@ -1149,7 +1149,7 @@ eventwatcher(void *v)
 			} else {
 				readbuf(r, rec, strlen(rec));
 				respond(r, nil);
-				p9free(rec);
+				free(rec);
 			}
 		} else {
 			evbuf_push(rec);
@@ -1168,7 +1168,7 @@ static void
 agent_ontext(const char *text, void *aux)
 {
 	USED(aux);
-	chansendp(g->outchan, p9strdup((char*)text));
+	chansendp(g->outchan, strdup((char*)text));
 }
 
 /*
@@ -1179,7 +1179,7 @@ agent_onevent(const char *rec, long len, void *aux)
 {
 	char *copy;
 	USED(aux); USED(len);
-	copy = p9strdup((char*)rec);
+	copy = strdup((char*)rec);
 	chansendp(g->eventchan, copy);
 }
 
@@ -1207,8 +1207,8 @@ agentproc(void *v)
 
 		if(req->type == AgentReqSteer) {
 			/* phase 14: not yet implemented */
-			p9free(req->text);
-			p9free(req);
+			free(req->text);
+			free(req);
 			continue;
 		}
 
@@ -1225,11 +1225,11 @@ agentproc(void *v)
 			char    *sessdir;
 			/* derive session dir from tokpath parent, not ~/lib/9ai */
 			{
-				char *tp = p9strdup(g->tokpath);
+				char *tp = strdup(g->tokpath);
 				char *slash = strrchr(tp, '/');
 				if(slash != nil) *slash = '\0';
 				sessdir = smprint("%s/sessions/", tp);
-				p9free(tp);
+				free(tp);
 			}
 			memset(&tmpcfg, 0, sizeof tmpcfg);
 			tmpcfg.model   = g->model;
@@ -1239,17 +1239,17 @@ agentproc(void *v)
 				memmove(g->uuid, tmpcfg.uuid, 37);
 				g->sess_bio = tmpcfg.sess_bio;
 			}
-			p9free(sessdir);
+			free(sessdir);
 		}
 		qunlock(&g->lk);
 
 		/* build AgentCfg pointing at global state */
 		memset(&cfg, 0, sizeof cfg);
 		qlock(&g->lk);
-		cfg.model    = p9strdup(g->model);
-		cfg.sockpath = p9strdup(g->sockpath);
-		cfg.tokpath  = p9strdup(g->tokpath);
-		cfg.system   = p9strdup((char*)defaultsystem);
+		cfg.model    = strdup(g->model);
+		cfg.sockpath = strdup(g->sockpath);
+		cfg.tokpath  = strdup(g->tokpath);
+		cfg.system   = strdup((char*)defaultsystem);
 		memmove(cfg.uuid, g->uuid, 37);
 		cfg.sess_bio = g->sess_bio;
 		cfg.ontext   = agent_ontext;
@@ -1268,7 +1268,7 @@ agentproc(void *v)
 			rc = agentrun(req->text, g->oaireq, &cfg);
 
 		/* send [done] sentinel before EOF on /output */
-		chansendp(g->outchan, p9strdup("[done]\n"));
+		chansendp(g->outchan, strdup("[done]\n"));
 
 		/* sync uuid back (agentsessopen may have set it) */
 		qlock(&g->lk);
@@ -1280,14 +1280,14 @@ agentproc(void *v)
 		g->toolbusy = 0;
 		qunlock(&g->lk);
 
-		p9free(cfg.model);
-		p9free(cfg.sockpath);
-		p9free(cfg.tokpath);
-		p9free(cfg.system);
+		free(cfg.model);
+		free(cfg.sockpath);
+		free(cfg.tokpath);
+		free(cfg.system);
 		/* do not free cfg.sess_bio — still owned by g */
 
-		p9free(req->text);
-		p9free(req);
+		free(req->text);
+		free(req);
 
 		/* signal end-of-turn to watchers */
 		chansendp(g->outchan,  nil);
@@ -1306,9 +1306,9 @@ aiinit(char *model, char *sockpath, char *tokpath)
 	if(ai == nil)
 		sysfatal("mallocz AiState: %r");
 
-	ai->model    = p9strdup(model);
-	ai->sockpath = p9strdup(sockpath);
-	ai->tokpath  = p9strdup(tokpath);
+	ai->model    = strdup(model);
+	ai->sockpath = strdup(sockpath);
+	ai->tokpath  = strdup(tokpath);
 	ai->oaireq   = oaireqnew(model);
 	ai->antreq   = antreqnew(model);
 	ai->fmt      = Fmt_Oai;  /* default; switched when model changes */

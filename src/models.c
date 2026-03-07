@@ -44,6 +44,7 @@
 #include <bio.h>
 #include <thread.h>
 
+#include "9ai.h"
 #include "http.h"
 #include "json.h"
 #include "models.h"
@@ -234,7 +235,7 @@ modelsfetch(char *session, char *sockpath)
 	hdrs[nhdrs].name  = "Editor-Plugin-Version"; hdrs[nhdrs].value = "copilot-chat/0.35.0";       nhdrs++;
 	hdrs[nhdrs].name  = "Copilot-Integration-Id"; hdrs[nhdrs].value = "vscode-chat";              nhdrs++;
 
-	c = httpdial(sockpath);
+	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
 	if(c == nil)
 		return nil;
 

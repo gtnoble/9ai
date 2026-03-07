@@ -2,6 +2,8 @@
 
 TARG=9ai
 
+CFLAGS=$CFLAGS -DPLAN9PORT
+
 OFILES=\
 	main.$O\
 	port.$O\
@@ -45,7 +47,7 @@ test-http:V: $O.httptest
 	./$O.httptest
 
 # Stage 3: unit-test JSON helpers
-$O.jsontest: jsontest.$O json.$O port.$O
+$O.jsontest: jsontest.$O json.$O port.$O http.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-json:V: $O.jsontest
@@ -80,7 +82,7 @@ test-oai:V: $O.oaitest
 	./$O.oaitest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
 
 # Stage 8: exec tool — parse args, threadspawn, collect output
-$O.exectest: exectest.$O port.$O json.$O exec.$O
+$O.exectest: exectest.$O port.$O http.$O json.$O exec.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-exec:V: $O.exectest
@@ -108,8 +110,18 @@ test-ant:V: $O.anttest
 	./$O.anttest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
 
 # Stage 15: 9ai-acme — acme integration client
-$O.9ai-acme: 9ai-acme.$O port.$O
+$O.9ai-acme: 9ai-acme.$O port.$O http.$O
 	$LD $LDFLAGS -o $target $prereq -l9pclient
 
 9ai-acme:V: $O.9ai-acme
 	cp $O.9ai-acme $HOME/bin/acme/9ai-acme
+
+# Stage 16: 9ai-sessions — session listing companion
+$O.9ai-sessions: 9ai-sessions.$O port.$O http.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-sessions:V: $O.9ai-sessions
+	./$O.9ai-sessions
+
+9ai-sessions:V: $O.9ai-sessions
+	cp $O.9ai-sessions $HOME/bin/9ai-sessions

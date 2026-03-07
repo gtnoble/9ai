@@ -76,7 +76,7 @@ threadmain(int argc, char *argv[])
 	free(token);
 
 	print("dialing proxy %s...\n", sockfile);
-	c = httpdial(sockfile);
+	c = portdial("api.individual.githubcopilot.com", "443", sockfile);
 	if(c == nil)
 		sysfatal("httpdial: %r");
 	print("connected\n");

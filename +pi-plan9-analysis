@@ -816,5 +816,9 @@ Flush handler must cancel both pending_output and pending_event on disconnect.
        by per-proc private connections with fsopen-failure reconnect loop.
        Verified: full interactive session in acme; response text streams into
        window; separator written at turn end; model/session display updated.
-  [16] 9ai-sessions companion script
-       Test: verify listing after step 12
+  [16] 9ai-sessions companion script  ✓ DONE
+       src/9ai-sessions.c: parsesessfile() (Biobuf + splitrec), mtime_cmp qsort,
+       optional dir arg (default ~/.cache/9ai/sessions/); outputs uuid/model/date/snippet
+       tab-separated, newest-first.  splitrec NUL-patches in place (no malloc).
+       mk o.9ai-sessions builds clean; live run against 15 session files all correct;
+       ellipsis truncation verified at SNIPPET=80; nonexistent dir exits with error.
