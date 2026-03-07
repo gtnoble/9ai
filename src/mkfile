@@ -87,7 +87,7 @@ test-exec:V: $O.exectest
 	./$O.exectest
 
 # Stage 9: agent loop (OAI format) — tool loop, emit_event, write_session
-$O.agenttest: agenttest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O exec.$O agent.$O
+$O.agenttest: agenttest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O ant.$O exec.$O agent.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-agent:V: $O.agenttest

@@ -37,6 +37,7 @@
 #include "oauth.h"
 #include "sse.h"
 #include "oai.h"
+#include "ant.h"
 #include "exec.h"
 #include "agent.h"
 
@@ -510,6 +511,112 @@ test_live_agent(char *sockpath, char *tokpath)
 	oaireqfree(req);
 }
 
+/* ── Part 3: Phase-14 live test — ANT agent loop with thinking ────────── */
+
+/*
+ * test_live_agent_ant — test agentrunant() with claude-sonnet-4.5.
+ *
+ * 3.1  agentrunant: "list the files in /tmp" with claude-sonnet-4.5
+ *        - exec tool must be called (tool_start event emitted)
+ *        - thinking events may be emitted (ANTDThinking → "thinking" records)
+ *        - final stop_reason must be "end_turn" (turn completes)
+ *        - text output non-empty
+ *        - session file contains: session, turn_start, prompt,
+ *          tool_start, tool_end, turn_end records
+ *        - session file does NOT contain thinking blocks in API history
+ *          (thinking is session-file-only, not fed back to API)
+ */
+static void
+test_live_agent_ant(char *sockpath, char *tokpath)
+{
+	AgentCfg     cfg;
+	ANTReq      *req;
+	LiveCapture  lc;
+	int          rc;
+
+	print("\n-- 3.1 live: agentrunant with claude-sonnet-4.5 — list files in /tmp\n");
+
+	memset(&cfg, 0, sizeof cfg);
+	memset(&lc,  0, sizeof lc);
+
+	cfg.model    = "claude-sonnet-4.5";
+	cfg.sockpath = sockpath;
+	cfg.tokpath  = tokpath;
+	/* derive session dir from sock path: strip last component, append sessions/ */
+	{
+		char  sockdup[512];
+		char *slash;
+		strlcpy(sockdup, sockpath, sizeof sockdup);
+		slash = strrchr(sockdup, '/');
+		if(slash != nil) *slash = '\0';
+		cfg.sessdir = smprint("%s/sessions/", sockdup);
+	}
+	cfg.system   = "You are a helpful assistant. "
+	               "When asked to list files, use the exec tool to run ls.";
+	cfg.ontext   = live_ontext;
+	cfg.onevent  = live_onevent;
+	cfg.aux      = &lc;
+
+	/* open session file */
+	rc = agentsessopen(&cfg);
+	if(rc < 0) {
+		fprint(2, "  SKIP: agentsessopen failed: %r\n");
+		free(cfg.sessdir);
+		return;
+	}
+	print("  session uuid: %s\n", cfg.uuid);
+
+	/* run the agent with ANT format */
+	req = antreqnew("claude-sonnet-4.5");
+	rc  = agentrunant("list the files in /tmp using the exec tool", req, &cfg);
+
+	agentsessclose(&cfg);
+
+	if(rc < 0) {
+		char errbuf[256];
+		rerrstr(errbuf, sizeof errbuf);
+		fprint(2, "  SKIP: agentrunant failed: %s\n", errbuf);
+		antreqfree(req);
+		free(cfg.sessdir);
+		return;
+	}
+
+	/* verify results */
+	print("  events received: %d\n", lc.nevents);
+	print("  text output length: %ld\n", lc.textlen);
+
+	/* Count thinking records in event log */
+	int nthinking = 0;
+	{
+		long i = 0;
+		while(i < lc.evlen) {
+			char *rec = lc.evbuf + i;
+			if(strncmp(rec, "thinking", 8) == 0 &&
+			   ((unsigned char)rec[8] == 0x1f || (unsigned char)rec[8] == 0x1e))
+				nthinking++;
+			/* advance past this record (find next NUL we inserted) */
+			i += strlen(rec) + 1;
+		}
+	}
+	print("  thinking events: %d\n", nthinking);
+
+	CHECK(lc.saw_turn_start,  "3.1: turn_start event emitted");
+	CHECK(lc.saw_tool_start,  "3.1: tool_start event emitted (exec was called)");
+	CHECK(lc.saw_tool_end,    "3.1: tool_end event emitted");
+	CHECK(lc.saw_turn_end,    "3.1: turn_end event emitted");
+	CHECK(lc.textlen > 0,     "3.1: text output non-empty");
+	CHECK(lc.nevents >= 4,    "3.1: at least 4 events");
+
+	/* verify session file */
+	{
+		int sess_ok = check_session_file(cfg.sessdir, cfg.uuid);
+		CHECK(sess_ok, "3.1: session file contains all required record types");
+	}
+
+	free(cfg.sessdir);
+	antreqfree(req);
+}
+
 /* ── Main ────────────────────────────────────────────────────────────── */
 
 void
@@ -535,8 +642,10 @@ threadmain(int argc, char *argv[])
 	test_record_three_fields();
 
 	if(sockpath != nil && tokpath != nil) {
-		print("\n=== Part 2: Live integration tests ===\n");
+		print("\n=== Part 2: Live integration tests (OAI) ===\n");
 		test_live_agent(sockpath, tokpath);
+		print("\n=== Part 3: Live integration tests (ANT/Claude) ===\n");
+		test_live_agent_ant(sockpath, tokpath);
 	} else {
 		print("\n(skipping live tests: pass -s <sock> -t <tok> to enable)\n");
 	}

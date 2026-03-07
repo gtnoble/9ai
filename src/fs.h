@@ -88,7 +88,9 @@ struct AiState {
 	QLock lk;
 
 	/* conversation history */
-	OAIReq *oaireq;
+	OAIReq *oaireq;   /* OpenAI Completions history (Fmt_Oai models) */
+	ANTReq *antreq;   /* Anthropic Messages history (Fmt_Ant models) */
+	int     fmt;      /* Fmt_Oai or Fmt_Ant — derived from model on each switch */
 };
 
 /*

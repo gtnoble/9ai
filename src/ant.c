@@ -134,10 +134,16 @@ antmsgtooluse(char *text, char *tool_id, char *tool_name, char *tool_input)
 	ANTMsg   *m = newmsg(ANTRoleAssistant);
 	ANTBlock *b;
 
-	/* text block (may be empty — still included per API requirement) */
-	b = newblock(ANTBlockText);
-	b->text = strdup(text != nil ? text : "");
-	appendblock(m, b);
+	/*
+	 * Only include the text block if the text is non-empty.
+	 * The Copilot/Claude proxy rejects empty text content blocks
+	 * ("text content blocks must be non-empty").
+	 */
+	if(text != nil && text[0] != '\0') {
+		b = newblock(ANTBlockText);
+		b->text = strdup(text);
+		appendblock(m, b);
+	}
 
 	/* tool_use block */
 	b = newblock(ANTBlockToolUse);
@@ -347,10 +353,12 @@ emitmsg(Biobuf *b, ANTMsg *m)
 		for(blk = m->content; blk != nil; blk = blk->next) {
 			switch(blk->type) {
 			case ANTBlockText:
+				/* skip empty text blocks — API rejects them */
+				if(blk->text == nil || blk->text[0] == '\0') break;
 				if(!first) Bprint(b, ",");
 				first = 0;
 				Bprint(b, "{\"type\":\"text\",\"text\":");
-				jsonemitstr(b, blk->text != nil ? blk->text : "");
+				jsonemitstr(b, blk->text);
 				Bprint(b, "}");
 				break;
 			case ANTBlockToolUse:

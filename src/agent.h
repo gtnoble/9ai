@@ -41,10 +41,14 @@
  * The session header (session FS uuid FS model FS timestamp RS) is
  * written by agentsessopen() when the file is first created.
  *
- * ── OAI format only ──────────────────────────────────────────────────
+ * ── Wire format selection ─────────────────────────────────────────────
  *
- * Phase 9 implements the OpenAI Completions wire format (gpt-4o etc.).
- * Anthropic Messages (Claude) is added in phase 13/14.
+ * agentrun()    — OpenAI Completions wire format (gpt-4o, gpt-4.1 …)
+ * agentrunant() — Anthropic Messages wire format (claude-* models)
+ *
+ * The caller selects the correct function based on the model's fmt field
+ * (Fmt_Oai / Fmt_Ant from models.h).  agentrunant() takes an ANTReq
+ * instead of an OAIReq for conversation history.
  */
 
 /* ── Record separator constants ─────────────────────────────────────── */
@@ -185,3 +189,25 @@ void emitandsave(AgentCfg *cfg, ...);
  * expiry between tool loops.
  */
 int agentrun(char *prompt, OAIReq *req, AgentCfg *cfg);
+
+/*
+ * agentrunant — run one full agent turn using the Anthropic Messages wire format.
+ *
+ * prompt:  the user message text
+ * req:     an ANTReq containing the existing conversation history;
+ *          agentrunant() appends the user message and assistant response(s)
+ *          to req in place.  Pass an empty ANTReq for the first turn.
+ * cfg:     agent configuration, callbacks, session Biobuf
+ *
+ * Differences from agentrun():
+ *   - POSTs to /v1/messages using antreqjson() / antreqhdrs().
+ *   - Streams ANTDelta events via antdelta().
+ *   - ANTDThinking deltas → emitandsave("thinking", chunk) only;
+ *     NOT delivered to cfg->ontext and NOT included in API history.
+ *   - stop_reason "end_turn" (text done) vs "tool_use" (tool call).
+ *   - Tool result appended as antmsgtoolresult() (user message with
+ *     content array containing a tool_result block).
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg);

@@ -60,6 +60,7 @@
 #include "oauth.h"
 #include "sse.h"
 #include "oai.h"
+#include "ant.h"
 #include "exec.h"
 #include "agent.h"
 
@@ -1107,5 +1108,362 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 	oauthtokenfree(tok);
 	free(textbuf);
 	werrstr("agentrun: exceeded %d tool iterations", MAX_ITERATIONS);
+	return -1;
+}
+
+/* ── agentrunant ──────────────────────────────────────────────────────────
+ *
+ * Full agent turn using the Anthropic Messages wire format (Claude models).
+ *
+ * Structure mirrors agentrun() but:
+ *   - Uses ANTReq / antdelta() / antreqjson() / antreqhdrs()
+ *   - POSTs to /v1/messages
+ *   - ANTDThinking → emitandsave("thinking", chunk); NOT sent to ontext
+ *   - stop_reason "end_turn" → normal completion
+ *   - stop_reason "tool_use" → tool call; loop
+ *   - History: antmsgtooluse() + antmsgtoolresult()
+ */
+int
+agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
+{
+	char        *refresh;
+	OAuthToken  *tok;
+	HTTPConn    *c;
+	HTTPResp    *r;
+	ANTParser    parser;
+	ANTDelta     d;
+	int          rc;
+	HTTPHdr      hdrs[16];
+	int          nhdrs;
+	char        *body;
+	long         bodylen;
+	int          iteration;
+
+	/* text accumulation for assistant message */
+	char  *textbuf;
+	long   textcap, textlen;
+
+	/* thinking accumulation (for session only; not sent to API) */
+	/* We do not reconstruct thinking — just emit chunk by chunk */
+
+	/* tool call accumulation */
+	char  tool_id[128];
+	char  tool_name[128];
+	char  argsbuf[65536];
+	long  argslen;
+
+	enum { TEXTCAP_INIT = 8192, MAX_ITERATIONS = 32 };
+
+	/* ── load refresh token and get session token ── */
+	refresh = loadrefresh(cfg);
+	if(refresh == nil)
+		return -1;
+
+	tok = oauthsession(refresh, cfg->sockpath);
+	free(refresh);
+	if(tok == nil) {
+		werrstr("agentrunant: oauthsession: %r");
+		return -1;
+	}
+
+	/* ── emit turn_start ── */
+	emitandsave(cfg,
+	    "turn_start", cfg->uuid[0] ? cfg->uuid : "no-session", cfg->model,
+	    nil);
+
+	/* ── append user message to req; write prompt session record ── */
+	antreqaddmsg(req, antmsguser(prompt));
+	writesession(cfg, "prompt", prompt, nil);
+
+	/* allocate text accumulation buffer */
+	textcap = TEXTCAP_INIT;
+	textbuf = malloc(textcap + 1);
+	if(textbuf == nil) {
+		oauthtokenfree(tok);
+		werrstr("agentrunant: malloc textbuf: %r");
+		return -1;
+	}
+	textbuf[0] = '\0';
+	textlen    = 0;
+
+	/* ── tool loop ── */
+	for(iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+
+		/* refresh token if near expiry */
+		if(iteration > 0 && time(0) > tok->expires_at - 300) {
+			char *ref2 = loadrefresh(cfg);
+			if(ref2 != nil) {
+				OAuthToken *newtok = oauthsession(ref2, cfg->sockpath);
+				free(ref2);
+				if(newtok != nil) {
+					oauthtokenfree(tok);
+					tok = newtok;
+				}
+			}
+		}
+
+		/* build and POST request to /v1/messages */
+		nhdrs = antreqhdrs(req, tok->token, hdrs, 16);
+		body  = antreqjson(req, cfg->system, &bodylen);
+		if(body == nil) {
+			oauthtokenfree(tok);
+			free(textbuf);
+			werrstr("agentrunant: antreqjson: %r");
+			return -1;
+		}
+
+		c = httpdial(cfg->sockpath);
+		if(c == nil) {
+			free(body);
+			oauthtokenfree(tok);
+			free(textbuf);
+			werrstr("agentrunant: httpdial: %r");
+			return -1;
+		}
+
+		r = httppost(c, "/v1/messages",
+		             "api.individual.githubcopilot.com",
+		             hdrs, nhdrs, body, bodylen);
+		free(body);
+		/* free smprint'd Authorization header value */
+		{
+			int i;
+			for(i = 0; i < nhdrs; i++)
+				if(strcmp(hdrs[i].name, "Authorization") == 0)
+					free(hdrs[i].value);
+		}
+
+		if(r == nil || r->code != 200) {
+			if(r != nil) {
+				httpreadbody(r);
+				werrstr("agentrunant: HTTP %d: %s",
+				        r->code, r->body ? r->body : "(no body)");
+				httprespfree(r);
+			} else {
+				werrstr("agentrunant: httppost: %r");
+			}
+			httpclose(c);
+			oauthtokenfree(tok);
+			free(textbuf);
+			return -1;
+		}
+
+		/* ── stream deltas ── */
+		antinit(&parser, r);
+
+		textlen        = 0;
+		textbuf[0]     = '\0';
+		tool_id[0]     = '\0';
+		tool_name[0]   = '\0';
+		argslen        = 0;
+		argsbuf[0]     = '\0';
+
+		int stop_reason_is_tool = 0;
+		char stop_reason[32];
+		stop_reason[0] = '\0';
+
+		while((rc = antdelta(&parser, &d)) == ANT_OK) {
+			switch(d.type) {
+
+			case ANTDText:
+				/* deliver text chunk to caller */
+				if(cfg->ontext != nil)
+					cfg->ontext(d.text, cfg->aux);
+				/* emit text event record */
+				emitandsave(cfg, "text", d.text, nil);
+				/* accumulate for assistant message */
+				{
+					long dlen = strlen(d.text);
+					if(textlen + dlen >= textcap) {
+						long newcap = textcap * 2 + dlen + 1;
+						char *tmp = realloc(textbuf, newcap + 1);
+						if(tmp != nil) {
+							textbuf = tmp;
+							textcap = newcap;
+						}
+					}
+					if(textlen + dlen < textcap) {
+						memmove(textbuf + textlen, d.text, dlen);
+						textlen += dlen;
+						textbuf[textlen] = '\0';
+					}
+				}
+				break;
+
+			case ANTDThinking:
+				/*
+				 * Thinking blocks: emit to event stream and session file,
+				 * but do NOT deliver to cfg->ontext and do NOT add to
+				 * API history (Anthropic forbids sending thinking blocks back).
+				 */
+				emitandsave(cfg, "thinking", d.text, nil);
+				break;
+
+			case ANTDTool:
+				/* new tool_use block starting */
+				snprint(tool_id,   sizeof tool_id,   "%s",
+				        d.tool_id   ? d.tool_id   : "");
+				snprint(tool_name, sizeof tool_name, "%s",
+				        d.tool_name ? d.tool_name : "exec");
+				argslen    = 0;
+				argsbuf[0] = '\0';
+				break;
+
+			case ANTDToolArg:
+				/* accumulate JSON input */
+				{
+					long dlen = strlen(d.text);
+					if(argslen + dlen < (long)sizeof argsbuf - 1) {
+						memmove(argsbuf + argslen, d.text, dlen);
+						argslen += dlen;
+						argsbuf[argslen] = '\0';
+					}
+				}
+				break;
+
+			case ANTDStop:
+				snprint(stop_reason, sizeof stop_reason, "%s",
+				        d.stop_reason ? d.stop_reason : "end_turn");
+				stop_reason_is_tool = (strcmp(stop_reason, "tool_use") == 0);
+				break;
+			}
+		}
+
+		/* done streaming this iteration */
+		httprespfree(r);
+		httpclose(c);
+
+		if(rc == ANT_EOF && stop_reason[0] == '\0') {
+			oauthtokenfree(tok);
+			free(textbuf);
+			werrstr("agentrunant: SSE stream ended without stop_reason");
+			return -1;
+		}
+
+		if(!stop_reason_is_tool) {
+			/*
+			 * Normal text turn complete (stop_reason "end_turn").
+			 * Append assistant text message to history.
+			 */
+			antreqaddmsg(req, antmsgassistant(textbuf));
+
+			/* emit turn_end */
+			emitandsave(cfg, "turn_end", "end_turn", nil);
+			if(cfg->sess_bio != nil)
+				Bflush(cfg->sess_bio);
+
+			oauthtokenfree(tok);
+			free(textbuf);
+			return 0;
+		}
+
+		/*
+		 * Tool call turn (stop_reason "tool_use").
+		 *
+		 * 1. Append assistant message (text + tool_use) to history.
+		 * 2. Emit tool_start event.
+		 * 3. Execute the tool.
+		 * 4. Emit tool_end event.
+		 * 5. Append tool result (user message) to history.
+		 * 6. Loop back to POST again.
+		 */
+
+		/* append assistant message: text + tool_use block */
+		antreqaddmsg(req, antmsgtooluse(
+		    textbuf[0] ? textbuf : nil,
+		    tool_id[0]   ? tool_id   : "toolu_unknown",
+		    tool_name[0] ? tool_name : "exec",
+		    argsbuf[0]   ? argsbuf   : "{}"));
+
+		/* emit tool_start */
+		{
+			char *tsargv[EXEC_MAXARGV + 1];
+			char *tsstdin = nil;
+			int   tsargc;
+
+			tsargc = execparse(argsbuf, argslen, tsargv, EXEC_MAXARGV, &tsstdin);
+			free(tsstdin);
+
+			if(tsargc > 0) {
+				char  buf[65536];
+				long  total = 0;
+				int   first = 1;
+				int   j;
+
+				for(j = 0; j < tsargc + 3; j++) {
+					char *fld;
+					long  flen;
+					if(j == 0)      fld = "tool_start";
+					else if(j == 1) fld = tool_name;
+					else if(j == 2) fld = tool_id;
+					else            fld = tsargv[j - 3];
+
+					if(!first) {
+						if(total < (long)sizeof buf - 1) buf[total] = '\x1f';
+						total++;
+					}
+					first = 0;
+					flen = strlen(fld);
+					{
+						long rem = (long)sizeof buf - 1 - total;
+						if(rem < 0) rem = 0;
+						long copy = flen < rem ? flen : rem;
+						if(copy > 0) memmove(buf + total, fld, copy);
+					}
+					total += flen;
+				}
+				if(total < (long)sizeof buf - 1) buf[total] = '\x1e';
+				total++;
+				{
+					long wlen = total < (long)sizeof buf ? total : (long)sizeof buf - 1;
+					buf[wlen] = '\0';
+					if(cfg->onevent != nil) cfg->onevent(buf, wlen, cfg->aux);
+					if(cfg->sess_bio != nil) Bwrite(cfg->sess_bio, buf, wlen);
+				}
+
+				for(j = 0; j < tsargc; j++) free(tsargv[j]);
+			} else {
+				emitandsave(cfg, "tool_start", tool_name, tool_id, nil);
+			}
+		}
+
+		/* execute the tool */
+		{
+			ExecResult *er;
+			char        result[EXEC_MAXOUT + 64];
+			int         is_error;
+
+			er = execrun(argsbuf, argslen);
+			if(er == nil) {
+				char errbuf[256];
+				rerrstr(errbuf, sizeof errbuf);
+				emitandsave(cfg, "tool_end", "err", errbuf, nil);
+				antreqaddmsg(req, antmsgtoolresult(
+				    tool_id[0] ? tool_id : "toolu_unknown",
+				    errbuf, 1));
+				if(cfg->sess_bio != nil) Bflush(cfg->sess_bio);
+			} else {
+				is_error = (er->exitcode != 0);
+				execresultstr(er, result, sizeof result);
+
+				emitandsave(cfg, "tool_end",
+				    is_error ? "err" : "ok",
+				    result, nil);
+				if(cfg->sess_bio != nil) Bflush(cfg->sess_bio);
+
+				antreqaddmsg(req, antmsgtoolresult(
+				    tool_id[0] ? tool_id : "toolu_unknown",
+				    result, is_error));
+				execresultfree(er);
+			}
+		}
+
+		/* loop: POST again with tool result in history */
+	}
+
+	/* hit MAX_ITERATIONS */
+	oauthtokenfree(tok);
+	free(textbuf);
+	werrstr("agentrunant: exceeded %d tool iterations", MAX_ITERATIONS);
 	return -1;
 }

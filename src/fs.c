@@ -69,6 +69,7 @@
 #include "models.h"
 #include "sse.h"
 #include "oai.h"
+#include "ant.h"
 #include "exec.h"
 #include "agent.h"
 #include "fs.h"
@@ -603,6 +604,17 @@ fswrite(Req *r)
 		qlock(&g->lk);
 		p9free(g->model);
 		g->model = p9strdup(newmodel);
+		/* update history model fields and wire format */
+		if(g->oaireq != nil) {
+			p9free(g->oaireq->model);
+			g->oaireq->model = p9strdup(newmodel);
+		}
+		if(g->antreq != nil) {
+			p9free(g->antreq->model);
+			g->antreq->model = p9strdup(newmodel);
+		}
+		/* infer format: "claude-" prefix → Anthropic Messages */
+		g->fmt = (strncmp(newmodel, "claude-", 7) == 0) ? Fmt_Ant : Fmt_Oai;
 		qunlock(&g->lk);
 		r->ofcall.count = r->ifcall.count;
 		respond(r, nil);
@@ -630,6 +642,8 @@ fswrite(Req *r)
 			qlock(&g->lk);
 			oaireqfree(g->oaireq);
 			g->oaireq = oaireqnew(g->model);
+			antreqfree(g->antreq);
+			g->antreq = antreqnew(g->model);
 			g->uuid[0] = '\0';
 			if(g->sess_bio != nil) {
 				int fd2 = g->sess_bio->fid;
@@ -651,11 +665,17 @@ fswrite(Req *r)
 			qlock(&g->lk);
 			p9free(g->model);
 			g->model = p9strdup(nm);
-			/* update OAIReq model too */
+			/* update OAIReq and ANTReq model too */
 			if(g->oaireq != nil) {
 				p9free(g->oaireq->model);
 				g->oaireq->model = p9strdup(nm);
 			}
+			if(g->antreq != nil) {
+				p9free(g->antreq->model);
+				g->antreq->model = p9strdup(nm);
+			}
+			/* infer wire format from model id */
+			g->fmt = (strncmp(nm, "claude-", 7) == 0) ? Fmt_Ant : Fmt_Oai;
 			qunlock(&g->lk);
 			r->ofcall.count = r->ifcall.count;
 			respond(r, nil);
@@ -800,11 +820,20 @@ fsdestroyfid(Fid *fid)
 								p9free(g->oaireq->model);
 								g->oaireq->model = p9strdup(g->model);
 							}
+							if(g->antreq != nil) {
+								p9free(g->antreq->model);
+								g->antreq->model = p9strdup(g->model);
+							}
+							/* infer format from loaded model */
+							g->fmt = (strncmp(g->model, "claude-", 7) == 0) ? Fmt_Ant : Fmt_Oai;
 						}
-						/* replace history */
+						/* replace OAI history (session file uses OAI format for load) */
 						oaireqfree(g->oaireq);
 						newreq->model = p9strdup(g->model);
 						g->oaireq = newreq;
+						/* reset ANT history to empty for this model */
+						antreqfree(g->antreq);
+						g->antreq = antreqnew(g->model);
 						memmove(g->uuid, tmpcfg.uuid, 37);
 						g->sess_bio = tmpcfg.sess_bio;
 						/* emit session_new event with loaded uuid */
@@ -1183,7 +1212,15 @@ agentproc(void *v)
 		cfg.aux      = nil;
 		qunlock(&g->lk);
 
-		int rc = agentrun(req->text, g->oaireq, &cfg);
+		int rc;
+		qlock(&g->lk);
+		int fmt = g->fmt;
+		qunlock(&g->lk);
+
+		if(fmt == Fmt_Ant)
+			rc = agentrunant(req->text, g->antreq, &cfg);
+		else
+			rc = agentrun(req->text, g->oaireq, &cfg);
 
 		/* send [done] sentinel before EOF on /output */
 		chansendp(g->outchan, p9strdup("[done]\n"));
@@ -1228,6 +1265,8 @@ aiinit(char *model, char *sockpath, char *tokpath)
 	ai->sockpath = p9strdup(sockpath);
 	ai->tokpath  = p9strdup(tokpath);
 	ai->oaireq   = oaireqnew(model);
+	ai->antreq   = antreqnew(model);
+	ai->fmt      = Fmt_Oai;  /* default; switched when model changes */
 
 	ai->reqchan   = chancreate(sizeof(void*), 8);  /* buffered: fsdestroyfid must not block srv */
 	ai->outchan   = chancreate(sizeof(void*), 16);

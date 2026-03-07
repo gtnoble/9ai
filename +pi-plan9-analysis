@@ -798,8 +798,10 @@ Flush handler must cancel both pending_output and pending_event on disconnect.
        agentsessload() + /session/save + /session/load wired; 50 tests — all pass.  ✓ DONE
   [13] Anthropic Messages request builder + SSE event parser (add alongside OAI)  ✓ DONE
        src/ant.h + src/ant.c + src/anttest.c: 7 req-builder + 2 fixture + 6 live tests (39 total) — all pass.  ✓ DONE
-  [14] Agent loop extended: Anthropic format + thinking blocks
-       Test: full tool loop with claude-sonnet-4.5; thinking events in /event
+  [14] Agent loop extended: Anthropic format + thinking blocks  ✓ DONE
+       agentrunant() in agent.c; Fmt_Ant dispatch in fs.c; antmsgtooluse/result;
+       thinking→event+session only (not API history); empty text block fix in ant.c;
+       claude-sonnet-4.5 full tool loop verified live; 7+1 unit+live tests all pass.
   [15] 9ai-acme — fresh acme integration script
        Test: full interactive session in acme; model picker shows /models output
   [16] 9ai-sessions companion script
