@@ -541,21 +541,28 @@ Three procs communicate via channels.  No select/epoll anywhere.
   lib9p, libbio, libthread
   mk + mkfile
 
-### What differs: port.c (~50 lines)
+### What differs: port.c (implemented, src/port.c)
 
   char *homedir(void)
   {
       char *h;
-      if((h = getenv("home")) != nil) return h;
-      if((h = getenv("HOME")) != nil) return h;
+      if((h = getenv("home")) != nil && h[0] != '\0') return h;
+      free(h);
+      if((h = getenv("HOME")) != nil && h[0] != '\0') return h;
+      free(h);
       return smprint("/usr/%s", getuser());
   }
 
   char *configpath(char *name)   /* ~/lib/9ai/<name> */
   {
-      return smprint("%s/lib/9ai/%s", homedir(), name);
+      char *h, *p;
+      h = homedir();
+      p = smprint("%s/lib/9ai/%s", h, name);
+      free(h);
+      return p;
   }
 
+Both return smprint-allocated strings; caller must free().
 Plan 9 conventions throughout: ~/lib/9ai/, not ~/.config/.
 
 ### ioproc
@@ -704,7 +711,12 @@ Flush handler must cancel both pending_output and pending_event on disconnect.
 
 ## Implementation Order
 
-  [1]  port.c + mkfile — confirm build on plan9port
+  [1]  port.c + mkfile — DONE
+       src/port.c: homedir(), configpath(); free() of intermediate $home/$HOME
+       properly handled; both return smprint-allocated strings.
+       src/main.c: threadmain stub exercises both helpers.
+       src/mkfile: standard mkhdr/mkone pattern; mk test runs the binary.
+       Verified: homedir → /home/gtnoble, configpath(token) → ~/lib/9ai/token.
   [2]  HTTP client — dial + tlsClient, raw request/response
        Test: GET /models, print raw response body
   [3]  jsmn vendor + JSON helpers — token extraction, string compare, array walk
