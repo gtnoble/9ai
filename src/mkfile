@@ -6,10 +6,12 @@ OFILES=\
 	main.$O\
 	port.$O\
 	http.$O\
+	json.$O\
 
 HFILES=\
 	9ai.h\
 	http.h\
+	json.h\
 
 <$PLAN9/src/mkone
 
@@ -20,8 +22,15 @@ test-port:V: $O.$TARG
 # Stage 2: test HTTP client via 9aitls proxy
 # Start proxy first:  ./9aitls &
 # Requires ~/lib/9ai/token (GitHub access token)
-$O.httptest: httptest.$O port.$O http.$O
+$O.httptest: httptest.$O port.$O http.$O json.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-http:V: $O.httptest
 	./$O.httptest
+
+# Stage 3: unit-test JSON helpers
+$O.jsontest: jsontest.$O json.$O port.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-json:V: $O.jsontest
+	./$O.jsontest
