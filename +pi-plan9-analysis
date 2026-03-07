@@ -1,0 +1,737 @@
+# 9ai: Plan 9 C Agent — Design Document
+
+## Scope
+
+Port the pi LLM agent backend to Plan 9 C, exposing it as a 9P file server.
+No TUI.  GitHub Copilot provider only (Anthropic Messages wire format — Claude models).
+Targets native Plan 9 as the primary platform; plan9port on Linux/macOS also supported.
+
+The name is **9ai** (the 9P service is posted as "9ai").
+
+9ai provides the same class of capabilities as pi's RPC mode — multi-turn
+conversation, tool use, streaming output, session persistence, model switching,
+steering — but through a 9P file interface.  It has its own file layout, event
+format, and session storage.  9ai-acme is a fresh acme integration script that
+uses the 9P files directly.
+
+---
+
+## What We Are Building
+
+A standalone program that:
+
+  1. Posts a 9P service ("9ai") into the namespace on startup
+  2. Accepts user messages via /message; steering via /steer
+  3. Drives a multi-turn agent loop against the Copilot/Anthropic API
+  4. Provides the single exec tool (direct execve, no shell)
+  5. Streams LLM response text via /output (raw text, blocking reads)
+  6. Emits structured events via /event (RS/US-delimited records, blocking reads)
+  7. Appends a complete session record to ~/lib/9ai/sessions/<uuid>
+
+---
+
+## Record Format
+
+All structured data in 9ai — the /event stream and session files — uses a
+single record format built on two ASCII control characters that exist for
+exactly this purpose:
+
+  U+001F  0x1F  INFORMATION SEPARATOR ONE   — field separator (FS)
+  U+001E  0x1E  INFORMATION SEPARATOR TWO   — record separator (RS)
+
+A record is a sequence of fields separated by FS, terminated by RS:
+  field₀ FS field₁ FS field₂ RS
+
+Fields are verbatim byte strings.  Newlines, tabs, and all other characters
+pass through literally.  No escaping is needed for ordinary text.
+
+Literal FS or RS within a field value is represented by doubling:
+  0x1F 0x1F → literal 0x1F
+  0x1E 0x1E → literal 0x1E
+
+This doubling case is extremely rare in practice (these characters almost
+never appear in source code, command output, or prose).  The parser is simple:
+scan for 0x1E to find record boundaries, then split on 0x1F for fields, then
+collapse doubled separators.
+
+In C:
+  #define FS ""
+  #define RS ""
+
+  Bprint(b, "text" FS "%s" RS, chunk);
+  Bprint(b, "tool_end" FS "ok" FS "%s" RS, full_output);
+
+Human-readable conversion: `tr '' '	
+'`
+
+---
+
+## Event Records
+
+The first field of every record is the event type.
+
+Records delivered on /event (agent-side events only):
+
+  turn_start  FS  <session-uuid>  FS  <model>
+  thinking    FS  <text>
+  text        FS  <text>
+  tool_start  FS  <name>  FS  <tool-call-id>  FS  <argv[0]>  FS  <argv[1]>  ...
+  tool_end    FS  <ok|err>  FS  <full-output>
+  turn_end    FS  <end_turn|aborted|error>
+  error       FS  <message>
+  model       FS  <new-model-name>
+  session_new FS  <new-session-uuid>
+
+Additional records written only to the session file (inputs, not agent events):
+
+  session  FS  <uuid>  FS  <model>  FS  <unix-timestamp>   ← file header record
+  prompt   FS  <text>                                       ← user message sent
+  steer    FS  <text>                                       ← steering message sent
+
+Notes:
+  - tool_start has a variable number of fields: type, name, id, then one field
+    per argv element.  No quoting or joining needed; each element is its own field.
+  - text and thinking records carry individual delta chunks as they arrive from
+    the SSE stream.  On session replay, consecutive text records are concatenated
+    to reconstruct the full response.
+  - tool_end carries the full exec output — no truncation for the session file.
+    For the live /event stream the same full output is delivered.
+  - prompt and steer records are NOT emitted on /event; they record inputs and
+    belong only in the session file.
+
+---
+
+
+
+---
+
+## Wire Formats
+
+### Common Copilot headers (both formats)
+
+  Authorization: Bearer <copilot_token>
+  Content-Type: application/json
+  User-Agent: GitHubCopilotChat/0.35.0
+  Editor-Version: vscode/1.107.0
+  Editor-Plugin-Version: copilot-chat/0.35.0
+  Copilot-Integration-Id: vscode-chat
+  X-Initiator: user   (when last message is from user)
+              agent   (when last message is from assistant/tool)
+  Openai-Intent: conversation-edits
+
+### Format A: OpenAI Completions (gpt-4o, gpt-4.1, ...)
+
+Implemented first — free-tier Copilot models use this format.
+Free models confirmed (cost={input:0,output:0} in pi's model table):
+  gpt-4o    — 64K context, 16K output, compat: supportsStore=false,
+              supportsDeveloperRole=false, supportsReasoningEffort=false
+  gpt-4.1   — same compat flags, 128K context
+
+  POST https://api.individual.githubcopilot.com/chat/completions
+
+Request body:
+  {
+    "model": "gpt-4o",
+    "max_completion_tokens": 16384,
+    "stream": true,
+    "messages": [
+      {"role": "system", "content": "<system prompt>"},
+      {"role": "user",   "content": "<message>"},
+      ...
+    ],
+    "tools": [ { "type": "function", "function": { "name": "exec",
+      "parameters": { "type":"object", "properties": { ... } } } } ]
+  }
+
+Copilot compat (applies to all github-copilot OpenAI Completions models):
+  "store" field: omit (supportsStore=false)
+  System role: "system" not "developer" (supportsDeveloperRole=false)
+  Max tokens field: "max_completion_tokens" not "max_tokens"
+  reasoning_effort: omit (supportsReasoningEffort=false)
+  Assistant message content: must be a plain string, never an array
+    (Copilot rejects array content on assistant messages)
+
+SSE response:
+  data: {"choices":[{"delta":{"content":"text chunk"},"finish_reason":null}]}
+  data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+  data: [DONE]
+
+Tool call SSE:
+  data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc",
+         "function":{"name":"exec","arguments":""}}]}}]}
+  data: {"choices":[{"delta":{"tool_calls":[{"index":0,
+         "function":{"arguments":"{\"argv\":[\"ls\"]}"}}]}}]}
+  data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+Arguments accumulate across chunks into a JSON string; parse when
+finish_reason="tool_calls".  The arguments string is itself JSON:
+  {"argv":["ls","-l"],"stdin":""}
+
+Tool result for next request:
+  {"role":"tool","tool_call_id":"call_abc","content":"<output>"}
+
+### Format B: Anthropic Messages (all Claude models)
+
+  POST https://api.individual.githubcopilot.com/v1/messages
+
+Request body:
+  {
+    "model": "claude-sonnet-4.5",
+    "max_tokens": 32000,
+    "stream": true,
+    "system": "<system prompt>",
+    "messages": [ ... ],
+    "tools": [ { "name": "exec", "input_schema": { ... } } ]
+  }
+
+Tool definitions use "input_schema" not "parameters".
+No anthropic-version or anthropic-beta headers (Copilot proxy adds them).
+
+SSE response — event:/data: pairs:
+  event: content_block_start
+  data: {"type":"content_block_start","content_block":{"type":"text"}}
+
+  event: content_block_delta
+  data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"chunk"}}
+
+  event: content_block_delta
+  data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"..."}}
+
+  event: content_block_stop
+
+  event: message_delta
+  data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+  event: message_stop
+
+Tool call in SSE:
+  content_block_start: content_block.type="tool_use", id="toolu_01...", name="exec"
+  content_block_delta: delta.type="input_json_delta", partial_json="..."  (many)
+  content_block_stop:  parse accumulated input JSON → {"argv":[...],"stdin":"..."}
+
+Tool result (appended to messages as a user message):
+  {"role":"user","content":[{
+    "type":"tool_result",
+    "tool_use_id":"toolu_01...",
+    "content":"<output>",
+    "is_error": false
+  }]}
+
+---
+
+## The exec Tool
+
+### What the LLM sees
+
+One tool declaration, hardcoded as a constant string in the binary:
+
+  {
+    "name": "exec",
+    "description": "Execute a program directly (no shell). Use standard
+      Unix programs for all file operations: cat/head to read,
+      grep/find to search, ed/patch/awk/sed to edit, cc/mk to compile.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "argv": {
+          "type": "array", "items": {"type":"string"},
+          "description": "Program and arguments, e.g. [\"grep\",\"-r\",\"foo\",\"src\"]"
+        },
+        "stdin": {
+          "type": "string",
+          "description": "Optional text to supply as stdin."
+        }
+      },
+      "required": ["argv"]
+    }
+  }
+
+Anthropic Messages format uses "input_schema"; OpenAI Completions format uses "parameters".
+The binary emits the appropriate form based on the current model's wire format.
+
+### C implementation
+
+  1. Parse argv[] and optional stdin from accumulated input_json_delta JSON
+  2. threadspawn(fd[3], argv[0], argv): fork, wire up stdin/stdout/stderr pipes
+  3. If stdin provided: write to child stdin pipe, then close write end
+  4. Read stdout+stderr into a capped buffer (512KB; tail on overflow)
+  5. waitfor(pid): collect exit status
+  6. Return tool_result: output text + "\nexited N" suffix if nonzero
+
+No shell.  threadspawn() handles fork+exec on both Plan 9 (rfork) and plan9port.
+
+On Plan 9: rfork flags include RFNOTEG and RFCNAMEG (clean namespace for child;
+RFCNAMEG is ignored on plan9port).
+
+Abort: postnote(pid, "kill") on Plan 9, kill(pid, SIGTERM) on plan9port,
+then force-kill after 2s.
+
+---
+
+## 9P Interface
+
+### Service posting
+
+  threadpostmountsrv(&fs, "9ai", nil, 0)
+
+Posts to /srv/9ai on native Plan 9; to $NAMESPACE/9ai (unix socket) on plan9port.
+With -m flag, also mounts at /mnt/9ai.
+
+### File tree
+
+  /                    dir   0555
+  ├── ctl              rw    0600  commands (write) + state summary (read)
+  ├── message          wo    0200  user prompt; close triggers agent turn
+  ├── steer            wo    0200  steering prompt; close redirects running turn
+  ├── output           ro    0400  streaming response text (blocking reads)
+  ├── event            ro    0400  structured event stream (blocking reads)
+  ├── status           ro    0444  one-line agent state (non-blocking)
+  ├── model            rw    0600  current model name
+  ├── models           ro    0444  list of available models (non-blocking)
+  └── session/         dir   0555
+      ├── id           ro    0444  current session UUID (non-blocking)
+      ├── new          wo    0200  write anything → fresh session
+      ├── load         wo    0200  write file path → load session from disk
+      └── save         wo    0200  write file path → save session to disk
+
+Auth subtree deferred to v2 (v1 reads token from ~/lib/9ai/token at startup).
+
+### /message
+
+Client opens, writes the full message body (any number of writes, any size),
+closes.  Clunk triggers the agent turn.  The raw bytes between open and close
+are the message — no framing, no escaping.
+
+  echo 'explain foo()' | 9p write 9ai/message
+  { cat context.c; echo 'what does foo() do?' } | 9p write 9ai/message
+
+If opened while the agent is running: open returns error "agent busy".
+
+Implementation: fid->aux holds a Biobuf over a malloc'd buffer.
+Each write appends via Bwrite().  On clunk with OWRITE: extract buffer,
+send AgentReq{PROMPT, text} on reqchan.
+
+### /steer
+
+Same open→write→close semantics as /message, but sends a steering prompt.
+May be opened while a turn is in progress.  If no turn is running, behaves
+like /message.
+
+  echo 'focus on the error path' | 9p write 9ai/steer
+
+On clunk: sends AgentReq{STEER, text} on reqchan.  The agent proc aborts
+the current HTTP stream and issues a new request with the steering message.
+
+### /ctl
+
+Read: short multi-line state summary:
+  model claude-sonnet-4.5
+  status idle
+  session f47ac10b-58cc-4372-a567-0e02b2c3d479
+
+Write: imperative commands (no data payloads):
+  abort       -- interrupt running turn; kill any exec child
+  clear       -- wipe in-memory history (does not delete session file)
+  model <id>  -- switch model for the next turn
+
+### /output
+
+Blocking streaming read.  Each read(2) returns the next available chunk of
+response text.  Thinking text is excluded — /output carries only the final
+response.
+
+End-of-turn: sentinel followed by EOF:
+  [done]
+Re-open to read the next turn.
+
+### /event
+
+Blocking reads; one record per read (terminated by RS = 0x1E).
+Turn-scoped: /event delivers events for the current turn, then EOF at turn_end.
+Re-open to read the next turn.
+
+See "Event Records" above for the full record set and field layout.
+
+The /event stream and the session file use the same record format.
+The session file is the /event stream plus prompt/steer input records,
+all concatenated across all turns with a session header prepended.
+
+### /status
+
+Non-blocking.  Always returns immediately.  One of:
+  idle
+  running
+  tool
+  error: <message>
+
+### /model
+
+Read: current model name followed by newline.
+Write: switch model for the next turn.  A model event is emitted on /event.
+
+### /models
+
+Non-blocking read.  Returns one line per available model, tab-separated:
+  <id>  <format>  <ctx-k>  <max-out-k>  <tools>  <name>
+
+  id       model identifier as used with /model or /ctl model <id>
+  format   oai (OpenAI Completions) or ant (Anthropic Messages)
+  ctx-k    context window in thousands of tokens
+  max-out-k maximum output tokens in thousands
+  tools    y or n (tool call support)
+  name     human-readable display name
+
+Example:
+  gpt-4o	oai	64	16	y	GPT-4o
+  gpt-4.1	oai	128	16	y	GPT-4.1
+  claude-sonnet-4.5	ant	128	32	y	Claude Sonnet 4.5
+  claude-opus-4.5	ant	128	32	y	Claude Opus 4.5
+
+The list is populated at startup by fetching GET /models from the Copilot API,
+which returns live model availability for the authenticated account.
+Only models with supported_endpoints containing /chat/completions or /v1/messages
+and model_picker_enabled=true are included.
+The file is refreshed each time it is read (a new GET /models request is made).
+
+Used by 9ai-acme to populate the model picker window.  Also useful directly:
+  9p read 9ai/models
+  9p read 9ai/models | awk -F\t '$2=="oai"'   # OpenAI models only
+
+### /session/id
+
+Non-blocking.  Returns current session UUID + newline, or empty if none yet.
+
+### /session/new
+
+Write anything to start a fresh session.  In-memory history is cleared.
+A new session file is opened at ~/lib/9ai/sessions/<new-uuid>.
+A session_new event is emitted on /event with the new UUID.
+
+### /session/load
+
+Write a path to ~/lib/9ai/sessions/<uuid> to load that session.
+The session file is replayed: prompt/steer/text/tool records reconstruct
+the in-memory history for use in the next API request.
+Thinking records are loaded but not sent to the API.
+
+### /session/save
+
+Write a destination path to flush the current session file there.
+(The live session file is already being appended to continuously;
+this is for exporting a copy.)
+
+---
+
+## Session Storage
+
+Session files live at ~/lib/9ai/sessions/<uuid> — plain files, no extension.
+Each file is an append-only stream of records in the format described above.
+
+The file is self-describing: the first record is always:
+  session  FS  <uuid>  FS  <model>  FS  <unix-timestamp>  RS
+
+Subsequent records are written in order as events occur:
+  prompt   FS  <text>                          ← user sends /message
+  steer    FS  <text>                          ← user sends /steer
+  turn_start  FS  <uuid>  FS  <model>
+  thinking FS  <chunk>                         ← one record per delta
+  text     FS  <chunk>                         ← one record per delta
+  tool_start  FS  <name>  FS  <id>  FS  <argv[0]>  FS  ...
+  tool_end FS  <ok|err>  FS  <full-output>
+  turn_end FS  <end_turn|aborted|error>
+  model    FS  <name>                          ← if model changed mid-session
+
+The session file IS the complete record of the conversation.  No separate
+index, no JSON metadata.  Human-readable with `tr '' '	
+'`.
+
+### Session replay
+
+On load, the agent proc scans the session file forward:
+  - prompt/steer records → user messages in history
+  - text records (concatenated between turn_start and turn_end) → assistant response
+  - thinking records → thinking blocks (retained for display, not sent to API)
+  - tool_start + tool_end pairs → tool call + result in history
+  - model records → update current model
+
+The reconstructed history is translated into Anthropic messages format for
+the next API request.
+
+### emit_event() and write_session()
+
+The agent proc has two output paths per event:
+  emit_event(type, fields...)   → formats record, sends on eventchan (→ /event)
+  write_session(type, fields...)→ formats record, appends to session Biobuf
+
+For agent events (turn_start through session_new): both are called.
+For input events (prompt, steer): only write_session() is called.
+
+Both use the same field layout; the difference is purely in destination.
+The session Biobuf is flushed (Bflush) at turn_end and after tool_end.
+
+### 9ai-sessions companion script
+
+Lists sessions for display in a picker window:
+
+  9ai-sessions [dir]
+
+Reads ~/lib/9ai/sessions/ (or given dir).  For each file, reads the first
+record (type must be "session") and the first "prompt" record.
+Output: one tab-separated line per session:
+  <uuid>  <model>  <date>  <first-prompt-snippet>
+
+---
+
+## Concurrency Model
+
+Three procs communicate via channels.  No select/epoll anywhere.
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Main proc  (9P srv loop)                                        │
+  │  threadpostmountsrv → lib9p dispatch                             │
+  │                                                                  │
+  │  on /message clunk:   send(reqchan, AgentReq{PROMPT, text})      │
+  │  on /steer clunk:     send(reqchan, AgentReq{STEER, text})       │
+  │  on /ctl "abort":     send(abortchan, 1)                         │
+  │  on /output fsread:   park Req* in pending_output                │
+  │  on /event  fsread:   park Req* in pending_event                 │
+  │  on outchan recv:     respond(pending_output)                    │
+  │  on eventchan recv:   respond(pending_event)                     │
+  └──────────────────────────┬───────────────────────────────────────┘
+                             │ reqchan (AgentReq*)
+                             ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Agent proc                                                      │
+  │  recv(reqchan) → write_session(prompt/steer, ...)                │
+  │  check token expiry → refresh if needed                          │
+  │  iodial HTTP conn → tlsClient                                    │
+  │  write Anthropic request → Brdline SSE loop                      │
+  │  on thinking_delta:  emit_event + write_session("thinking",...)  │
+  │  on text_delta:      send(outchan, chunk)                        │
+  │                      emit_event + write_session("text",...)      │
+  │  on tool_use:        emit_event + write_session("tool_start",...) │
+  │                      threadspawn exec child, collect output      │
+  │                      emit_event + write_session("tool_end",...)  │
+  │                      loop back to API with tool result           │
+  │  on end_turn:        send(outchan, "[done]
+") then nil          │
+  │                      emit_event + write_session("turn_end",...)  │
+  │                      Bflush(session_bio)                         │
+  └──────────────────────────────────────────────────────────────────┘
+                             ↑ authchan (token string)
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Auth proc                                                       │
+  │  startup: load ~/lib/9ai/token or run OAuth device-code flow     │
+  │  send initial token on authchan                                  │
+  │  iosleep loop: refresh ~5 min before expiry                      │
+  └──────────────────────────────────────────────────────────────────┘
+
+  abortchan: main → agent
+
+---
+
+## Platform Portability
+
+### What is identical on both platforms
+
+  dial("tcp!host!port", nil, nil, nil)
+  tlsClient(fd, &conn)
+  threadspawn(fd[3], cmd, argv)
+  threadpostmountsrv(...)
+  lib9p, libbio, libthread
+  mk + mkfile
+
+### What differs: port.c (~50 lines)
+
+  char *homedir(void)
+  {
+      char *h;
+      if((h = getenv("home")) != nil) return h;
+      if((h = getenv("HOME")) != nil) return h;
+      return smprint("/usr/%s", getuser());
+  }
+
+  char *configpath(char *name)   /* ~/lib/9ai/<name> */
+  {
+      return smprint("%s/lib/9ai/%s", homedir(), name);
+  }
+
+Plan 9 conventions throughout: ~/lib/9ai/, not ~/.config/.
+
+### ioproc
+
+Used only for iodial().  Synchronous Brdline() inside the agent proc is safe
+because agent and 9P server run in separate procs.
+
+### Plan 9-specific benefits
+
+  rfork(RFCNAMEG): exec children get a clean namespace
+  werrstr/rerrstr: no errno, no strerror
+  Factotum (v2): OAuth token stored in factotum instead of ~/lib/9ai/token
+
+---
+
+## GitHub Copilot OAuth
+
+### Device code flow
+
+  Step 1: POST https://github.com/login/device/code
+          form: client_id=Iv1.b507a08c87ecfe98 scope=read:user
+          → device_code, user_code, verification_uri, interval, expires_in
+
+  Step 2: v1: print user_code + verification_uri to stderr.
+          v2: expose via /auth/device and /auth/status 9P files.
+
+  Step 3: Poll POST https://github.com/login/oauth/access_token
+          form: client_id=... device_code=... grant_type=urn:ietf:...device_code
+          iosleep(interval) between polls
+          → "authorization_pending": continue
+          → success: github_access_token
+
+  Step 4: Save github_access_token to ~/lib/9ai/token (mode 0600)
+
+  Step 5: GET https://api.github.com/copilot_internal/v2/token
+          Authorization: Bearer <github_access_token>
+          + Copilot headers
+          → copilot_token string + expires_at (unix timestamp)
+
+  Step 6: Parse proxy-ep from copilot_token:
+          proxy-ep=proxy.individual.githubcopilot.com
+          → replace "proxy." with "api." → base URL
+
+### Token refresh
+
+Before each API request: if time(0) > expires_at - 300, re-fetch step 5 inline.
+
+---
+
+## Conversation History
+
+### In-memory representation
+
+  typedef struct Block Block;
+  struct Block {
+      int   type;        /* BlockText, BlockThinking, BlockToolCall, BlockToolResult */
+      char *text;
+      char *tool_id;     /* BlockToolCall, BlockToolResult */
+      char *tool_name;   /* BlockToolCall */
+      char *tool_input;  /* BlockToolCall: accumulated JSON */
+      int   is_error;    /* BlockToolResult */
+      Block *next;
+  };
+
+  typedef struct Msg Msg;
+  struct Msg {
+      int    role;       /* RoleUser, RoleAssistant, RoleTool */
+      Block *content;
+      ulong  ts;
+      Msg   *next;
+  };
+
+Content blocks are necessary to correctly serialise multi-block assistant
+messages for the Anthropic API (a single turn can have thinking + text +
+tool_use blocks in sequence).
+
+### Orphaned tool call invariant
+
+Before sending a new user message, check: if the last assistant message has
+a tool_use block with no following tool_result, insert a synthetic error result:
+  role:toolResult, tool_id:<id>, is_error:true, text:"aborted"
+
+Prevents 400 errors after aborted turns.  ~30 lines of C.
+
+### Reconstruction from session file
+
+On /session/load, the agent proc scans forward through the session file:
+  prompt record       → new RoleUser message with BlockText
+  text records        → concatenate into RoleAssistant BlockText
+  thinking records    → RoleAssistant BlockThinking (not sent to API)
+  tool_start record   → RoleAssistant BlockToolCall (accumulate argv into JSON)
+  tool_end record     → RoleUser message with BlockToolResult
+  model record        → update current model name
+
+The argv fields from tool_start are re-joined into a JSON array for
+BlockToolCall.tool_input so the API request builder can serialise them.
+
+---
+
+## Known Risks
+
+### Risk 1: SNI — RESOLVED
+Tested live: Copilot API routes on HTTP Host header, not TLS SNI.
+plan9port tlsClient() works.  Cert mismatch: skip hostname verification.
+
+### Risk 2: HTTP/2 — NON-ISSUE
+HTTP/1.1 works for all Copilot endpoints.
+
+### Risk 3: JSON at scale
+Many jsmn parse calls per turn.  jsmn is zero-allocation; perf is fine.
+Code is verbose — budget the time.
+
+### Risk 4: Copilot API churn
+copilot_internal/v2/token is undocumented.  Shared risk with the TS version.
+
+### Risk 5: Anthropic tool input streaming
+Tool arguments accumulate across many input_json_delta events.
+Parse only at content_block_stop.  Write a unit test.
+
+### Risk 6: Dual pending Req* slots
+Flush handler must cancel both pending_output and pending_event on disconnect.
+
+---
+
+## Effort Estimate
+
+| Component                                | Lines | Days |
+|------------------------------------------|-------|------|
+| port.c (homedir, configpath)             |  ~50  | 0.25 |
+| HTTP/1.1 client + iodial                 | ~250  | 1.5  |
+| SSE line parser (shared)                 | ~150  | 0.75 |
+| jsmn vendor + JSON helpers               | ~150  | 0.5  |
+| GitHub Copilot OAuth + token refresh     | ~300  | 1.5  |
+| /models fetch + parser                   | ~100  | 0.5  |
+| OpenAI Completions request + SSE parser  | ~300  | 1.5  |
+| Anthropic Messages request + SSE parser  | ~300  | 1.5  |
+| Conversation history + session load      | ~400  | 2.0  |
+| exec tool (threadspawn + collect)        | ~150  | 0.75 |
+| Agent loop + emit_event/write_session    | ~350  | 1.75 |
+| 9P server (/output + /event + /models)   | ~550  | 2.75 |
+| 9ai-sessions companion script            |  ~80  | 0.25 |
+| mkfile + test harness                    |  ~50  | 0.25 |
+| **Total**                                | ~3130 | ~16  |
+
+---
+
+## Implementation Order
+
+  [1]  port.c + mkfile — confirm build on plan9port
+  [2]  HTTP client — dial + tlsClient, raw request/response
+       Test: GET /models, print raw response body
+  [3]  jsmn vendor + JSON helpers — token extraction, string compare, array walk
+       Test: unit tests against fixed JSON strings
+  [4]  OAuth flow — device code, poll, token fetch, persist ~/lib/9ai/token
+       Test: full login from scratch, verify token file written
+  [5]  /models fetch + parser — GET /models, parse to model list structs
+       Test: print parsed model table; verify gpt-4o present with format=oai
+  [6]  SSE line parser (shared) — Brdline loop, event:/data: extraction
+       Test: feed captured OpenAI SSE fixture, print event/data pairs
+  [7]  OpenAI Completions request builder + SSE delta parser
+       Test: one-shot POST with gpt-4o, stream raw text to stdout (no tools)
+  [8]  exec tool — threadspawn, collect output, return result
+       Test: exec ["echo","hello"], verify output captured
+  [9]  Agent loop (OpenAI format) — full tool loop with gpt-4o
+       Test: ask agent to list files; verify exec tool called; session file written
+  [10] emit_event / write_session helpers (RS/US record format)
+       Test: run two-turn session; tr '\x1f\x1e' '\t\n' < session file
+  [11] 9P server — /message, /steer, /output, /event, /ctl, /status, /model, /models
+       Test: 9p write 9ai/message + concurrent 9p read 9ai/output and /event
+  [12] Session persistence — /session/id, /session/new, /session/load, /session/save
+       Test: kill and restart with /session/load, verify history restored
+  [13] Anthropic Messages request builder + SSE event parser (add alongside OAI)
+       Test: one-shot POST with claude-sonnet-4.5, stream text to stdout
+  [14] Agent loop extended: Anthropic format + thinking blocks
+       Test: full tool loop with claude-sonnet-4.5; thinking events in /event
+  [15] 9ai-acme — fresh acme integration script using 9P files directly
+       Test: full interactive session in acme; model picker shows /models output
+  [16] 9ai-sessions companion script
+       Test: verify listing after step 12
