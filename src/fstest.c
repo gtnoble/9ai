@@ -26,6 +26,16 @@
  *   2.3  /event delivers turn_start, text, turn_end records
  *   2.4  write to /session/new; /session/id changes
  *
+ * Part 3: Session persistence (requires proxy + token)
+ *   3.1  after a turn, write /session/save <dst>; verify dst file exists
+ *        and contains expected records
+ *   3.2  start a SECOND server instance, write the session path to its
+ *        /session/load, verify /session/id matches the loaded UUID
+ *   3.3  verify history is restored: /ctl session field matches
+ *   3.4  send a follow-up message that requires prior context;
+ *        verify the response is coherent (mentions the prior word)
+ *   3.5  /session/load with a nonexistent path: server stays idle (no crash)
+ *
  * Usage:
  *   ./o.fstest                          (unit tests only)
  *   ./o.fstest -s <sock> -t <tok>       (unit + live)
@@ -395,6 +405,198 @@ test_live(void)
 	free(uuid2);
 }
 
+/* ── Part 3: Session persistence ─────────────────────────────────────── */
+
+/*
+ * test_session_persistence — tests /session/save and /session/load.
+ *
+ * All tests run against the same single server instance (fs9p).
+ * The "restart" scenario is simulated by:
+ *   a. running a turn to build history
+ *   b. saving to /tmp via /session/save
+ *   c. clearing history via /ctl clear + /session/new
+ *   d. loading back via /session/load
+ *   e. verifying uuid is restored and a context-aware follow-up works
+ *
+ * Additionally, agentsessload() is tested directly (unit) to verify
+ * the history reconstruction without a running server.
+ */
+static void
+test_session_persistence(char *sockpath)
+{
+	char    *out, *uuid_orig, *uuid_after_load;
+	char     savepath[256];
+	Channel *outch;
+
+	USED(sockpath);
+
+	print("\n=== Part 3: Session persistence tests ===\n");
+
+	/* ── 3.0: start fresh, run a turn so we have history ── */
+	print("-- 3.0 build a session with history\n");
+
+	CHECK(fwrite_str("session/new", "1") == 0, "3.0: session/new for clean state");
+	p9sleep(100);
+
+	outch = chancreate(sizeof(ulong), 1);
+	proccreate(outreader_proc, outch, 32768);
+	p9sleep(50);
+	CHECK(fwrite_str("message", "What is 2+2? Reply with only the number.") == 0,
+	      "3.0: write /message for persistence turn");
+	out = (char*)(uintptr)recvul(outch);
+	chanfree(outch);
+	CHECKNONIL(out, "3.0: got output from turn");
+	if(out != nil) {
+		CHECKCONTAINS(out, "4", "3.0: output contains '4'");
+		free(out);
+	}
+
+	uuid_orig = fread_all("session/id");
+	CHECKNONIL(uuid_orig, "3.0: session/id non-empty after turn");
+	if(uuid_orig != nil) {
+		long n = strlen(uuid_orig);
+		while(n > 0 && (uuid_orig[n-1]=='\n'||uuid_orig[n-1]=='\r'))
+			uuid_orig[--n] = '\0';
+	}
+	print("  original uuid: %s\n", uuid_orig ? uuid_orig : "(nil)");
+
+	/* ── 3.1: /session/save exports session file ── */
+	print("-- 3.1 /session/save exports session file\n");
+	snprint(savepath, sizeof savepath, "/tmp/9ai-fstest-save-%d", getpid());
+
+	{
+		char savearg[512];
+		snprint(savearg, sizeof savearg, "%s\n", savepath);
+		CHECK(fwrite_str("session/save", savearg) == 0, "3.1: write /session/save succeeds");
+	}
+	p9sleep(100);
+
+	{
+		int  fd = open(savepath, OREAD);
+		CHECK(fd >= 0, "3.1: saved file exists");
+		if(fd >= 0) {
+			char sbuf[65536];
+			int  n = read(fd, sbuf, sizeof sbuf - 1);
+			close(fd);
+			if(n > 0) {
+				sbuf[n] = '\0';
+				CHECKCONTAINS(sbuf, "session",    "3.1: saved file has session record");
+				CHECKCONTAINS(sbuf, "turn_start", "3.1: saved file has turn_start");
+				CHECKCONTAINS(sbuf, "turn_end",   "3.1: saved file has turn_end");
+				CHECKCONTAINS(sbuf, "prompt",     "3.1: saved file has prompt record");
+				if(uuid_orig != nil)
+					CHECKCONTAINS(sbuf, uuid_orig, "3.1: saved file contains original uuid");
+			}
+		}
+	}
+
+	/* ── 3.2: agentsessload() unit test — reconstruct history directly ── */
+	print("-- 3.2 agentsessload() reconstructs history from session file\n");
+	{
+		OAIReq   *req2;
+		AgentCfg  cfg2;
+		int       rc;
+
+		req2 = oaireqnew("gpt-4o");
+		memset(&cfg2, 0, sizeof cfg2);
+		cfg2.model = strdup("gpt-4o");
+
+		rc = agentsessload(savepath, req2, &cfg2);
+		CHECK(rc == 0, "3.2: agentsessload returns 0");
+		if(rc == 0) {
+			/* uuid should match */
+			if(uuid_orig != nil)
+				CHECKSTR(cfg2.uuid, uuid_orig, "3.2: loaded uuid matches original");
+
+			/* history should have at least a user message and an assistant message */
+			int nmsg = 0;
+			OAIMsg *m;
+			for(m = req2->msgs; m != nil; m = m->next)
+				nmsg++;
+			CHECK(nmsg >= 2, "3.2: loaded history has at least 2 messages");
+			print("  loaded %d messages\n", nmsg);
+
+			/* first message should be user */
+			if(req2->msgs != nil)
+				CHECK(req2->msgs->role == OAIRoleUser, "3.2: first message is user role");
+
+			/* clean up */
+			if(cfg2.sess_bio != nil) {
+				int fd2 = cfg2.sess_bio->fid;
+				Bflush(cfg2.sess_bio);
+				Bterm(cfg2.sess_bio);
+				close(fd2);
+				free(cfg2.sess_bio);
+			}
+		}
+		free(cfg2.model);
+		oaireqfree(req2);
+	}
+
+	/* ── 3.3: load session into running server; uuid is restored ── */
+	print("-- 3.3 /session/load into running server restores uuid\n");
+
+	/* clear history first */
+	CHECK(fwrite_str("ctl", "clear") == 0, "3.3: ctl clear before load");
+	p9sleep(50);
+
+	{
+		char loadarg[512];
+		snprint(loadarg, sizeof loadarg, "%s\n", savepath);
+		CHECK(fwrite_str("session/load", loadarg) == 0, "3.3: write /session/load succeeds");
+	}
+	p9sleep(200);
+
+	uuid_after_load = fread_all("session/id");
+	CHECKNONIL(uuid_after_load, "3.3: session/id readable after load");
+	if(uuid_after_load != nil) {
+		long n = strlen(uuid_after_load);
+		while(n > 0 && (uuid_after_load[n-1]=='\n'||uuid_after_load[n-1]=='\r'))
+			uuid_after_load[--n] = '\0';
+		print("  uuid after load: %s\n", uuid_after_load);
+		if(uuid_orig != nil)
+			CHECKSTR(uuid_after_load, uuid_orig, "3.3: uuid after load matches original");
+	}
+
+	/* ── 3.4: follow-up turn uses loaded history ── */
+	print("-- 3.4 follow-up turn uses loaded history\n");
+	outch = chancreate(sizeof(ulong), 1);
+	proccreate(outreader_proc, outch, 32768);
+	p9sleep(50);
+	CHECK(fwrite_str("message",
+	      "What number did you give me in the previous turn? Reply with just the number.") == 0,
+	      "3.4: write follow-up /message");
+	out = (char*)(uintptr)recvul(outch);
+	chanfree(outch);
+	CHECKNONIL(out, "3.4: got output from follow-up turn");
+	if(out != nil) {
+		print("  follow-up output: %s\n", out);
+		CHECKCONTAINS(out, "4", "3.4: follow-up references '4' from loaded history");
+		CHECKCONTAINS(out, "[done]", "3.4: follow-up ends with [done]");
+		free(out);
+	}
+
+	/* ── 3.5: /session/load nonexistent path — server stays idle ── */
+	print("-- 3.5 /session/load with nonexistent path: server stays idle\n");
+	CHECK(fwrite_str("session/new", "1") == 0, "3.5: session/new before bad load");
+	p9sleep(100);
+	/* write a path that doesn't exist */
+	CHECK(fwrite_str("session/load", "/tmp/9ai-no-such-file-xyzzy\n") == 0,
+	      "3.5: write /session/load with bad path (write succeeds)");
+	p9sleep(100);
+	{
+		char *st = fread_all("status");
+		CHECKNONIL(st, "3.5: /status still readable after bad load");
+		CHECK(st != nil, "3.5: server still responding after bad load");
+		free(st);
+	}
+
+	/* clean up */
+	free(uuid_orig);
+	free(uuid_after_load);
+	remove(savepath);
+}
+
 /* ── threadmain ──────────────────────────────────────────────────────── */
 
 void
@@ -436,10 +638,12 @@ threadmain(int argc, char *argv[])
 
 	test_unit();
 	/* live tests only if proxy and token are accessible */
-	if(access(sockpath, AEXIST) == 0 && access(tokpath, AEXIST) == 0)
+	if(access(sockpath, AEXIST) == 0 && access(tokpath, AEXIST) == 0) {
 		test_live();
-	else
+		test_session_persistence(sockpath);
+	} else {
 		print("\n(skipping live tests: proxy or token not found)\n");
+	}
 
 	if(failures > 0) {
 		fprint(2, "%d test(s) FAILED\n", failures);

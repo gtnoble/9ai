@@ -94,6 +94,34 @@ void genuuid(char *buf);
 int agentsessopen(AgentCfg *cfg);
 
 /*
+ * agentsessload — load an existing session file and reconstruct history.
+ *
+ * path:    path to the session file (e.g. ~/.cache/9ai/sessions/<uuid>)
+ * req:     an OAIReq to populate; caller should pass a freshly-allocated
+ *          oaireqnew() — existing messages are NOT cleared here, so pass
+ *          a fresh req or handle clearing before calling.
+ * cfg:     uuid is populated from the session header; sess_bio is opened
+ *          for append so subsequent turns write to the same file.
+ *
+ * Replay logic:
+ *   session  → sets cfg->uuid and (optionally) cfg->model
+ *   prompt   → oaireqaddmsg(req, oaimsguser(text))
+ *   text     → concatenated across records between turn_start/turn_end
+ *              → oaireqaddmsg(req, oaimsgassistant(full_text))
+ *   tool_start → accumulate name, id, argv fields into JSON
+ *   tool_end   → oaireqaddmsg(req, oaimsgtoolcall(...))
+ *              + oaireqaddmsg(req, oaimsgtoolresult(...))
+ *   model    → updates cfg->model (caller should sync to AiState)
+ *   steer    → ignored (not part of API history)
+ *   thinking → ignored (not sent to API)
+ *
+ * On success: cfg->uuid is set, cfg->sess_bio is open for append,
+ * req contains the full history.  Returns 0.
+ * On error: returns -1 and sets errstr.
+ */
+int agentsessload(char *path, OAIReq *req, AgentCfg *cfg);
+
+/*
  * agentsessclose — flush and close the session Biobuf.
  */
 void agentsessclose(AgentCfg *cfg);

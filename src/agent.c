@@ -218,6 +218,395 @@ agentsessclose(AgentCfg *cfg)
 	cfg->sess_bio = nil;
 }
 
+/* ── agentsessload — session file replay ─────────────────────────────── */
+
+/*
+ * splitrec — split a RS-terminated record into fields separated by FS.
+ *
+ * rec:    the record bytes (may contain embedded NULs in theory, but
+ *         our fields are text so we treat them as C strings)
+ * reclen: length in bytes including the trailing RS (0x1E)
+ * fields: output array of malloc'd strings; caller must free each
+ * maxfields: capacity of fields[]
+ *
+ * Returns the number of fields extracted (>= 1 if record is non-empty).
+ * The trailing RS is not included in any field.
+ *
+ * Handles doubled FS (0x1F 0x1F → literal 0x1F) and RS (0x1E 0x1E →
+ * literal 0x1E) per the design doc, though these are vanishingly rare.
+ */
+static int
+splitrec(char *rec, long reclen, char **fields, int maxfields)
+{
+	char *p, *end, *fbuf;
+	int   nf;
+	long  flen;
+
+	/* strip trailing RS if present */
+	end = rec + reclen;
+	if(end > rec && (uchar)*(end-1) == 0x1e)
+		end--;
+
+	nf  = 0;
+	p   = rec;
+
+	while(p < end && nf < maxfields) {
+		/* find next FS or end-of-record */
+		char *fs = p;
+		long  cap = 256;
+		long  wlen = 0;
+
+		fbuf = malloc(cap);
+		if(fbuf == nil)
+			break;
+
+		while(fs < end) {
+			uchar c = (uchar)*fs;
+			if(c == 0x1f) {
+				/* doubled FS → literal 0x1F; single FS → field separator */
+				if(fs+1 < end && (uchar)*(fs+1) == 0x1f) {
+					/* literal FS */
+					if(wlen + 1 >= cap) {
+						cap *= 2;
+						char *tmp = realloc(fbuf, cap);
+						if(tmp == nil) { free(fbuf); fbuf = nil; break; }
+						fbuf = tmp;
+					}
+					fbuf[wlen++] = 0x1f;
+					fs += 2;
+				} else {
+					/* field separator */
+					fs++;
+					break;
+				}
+			} else if(c == 0x1e) {
+				/* doubled RS → literal 0x1E */
+				if(fs+1 < end && (uchar)*(fs+1) == 0x1e) {
+					if(wlen + 1 >= cap) {
+						cap *= 2;
+						char *tmp = realloc(fbuf, cap);
+						if(tmp == nil) { free(fbuf); fbuf = nil; break; }
+						fbuf = tmp;
+					}
+					fbuf[wlen++] = 0x1e;
+					fs += 2;
+				} else {
+					/* should not happen after stripping trailing RS */
+					fs++;
+					break;
+				}
+			} else {
+				if(wlen + 1 >= cap) {
+					cap *= 2;
+					char *tmp = realloc(fbuf, cap);
+					if(tmp == nil) { free(fbuf); fbuf = nil; break; }
+					fbuf = tmp;
+				}
+				fbuf[wlen++] = c;
+				fs++;
+			}
+		}
+		if(fbuf == nil)
+			break;
+		fbuf[wlen] = '\0';
+		fields[nf++] = fbuf;
+		p = fs;
+		USED(flen);
+	}
+	return nf;
+}
+
+/*
+ * freesplit — free an array of fields returned by splitrec.
+ */
+static void
+freesplit(char **fields, int nf)
+{
+	int i;
+	for(i = 0; i < nf; i++)
+		free(fields[i]);
+}
+
+/*
+ * argv2json — convert an argv array into a JSON object string:
+ *   {"argv":["arg0","arg1",...],"stdin":""}
+ *
+ * Returns a malloc'd string.  Returns nil on error.
+ */
+static char *
+argv2json(char **argv, int argc)
+{
+	char *buf;
+	long  cap = 1024, len = 0;
+	int   i;
+
+	buf = malloc(cap);
+	if(buf == nil)
+		return nil;
+
+	len += snprint(buf + len, cap - len, "{\"argv\":[");
+	for(i = 0; i < argc; i++) {
+		if(i > 0) {
+			if(len + 2 < cap) { buf[len++] = ','; buf[len] = '\0'; }
+		}
+		/* JSON-encode argv[i]: escape backslash and double-quote */
+		char *s = argv[i];
+		if(len + 2 < cap) { buf[len++] = '"'; buf[len] = '\0'; }
+		while(*s) {
+			if(len + 4 >= cap) {
+				cap *= 2;
+				char *tmp = realloc(buf, cap);
+				if(tmp == nil) { free(buf); return nil; }
+				buf = tmp;
+			}
+			if(*s == '"' || *s == '\\') buf[len++] = '\\';
+			buf[len++] = *s++;
+		}
+		if(len + 2 < cap) { buf[len++] = '"'; buf[len] = '\0'; }
+	}
+	if(len + 32 < cap || (cap = len + 32, buf = realloc(buf, cap), buf != nil))
+		len += snprint(buf + len, cap - len, "],\"stdin\":\"\"}");
+	buf[len] = '\0';
+	return buf;
+}
+
+int
+agentsessload(char *path, OAIReq *req, AgentCfg *cfg)
+{
+	int     fd;
+	Biobuf  bio;
+	char   *line;
+	long    linelen;
+
+	/* State machine for reconstructing turns */
+	enum { ST_IDLE, ST_TURN, ST_TOOL };
+	int   state = ST_IDLE;
+
+	/* text accumulator for assistant response */
+	char *textbuf = nil;
+	long  textcap = 0, textlen = 0;
+
+	/* tool call accumulator */
+	char *tc_name = nil;
+	char *tc_id   = nil;
+	char **tc_argv = nil;
+	int   tc_argc  = 0;
+	int   tc_argv_cap = 0;
+
+	/* tool result accumulator */
+	char *tr_output  = nil;
+	int   tr_is_error = 0;
+
+	/* pending tool call (stored until we see tool_end) */
+	/* We need: assistant message with text+toolcall, then tool result */
+
+	fd = open(path, ORDWR);  /* ORDWR so we can later append */
+	if(fd < 0) {
+		werrstr("agentsessload: open %s: %r", path);
+		return -1;
+	}
+	Binit(&bio, fd, OREAD);
+
+	/*
+	 * Read records one at a time.  Records are terminated by RS (0x1E).
+	 * Brdline reads up to and including the delimiter.
+	 */
+	while((line = Brdline(&bio, 0x1e)) != nil) {
+		char  *fields[64];
+		int    nf;
+
+		linelen = Blinelen(&bio);
+		nf = splitrec(line, linelen, fields, 64);
+		if(nf == 0)
+			goto nextrecord;
+
+		/* dispatch on record type (field 0) */
+		if(strcmp(fields[0], "session") == 0) {
+			/* session FS uuid FS model FS timestamp */
+			if(nf >= 2)
+				memmove(cfg->uuid, fields[1],
+				        strlen(fields[1]) < 36 ? strlen(fields[1])+1 : 37);
+			/* optionally update model */
+			if(nf >= 3 && cfg->model != nil) {
+				free(cfg->model);
+				cfg->model = strdup(fields[2]);
+			}
+
+		} else if(strcmp(fields[0], "prompt") == 0) {
+			/* prompt FS text → user message */
+			if(nf >= 2)
+				oaireqaddmsg(req, oaimsguser(fields[1]));
+
+		} else if(strcmp(fields[0], "turn_start") == 0) {
+			/* begin accumulating assistant text */
+			state = ST_TURN;
+			free(textbuf);
+			textbuf = nil; textcap = 0; textlen = 0;
+
+		} else if(strcmp(fields[0], "text") == 0) {
+			/* text FS chunk — accumulate */
+			if(nf >= 2 && state == ST_TURN) {
+				long dlen = strlen(fields[1]);
+				if(textbuf == nil || textlen + dlen >= textcap) {
+					long newcap = (textcap == 0 ? 4096 : textcap * 2) + dlen + 1;
+					char *tmp = realloc(textbuf, newcap);
+					if(tmp != nil) {
+						textbuf = tmp;
+						textcap = newcap;
+					}
+				}
+				if(textbuf != nil && textlen + dlen < textcap) {
+					memmove(textbuf + textlen, fields[1], dlen);
+					textlen += dlen;
+					textbuf[textlen] = '\0';
+				}
+			}
+
+		} else if(strcmp(fields[0], "tool_start") == 0) {
+			/*
+			 * tool_start FS name FS id FS argv[0] FS argv[1] ...
+			 *
+			 * Before recording the tool call we emit the assistant text
+			 * message accumulated so far (it precedes the tool call in the
+			 * same assistant turn).
+			 */
+			int i;
+
+			/* free any previous tool accumulator */
+			free(tc_name); tc_name = nil;
+			free(tc_id);   tc_id   = nil;
+			if(tc_argv != nil) {
+				for(i = 0; i < tc_argc; i++) free(tc_argv[i]);
+				free(tc_argv);
+				tc_argv = nil;
+			}
+			tc_argc = 0; tc_argv_cap = 0;
+			free(tr_output); tr_output = nil;
+			tr_is_error = 0;
+
+			if(nf >= 2) tc_name = strdup(fields[1]);
+			if(nf >= 3) tc_id   = strdup(fields[2]);
+
+			/* collect argv fields (indices 3..nf-1) */
+			tc_argc = nf - 3;
+			if(tc_argc < 0) tc_argc = 0;
+			if(tc_argc > 0) {
+				tc_argv = malloc(tc_argc * sizeof(char*));
+				if(tc_argv != nil) {
+					for(i = 0; i < tc_argc; i++)
+						tc_argv[i] = strdup(fields[3 + i]);
+					tc_argv_cap = tc_argc;
+				} else {
+					tc_argc = 0;
+				}
+			}
+			state = ST_TOOL;
+
+		} else if(strcmp(fields[0], "tool_end") == 0) {
+			/*
+			 * tool_end FS ok|err FS output
+			 *
+			 * Now we have everything: emit the assistant message with
+			 * text (if any) + tool call, then the tool result.
+			 */
+			char *tool_args_json;
+			int   i;
+
+			if(nf >= 2) tr_is_error = (strcmp(fields[1], "err") == 0);
+			if(nf >= 3) { free(tr_output); tr_output = strdup(fields[2]); }
+
+			/* build JSON args from argv */
+			tool_args_json = argv2json(
+			    tc_argv != nil ? tc_argv : (char*[]){NULL, NULL},
+			    tc_argc);
+
+			oaireqaddmsg(req, oaimsgtoolcall(
+			    textbuf != nil && textlen > 0 ? textbuf : nil,
+			    tc_id   != nil ? tc_id   : "call_unknown",
+			    tc_name != nil ? tc_name : "exec",
+			    tool_args_json != nil ? tool_args_json : "{}"));
+			free(tool_args_json);
+
+			oaireqaddmsg(req, oaimsgtoolresult(
+			    tc_id     != nil ? tc_id     : "call_unknown",
+			    tr_output != nil ? tr_output : "",
+			    tr_is_error));
+
+			/* reset text accumulator for next tool or turn end */
+			free(textbuf); textbuf = nil; textcap = 0; textlen = 0;
+
+			free(tc_name); tc_name = nil;
+			free(tc_id);   tc_id   = nil;
+			free(tr_output); tr_output = nil;
+			if(tc_argv != nil) {
+				for(i = 0; i < tc_argc; i++) free(tc_argv[i]);
+				free(tc_argv); tc_argv = nil;
+			}
+			tc_argc = 0;
+			state = ST_TURN;  /* more text or turn_end may follow */
+
+		} else if(strcmp(fields[0], "turn_end") == 0) {
+			/*
+			 * turn_end — finalize the assistant response.
+			 * If we have accumulated text and no pending tool call,
+			 * add an assistant message.
+			 */
+			if(state == ST_TURN && textbuf != nil && textlen > 0)
+				oaireqaddmsg(req, oaimsgassistant(textbuf));
+
+			free(textbuf); textbuf = nil; textcap = 0; textlen = 0;
+			state = ST_IDLE;
+
+		} else if(strcmp(fields[0], "model") == 0) {
+			if(nf >= 2 && cfg->model != nil) {
+				free(cfg->model);
+				cfg->model = strdup(fields[1]);
+			}
+		}
+		/* steer, thinking: ignored for API history reconstruction */
+
+nextrecord:
+		freesplit(fields, nf);
+	}
+
+	Bterm(&bio);
+
+	/* clean up any partial state */
+	{
+		int i;
+		free(textbuf);
+		free(tc_name);
+		free(tc_id);
+		free(tr_output);
+		if(tc_argv != nil) {
+			for(i = 0; i < tc_argc; i++) free(tc_argv[i]);
+			free(tc_argv);
+		}
+	}
+
+	/*
+	 * Re-open for append so subsequent agentrun() calls write new records
+	 * to the same session file.
+	 */
+	fd = open(path, OWRITE);
+	if(fd < 0) {
+		werrstr("agentsessload: reopen for append %s: %r", path);
+		return -1;
+	}
+	/* seek to end */
+	seek(fd, 0, 2);
+
+	cfg->sess_bio = mallocz(sizeof *cfg->sess_bio, 1);
+	if(cfg->sess_bio == nil) {
+		close(fd);
+		werrstr("agentsessload: mallocz: %r");
+		return -1;
+	}
+	Binit(cfg->sess_bio, fd, OWRITE);
+
+	return 0;
+}
+
 /* ── Record formatting ────────────────────────────────────────────────── */
 
 /*

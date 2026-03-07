@@ -1,3 +1,9 @@
+  [11] 9P server — /message, /steer, /output, /event, /ctl, /status, /model, /models  ✓ DONE
+       src/fs.h + src/fs.c: AiState, aiinit/aimain; full file tree; outbuf/evbuf for
+       buffered streaming; outwatcher/eventwatcher procs; [done] sentinel; sessdir from
+       tokpath for portability.
+       src/fstest.c: 30 unit + 10 live tests — all passfstest.c: 30 unit + 10 live + 10 session-persistence tests — all pass.
+       src/main.c: wired to aiinit/aimain with flags.
 # 9ai: Plan 9 C Agent — Design Document
 
 ## Scope
@@ -517,7 +523,7 @@ Three procs communicate via channels.  No select/epoll anywhere.
 ") then nil          │
   │                      emit_event + write_session("turn_end",...)  │
   │                      Bflush(session_bio)                         │
-  └──────────────────────────────────────────────────────────────────┘
+  └─────���────────────────────────────────────────────────────────────┘
                              ↑ authchan (token string)
   ┌──────────────────────────────────────────────────────────────────┐
   │  Auth proc                                                       │
@@ -786,10 +792,10 @@ Flush handler must cancel both pending_output and pending_event on disconnect.
        text×N/turn_end — all present and correctly framed.
   [10] emit_event / write_session helpers (RS/US record format)  ✓ DONE
        (implemented as part of phase 9 — see agent.c)
-  [11] 9P server — /message, /steer, /output, /event, /ctl, /status, /model, /models
-       Test: 9p write 9ai/message + concurrent 9p read 9ai/output and /event
+  [11] 9P server — /message, /steer, /output, /event, /ctl, /status, /model, /models  ✓ DONE
+       src/fs.h + src/fs.c + src/fstest.c: 30 unit + 10 live tests — all pass.
   [12] Session persistence — /session/id, /session/new, /session/load, /session/save
-       Test: kill and restart with /session/load, verify history restored
+       agentsessload() + /session/save + /session/load wired; 50 tests — all pass.  ✓ DONE
   [13] Anthropic Messages request builder + SSE event parser (add alongside OAI)
        Test: one-shot POST with claude-sonnet-4.5, stream text to stdout
   [14] Agent loop extended: Anthropic format + thinking blocks

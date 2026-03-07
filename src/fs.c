@@ -739,8 +739,143 @@ fsdestroyfid(Fid *fid)
 		break;
 
 	case Qsession_load:
+		/*
+		 * Load a session from the path written by the client.
+		 * Reject if the agent is busy.
+		 * Clears current OAIReq history and replaces it with the
+		 * session loaded from the given path.
+		 * Updates g->uuid, g->model (from session header), g->sess_bio.
+		 */
+		if(w != nil && w->size > 0 && (fid->omode & 3) == OWRITE) {
+			char  sesspath[512];
+			int   n;
+
+			/* trim whitespace from the path */
+			n = w->size;
+			while(n > 0 && (w->buf[n-1]=='\n'||w->buf[n-1]=='\r'||w->buf[n-1]==' '))
+				w->buf[--n] = '\0';
+
+			if(n == 0 || n >= (int)sizeof sesspath) {
+				/* bad path — ignore silently */
+			} else {
+				memmove(sesspath, w->buf, n+1);
+
+				qlock(&g->lk);
+
+				/* reject if busy */
+				if(g->busy) {
+					qunlock(&g->lk);
+					/* cannot respond with error from destroyfid; just skip */
+				} else {
+					/* close current session */
+					if(g->sess_bio != nil) {
+						int fd2 = g->sess_bio->fid;
+						Bflush(g->sess_bio);
+						Bterm(g->sess_bio);
+						close(fd2);
+						p9free(g->sess_bio);
+						g->sess_bio = nil;
+					}
+					g->uuid[0] = '\0';
+
+					/* build a fresh OAIReq to fill */
+					OAIReq *newreq = oaireqnew(g->model);
+
+					/* AgentCfg for the load call */
+					AgentCfg tmpcfg;
+					memset(&tmpcfg, 0, sizeof tmpcfg);
+					tmpcfg.model   = p9strdup(g->model);
+					tmpcfg.sessdir = nil;
+					tmpcfg.sess_bio = nil;
+
+					qunlock(&g->lk);
+
+					if(agentsessload(sesspath, newreq, &tmpcfg) == 0) {
+						qlock(&g->lk);
+						/* replace model if session had one */
+						if(tmpcfg.model != nil && tmpcfg.model[0] != '\0') {
+							p9free(g->model);
+							g->model = p9strdup(tmpcfg.model);
+							if(g->oaireq != nil) {
+								p9free(g->oaireq->model);
+								g->oaireq->model = p9strdup(g->model);
+							}
+						}
+						/* replace history */
+						oaireqfree(g->oaireq);
+						newreq->model = p9strdup(g->model);
+						g->oaireq = newreq;
+						memmove(g->uuid, tmpcfg.uuid, 37);
+						g->sess_bio = tmpcfg.sess_bio;
+						/* emit session_new event with loaded uuid */
+						char evbuf2[64];
+						snprint(evbuf2, sizeof evbuf2, "session_new\x1f%s\x1e", g->uuid);
+						char *evcopy2 = p9strdup(evbuf2);
+						chansendp(g->eventchan, evcopy2);
+						qunlock(&g->lk);
+					} else {
+						/* load failed — restore a fresh state */
+						oaireqfree(newreq);
+						qlock(&g->lk);
+						g->errmsg[0] = '\0';
+						rerrstr(g->errmsg, sizeof g->errmsg);
+						qunlock(&g->lk);
+					}
+					p9free(tmpcfg.model);
+				}
+			}
+		}
+		wbuffree(w);
+		fid->aux = nil;
+		break;
+
 	case Qsession_save:
-		/* phase 12 stubs: accept and ignore */
+		/*
+		 * Copy the live session file to the path written by the client.
+		 * The live session file is at the path derived from g->uuid
+		 * and the sessions directory (tokpath parent/sessions/<uuid>).
+		 */
+		if(w != nil && w->size > 0 && (fid->omode & 3) == OWRITE) {
+			char  dstpath[512];
+			int   n;
+
+			n = w->size;
+			while(n > 0 && (w->buf[n-1]=='\n'||w->buf[n-1]=='\r'||w->buf[n-1]==' '))
+				w->buf[--n] = '\0';
+
+			if(n > 0 && n < (int)sizeof dstpath) {
+				memmove(dstpath, w->buf, n+1);
+
+				qlock(&g->lk);
+				if(g->sess_bio != nil) Bflush(g->sess_bio);
+				char uuid_copy[37];
+				memmove(uuid_copy, g->uuid, 37);
+				char *tp = p9strdup(g->tokpath);
+				qunlock(&g->lk);
+
+				if(uuid_copy[0] != '\0') {
+					char *slash = strrchr(tp, '/');
+					if(slash != nil) *slash = '\0';
+					char *srcpath = smprint("%s/sessions/%s", tp, uuid_copy);
+
+					/* open src, open dst, copy */
+					int   sfd = open(srcpath, OREAD);
+					if(sfd >= 0) {
+						int dfd = create(dstpath, OWRITE, 0600);
+						if(dfd >= 0) {
+							char copybuf[4096];
+							int  nr;
+							while((nr = read(sfd, copybuf, sizeof copybuf)) > 0)
+								write(dfd, copybuf, nr);
+							close(dfd);
+						}
+						close(sfd);
+					}
+					p9free(srcpath);
+				}
+				p9free(tp);
+			}
+		}
 		wbuffree(w);
 		fid->aux = nil;
 		break;
