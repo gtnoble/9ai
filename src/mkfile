@@ -12,6 +12,7 @@ OFILES=\
 	sse.$O\
 	oai.$O\
 	exec.$O\
+	agent.$O\
 
 HFILES=\
 	9ai.h\
@@ -22,6 +23,7 @@ HFILES=\
 	sse.h\
 	oai.h\
 	exec.h\
+	agent.h\
 
 <$PLAN9/src/mkone
 
@@ -79,3 +81,10 @@ $O.exectest: exectest.$O port.$O json.$O exec.$O
 
 test-exec:V: $O.exectest
 	./$O.exectest
+
+# Stage 9: agent loop (OAI format) — tool loop, emit_event, write_session
+$O.agenttest: agenttest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O exec.$O agent.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-agent:V: $O.agenttest
+	./$O.agenttest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token

@@ -717,24 +717,75 @@ Flush handler must cancel both pending_output and pending_event on disconnect.
        src/main.c: threadmain stub exercises both helpers.
        src/mkfile: standard mkhdr/mkone pattern; mk test runs the binary.
        Verified: homedir → /home/gtnoble, configpath(token) → ~/lib/9ai/token.
-  [2]  HTTP client — dial + tlsClient, raw request/response
-       Test: GET /models, print raw response body
-  [3]  jsmn vendor + JSON helpers — token extraction, string compare, array walk
-       Test: unit tests against fixed JSON strings
-  [4]  OAuth flow — device code, poll, token fetch, persist ~/lib/9ai/token
-       Test: full login from scratch, verify token file written
-  [5]  /models fetch + parser — GET /models, parse to model list structs
-       Test: print parsed model table; verify gpt-4o present with format=oai
-  [6]  SSE line parser (shared) — Brdline loop, event:/data: extraction
-       Test: feed captured OpenAI SSE fixture, print event/data pairs
-  [7]  OpenAI Completions request builder + SSE delta parser
-       Test: one-shot POST with gpt-4o, stream raw text to stdout (no tools)
-  [8]  exec tool — threadspawn, collect output, return result
-       Test: exec ["echo","hello"], verify output captured
-  [9]  Agent loop (OpenAI format) — full tool loop with gpt-4o
-       Test: ask agent to list files; verify exec tool called; session file written
-  [10] emit_event / write_session helpers (RS/US record format)
-       Test: run two-turn session; tr '\x1f\x1e' '\t\n' < session file
+  [2]  HTTP client — dial + tlsClient, raw request/response  ✓ DONE
+       Design pivot: plan9port tlsClient requires #a/tls kernel device absent
+       on Linux.  Replaced with proxy architecture for full portability:
+       src/9aitls: Python proxy, listens on Unix socket ~/lib/9ai/proxy.sock,
+       strips chunked TE, forwards plain HTTP to Copilot API over TLS.
+       src/http.c: dials unix!path, plain HTTP/1.1, single Biobuf per conn.
+       On native Plan 9: replace 9aitls with rc+tlssrv filter; C unchanged.
+       Sandbox note: start proxy via SCREENDIR=~/.cache/screen screen -dmS 9aitls
+       Verified: HTTP 200, full model JSON received cleanly.
+  [3]  jsmn vendor + JSON helpers — token extraction, string compare, array walk  ✓ DONE
+       src/vendor/jsmn/jsmn.h: zserge/jsmn header-only tokeniser (MIT licence)
+       src/json.h + src/json.c: jsoneq, jsonstr, jsonint, jsonget, jsonnext,
+       jsonemitstr, jsonemitstrn.
+       src/jsontest.c: 51 unit tests — oauth shapes, /models array walk,
+       OAI SSE text delta, tool_calls delta, string unescape (\uXXXX),
+       control char emission.  All pass.
+  [4]  OAuth flow — device code, poll, token fetch, persist ~/lib/9ai/token  ✓ DONE
+       src/oauth.c + src/oauth.h:
+         oauthlogin()    — device code flow against github.com; persists
+                           GitHub access token (ghu_...) to ~/lib/9ai/token
+         oauthsession()  — exchanges refresh token for Copilot session token
+                           (tid=...;exp=...;...) via api.github.com; returns
+                           OAuthToken{token, expires_at, refresh_in}
+       9aitls upgraded to route from Host: header — now transparent for any
+       HTTPS host; no per-host config needed.
+       Verified: session exchange → GET /models HTTP 200 end-to-end.
+  [5]  /models fetch + parser — GET /models, parse to model list structs  ✓ DONE
+       src/models.c + src/models.h: modelsfetch() → GET /models → Model linked
+       list; modelsfmt() → tab-separated /models file body; modelsfree().
+       Filtering: model_picker_enabled=true only.
+       Format detection: Fmt_Ant if /v1/messages present (preferred), else Fmt_Oai.
+       Fields: id, name, vendor, ctx_k, maxout_k (from capabilities.limits),
+       tools (from capabilities.supports.tool_calls).
+       modelstest.c: 17 unit checks on 3-model fixture (filtering, ant-preference,
+       all fields, modelsfmt output) + 4 live integration checks (12 models,
+       ant+oai both present, all IDs non-empty). All pass.
+  [6]  SSE line parser (shared) — Brdline loop, event:/data: extraction  ✓ DONE
+       src/sse.c + src/sse.h: SSEParser (stack-allocated, 65KB databuf);
+       sseinit(), ssestep() → SSE_OK/SSE_DONE/SSE_EOF.
+       Handles OAI (no event: lines) and ANT (event:/data: pairs) uniformly;
+       skips blank lines and ':' comments; [DONE]→DONE, EOF→EOF.
+       Bug caught: ev.event points into evbuf — must not clear evbuf[0] until
+       next ssestep() call; fixed by only resetting have_event flag on deliver.
+       173 unit checks across 4 real captured fixtures (oai_text 5, ant_text 7,
+       oai_tool 11, ant_tool 11 events) + EOF-without-DONE + comment-skip.
+       2 live integration tests: OAI assembles "hello world", ANT assembles
+       "hello world". All pass.
+  [7]  OpenAI Completions request builder + SSE delta parser  ✓ DONE
+       src/oai.h + src/oai.c: OAIReq builder (user/assistant/tool msgs, JSON emit),
+       oaireqhdrs() (X-Initiator, Copilot compat), OAIParser/oaidelta() (text/tool/stop
+       delta events from SSE stream).  oaitest.c: 38 checks (5 JSON, 2 headers,
+       9 text-fixture, 12 tool-fixture, 5 live-text, 5 live-tool).  All pass.
+  [8]  exec tool — threadspawn, collect output, return result  ✓ DONE
+       src/exec.h + src/exec.c: execparse() (JSON→argv/stdin), execrun()
+       (threadspawn + pipe setup + ring-buffer output cap + procwait),
+       execabort() (SIGTERM→SIGKILL), execresultstr() (exit suffix).
+       exectest.c: 42 checks (7 parse, 6 run, 3 resultstr, 2 truncation).
+       All pass.
+  [9]  Agent loop (OpenAI format) + emit_event/write_session  ✓ DONE
+       src/agent.h + src/agent.c: genuuid() (truerand-based UUID v4),
+       agentsessopen/close (creates ~/lib/9ai/sessions/<uuid>),
+       emitevent/writesession/emitandsave (FS/RS record format, nil-vararg),
+       agentrun() (OAI tool loop: prompt→stream→exec→continue).
+       agenttest.c: 51 checks (7 unit: uuid, record format, callbacks;
+       1 live: gpt-4o lists /tmp files via exec, session file verified).
+       Session file records: session/turn_start/prompt/tool_start/tool_end/
+       text×N/turn_end — all present and correctly framed.
+  [10] emit_event / write_session helpers (RS/US record format)  ✓ DONE
+       (implemented as part of phase 9 — see agent.c)
   [11] 9P server — /message, /steer, /output, /event, /ctl, /status, /model, /models
        Test: 9p write 9ai/message + concurrent 9p read 9ai/output and /event
   [12] Session persistence — /session/id, /session/new, /session/load, /session/save
@@ -743,7 +794,7 @@ Flush handler must cancel both pending_output and pending_event on disconnect.
        Test: one-shot POST with claude-sonnet-4.5, stream text to stdout
   [14] Agent loop extended: Anthropic format + thinking blocks
        Test: full tool loop with claude-sonnet-4.5; thinking events in /event
-  [15] 9ai-acme — fresh acme integration script using 9P files directly
+  [15] 9ai-acme — fresh acme integration script
        Test: full interactive session in acme; model picker shows /models output
   [16] 9ai-sessions companion script
        Test: verify listing after step 12

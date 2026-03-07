@@ -1,0 +1,159 @@
+/*
+ * agent.h — agent loop, conversation history, and session I/O for 9ai
+ *
+ * Implements:
+ *   - Conversation history (Msg/Block linked list)
+ *   - emit_event() / write_session() — RS/US record format output
+ *   - agentrun() — full OAI tool loop: prompt → stream → exec → continue
+ *   - Session file creation and append
+ *   - UUID generation
+ *
+ * ── Record format ────────────────────────────────────────────────────
+ *
+ * Every record is:  field₀ FS field₁ … FS fieldₙ RS
+ *
+ *   FS = 0x1F  (INFORMATION SEPARATOR ONE — field separator)
+ *   RS = 0x1E  (INFORMATION SEPARATOR TWO — record separator)
+ *
+ * Fields are raw bytes; no quoting.  Literal FS/RS within a field value
+ * are doubled (0x1F 0x1F or 0x1E 0x1E) — vanishingly rare in practice.
+ *
+ * ── Conversation history ─────────────────────────────────────────────
+ *
+ * Stored as a linked list of Msg structs, each containing a linked list
+ * of Block content blocks.  The OAI serialiser in oai.c consumes this
+ * directly via the OAIReq/OAIMsg/OAIBlock types.
+ *
+ * ── Agent output ─────────────────────────────────────────────────────
+ *
+ * agentrun() delivers output through two callbacks:
+ *
+ *   ontext(text, aux)   — called for each streaming text delta
+ *   onevent(rec, len, aux) — called for each complete RS-terminated record
+ *
+ * Passing nil for a callback silences that output path.  In the test
+ * binary these write to stdout/a log buffer; in the 9P server they
+ * forward to /output and /event channels.
+ *
+ * ── Session file ─────────────────────────────────────────────────────
+ *
+ * agentrun() appends records to the session Biobuf if sess_bio != nil.
+ * The session header (session FS uuid FS model FS timestamp RS) is
+ * written by agentsessopen() when the file is first created.
+ *
+ * ── OAI format only ──────────────────────────────────────────────────
+ *
+ * Phase 9 implements the OpenAI Completions wire format (gpt-4o etc.).
+ * Anthropic Messages (Claude) is added in phase 13/14.
+ */
+
+/* ── Record separator constants ─────────────────────────────────────── */
+
+#define AIFS "\x1f"   /* field separator: 0x1F */
+#define AIRS "\x1e"   /* record separator: 0x1E */
+
+/* ── Agent configuration ─────────────────────────────────────────────── */
+
+typedef struct AgentCfg AgentCfg;
+
+struct AgentCfg {
+	char *model;       /* model id, e.g. "gpt-4o" */
+	char *sockpath;    /* path to 9aitls Unix socket */
+	char *tokpath;     /* path to GitHub refresh token file */
+	char *system;      /* system prompt (may be nil) */
+	char *sessdir;     /* session directory override (nil → ~/lib/9ai/sessions/) */
+
+	/* output callbacks — both may be nil */
+	void (*ontext)(const char *text, void *aux);
+	void (*onevent)(const char *rec, long len, void *aux);
+	void *aux;
+
+	/* session I/O — may be nil to skip session recording */
+	Biobuf *sess_bio;
+	char    uuid[37];  /* current session UUID (set by agentsessopen) */
+};
+
+/* ── Session management ──────────────────────────────────────────────── */
+
+/*
+ * genuuid — generate a random UUID v4 string into buf (must be ≥37 bytes).
+ * Uses truerand() which reads /dev/random on plan9port.
+ */
+void genuuid(char *buf);
+
+/*
+ * agentsessopen — open (create) a new session file.
+ *
+ * Creates ~/lib/9ai/sessions/ if needed.  Generates a new UUID, opens
+ * the file, writes the session header record, and populates cfg->uuid
+ * and cfg->sess_bio.
+ *
+ * Returns 0 on success, -1 on error (sets errstr).
+ * Caller must eventually call agentsessclose().
+ */
+int agentsessopen(AgentCfg *cfg);
+
+/*
+ * agentsessclose — flush and close the session Biobuf.
+ */
+void agentsessclose(AgentCfg *cfg);
+
+/* ── Record I/O ──────────────────────────────────────────────────────── */
+
+/*
+ * emitevent — format a record and deliver it to cfg->onevent.
+ *
+ * Fields are supplied as a nil-terminated vararg list of char *.
+ * Each field is written verbatim (no escaping — literal FS/RS are not
+ * doubled in this implementation; they're rare enough in practice).
+ *
+ * Example:
+ *   emitevent(cfg, "text", delta_text, nil);
+ *   emitevent(cfg, "tool_start", "exec", tool_id, argv0, nil);
+ */
+void emitevent(AgentCfg *cfg, ...);
+
+/*
+ * writesession — format a record and append it to cfg->sess_bio.
+ * Same vararg convention as emitevent().
+ */
+void writesession(AgentCfg *cfg, ...);
+
+/*
+ * emitandsave — call both emitevent() and writesession() with the same args.
+ * Convenience for agent events that go to both destinations.
+ */
+void emitandsave(AgentCfg *cfg, ...);
+
+/* ── Agent loop ──────────────────────────────────────────────────────── */
+
+/*
+ * agentrun — run one full agent turn starting from prompt.
+ *
+ * prompt:  the user message text
+ * req:     an OAIReq containing the existing conversation history;
+ *          agentrun() appends the user message and assistant response(s)
+ *          to req in place.  Pass an empty OAIReq for the first turn.
+ * cfg:     agent configuration, callbacks, session Biobuf
+ *
+ * The loop:
+ *   1. Append user message to req; emit "prompt" session record.
+ *   2. Obtain/refresh session token.
+ *   3. POST to /chat/completions; stream OAIDelta events.
+ *   4. Accumulate text/tool deltas; call cfg->ontext for text chunks.
+ *   5. On OAIDStop "stop": emit turn_end; flush session; return 0.
+ *   6. On OAIDStop "tool_calls":
+ *      a. emit tool_start event/session record
+ *      b. call execrun() with accumulated tool args JSON
+ *      c. emit tool_end event/session record
+ *      d. append tool result to req
+ *      e. loop back to step 3 (new POST with tool result in history)
+ *
+ * Returns 0 on success (turn completed with stop or tool_calls→result→stop).
+ * Returns -1 on error (network, parse, exec, etc.) — sets errstr.
+ *
+ * The session token is obtained fresh before the first POST of each
+ * agentrun() call and refreshed if the token is within 5 minutes of
+ * expiry between tool loops.
+ */
+int agentrun(char *prompt, OAIReq *req, AgentCfg *cfg);
