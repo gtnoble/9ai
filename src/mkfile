@@ -7,11 +7,13 @@ OFILES=\
 	port.$O\
 	http.$O\
 	json.$O\
+	oauth.$O\
 
 HFILES=\
 	9ai.h\
 	http.h\
 	json.h\
+	oauth.h\
 
 <$PLAN9/src/mkone
 
@@ -34,3 +36,10 @@ $O.jsontest: jsontest.$O json.$O port.$O
 
 test-json:V: $O.jsontest
 	./$O.jsontest
+
+# Stage 4: OAuth device flow + session token
+$O.oauthtest: oauthtest.$O port.$O http.$O json.$O oauth.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-oauth:V: $O.oauthtest
+	./$O.oauthtest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
