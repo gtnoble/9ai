@@ -8,12 +8,14 @@ OFILES=\
 	http.$O\
 	json.$O\
 	oauth.$O\
+	models.$O\
 
 HFILES=\
 	9ai.h\
 	http.h\
 	json.h\
 	oauth.h\
+	models.h\
 
 <$PLAN9/src/mkone
 
@@ -43,3 +45,10 @@ $O.oauthtest: oauthtest.$O port.$O http.$O json.$O oauth.$O
 
 test-oauth:V: $O.oauthtest
 	./$O.oauthtest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
+
+# Stage 5: /models fetch + parser
+$O.modelstest: modelstest.$O port.$O http.$O json.$O oauth.$O models.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-models:V: $O.modelstest
+	./$O.modelstest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
