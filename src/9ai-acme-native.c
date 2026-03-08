@@ -40,7 +40,10 @@
  *   aiproc    — reads /mnt/9ai/event per turn; appends formatted lines
  *   eventproc — reads /mnt/acme/<id>/event; dispatches tag commands
  *
- * All window writes are serialised with winlk.
+ * All threads share one OS process (threadcreate, not proccreate) so
+ * only one runs at a time.  No locking is needed for window writes.
+ * Exception: aiproc and outproc use proccreate so they are not blocked
+ * by eventproc holding the cooperative scheduler.
  */
 
 #include <u.h>
@@ -77,7 +80,6 @@ struct Win {
 };
 
 static Win  *mainwin;
-static QLock winlk;
 
 /* ── Forward declarations ───────────────────────────────────────────── */
 
@@ -164,8 +166,9 @@ newwin(char *name)
 }
 
 /*
- * winappend — append text to the main window body.
- * Uses addr/data so we always append at end regardless of selection.
+ * winappend — append text to a window body via addr/data.
+ * Safe to call from any thread: cooperative scheduling means only
+ * one thread runs at a time, so no locking is needed.
  */
 static void
 winappend(Win *w, char *text, int len)
@@ -177,7 +180,6 @@ winappend(Win *w, char *text, int len)
 	if(len == 0)
 		return;
 
-	qlock(&winlk);
 	afd = acmeopen(w->id, "addr", OWRITE);
 	dfd = acmeopen(w->id, "data", ORDWR);
 	if(afd >= 0 && dfd >= 0) {
@@ -186,7 +188,6 @@ winappend(Win *w, char *text, int len)
 	}
 	if(afd >= 0) close(afd);
 	if(dfd >= 0) close(dfd);
-	qunlock(&winlk);
 }
 
 static void
@@ -246,9 +247,11 @@ winbody(Win *w, int *np)
 
 /* ── Status line ────────────────────────────────────────────────────── */
 
-static char curmodel[128];
-static char cursession[37];
+static char  curmodel[128];
+static char  cursession[37];
 static QLock statelk;
+
+int mainstacksize = STACK;
 
 static void
 setstatus(char *state)
@@ -271,7 +274,6 @@ setstatus(char *state)
 
 	snprint(buf, sizeof buf, "● %s%s%s\n", state, modstr, sesstr);
 
-	qlock(&winlk);
 	afd = acmeopen(mainwin->id, "addr", OWRITE);
 	dfd = acmeopen(mainwin->id, "data", ORDWR);
 	if(afd >= 0 && dfd >= 0) {
@@ -280,7 +282,6 @@ setstatus(char *state)
 	}
 	if(afd >= 0) close(afd);
 	if(dfd >= 0) close(dfd);
-	qunlock(&winlk);
 }
 
 /* ── 9ai file access ────────────────────────────────────────────────── */
@@ -330,7 +331,6 @@ aiproc(void *v)
 	int   n;
 
 	USED(v);
-
 	buf = malloc(RECBUF);
 	rec = malloc(RECBUF);
 	if(buf == nil || rec == nil)
@@ -342,81 +342,67 @@ aiproc(void *v)
 			sleep(2000);
 			continue;
 		}
-
-		for(;;) {
-			n = read(fd, buf, RECBUF - 1);
-			if(n <= 0)
-				break;
-			buf[n] = '\0';
-
-			memmove(rec, buf, n + 1);
-			nf = splitrec(rec, n, fields, MAXFIELDS);
-			if(nf == 0)
-				continue;
-
-			type = fields[0];
-
-			if(strcmp(type, "turn_start") == 0) {
-				if(nf >= 3) {
-					qlock(&statelk);
-					scopy(curmodel, sizeof curmodel, fields[2]);
-					qunlock(&statelk);
-				}
-				setstatus("running");
-
-			} else if(strcmp(type, "thinking") == 0) {
-				if(nf >= 2) {
-					char *out = render_thinking(fields[1]);
-					if(out != nil) {
-						winappendstr(mainwin, out);
-						free(out);
-					}
-				}
-
-			} else if(strcmp(type, "tool_start") == 0) {
-				char *out = render_tool_start(fields, nf);
-				if(out != nil) { winappendstr(mainwin, out); free(out); }
-
-			} else if(strcmp(type, "tool_end") == 0) {
-				char *out = render_tool_end(fields, nf);
-				if(out != nil) { winappendstr(mainwin, out); free(out); }
-
-			} else if(strcmp(type, "turn_end") == 0) {
-				char *reason = (nf >= 2) ? fields[1] : "end_turn";
-				if(strcmp(reason, "aborted") == 0)
-					winappendstr(mainwin, "\n⛔ Aborted.\n");
-				else if(strcmp(reason, "error") == 0)
-					winappendstr(mainwin, "\n⚠ Agent error.\n");
-				setstatus("ready");
-
-			} else if(strcmp(type, "model") == 0) {
-				if(nf >= 2) {
-					qlock(&statelk);
-					scopy(curmodel, sizeof curmodel, fields[1]);
-					qunlock(&statelk);
-				}
-				setstatus("ready");
-
-			} else if(strcmp(type, "session_new") == 0) {
-				if(nf >= 2) {
-					qlock(&statelk);
-					scopy(cursession, sizeof cursession, fields[1]);
-					qunlock(&statelk);
-				}
-				setstatus("ready");
-
-			} else if(strcmp(type, "error") == 0) {
-				if(nf >= 2) {
-					char errbuf[256];
-					snprint(errbuf, sizeof errbuf, "\n⚠ %s\n", fields[1]);
-					winappendstr(mainwin, errbuf);
-				}
-				setstatus("error");
-			}
-		}
-
+		n = read(fd, buf, RECBUF - 1);
 		close(fd);
-		/* re-open for next turn */
+
+		if(n <= 0)
+			continue;
+		buf[n] = '\0';
+
+		memmove(rec, buf, n + 1);
+		nf = splitrec(rec, n, fields, MAXFIELDS);
+		if(nf == 0)
+			continue;
+
+		type = fields[0];
+
+		if(strcmp(type, "turn_start") == 0) {
+			if(nf >= 3) {
+				qlock(&statelk);
+				scopy(curmodel, sizeof curmodel, fields[2]);
+				qunlock(&statelk);
+			}
+			setstatus("running");
+		} else if(strcmp(type, "thinking") == 0) {
+			if(nf >= 2) {
+				char *out = render_thinking(fields[1]);
+				if(out != nil) { winappendstr(mainwin, out); free(out); }
+			}
+		} else if(strcmp(type, "tool_start") == 0) {
+			char *out = render_tool_start(fields, nf);
+			if(out != nil) { winappendstr(mainwin, out); free(out); }
+		} else if(strcmp(type, "tool_end") == 0) {
+			char *out = render_tool_end(fields, nf);
+			if(out != nil) { winappendstr(mainwin, out); free(out); }
+		} else if(strcmp(type, "turn_end") == 0) {
+			char *reason = (nf >= 2) ? fields[1] : "end_turn";
+			if(strcmp(reason, "aborted") == 0)
+				winappendstr(mainwin, "\n⛔ Aborted.\n");
+			else if(strcmp(reason, "error") == 0)
+				winappendstr(mainwin, "\n⚠ Agent error.\n");
+			setstatus("ready");
+		} else if(strcmp(type, "model") == 0) {
+			if(nf >= 2) {
+				qlock(&statelk);
+				scopy(curmodel, sizeof curmodel, fields[1]);
+				qunlock(&statelk);
+			}
+			setstatus("ready");
+		} else if(strcmp(type, "session_new") == 0) {
+			if(nf >= 2) {
+				qlock(&statelk);
+				scopy(cursession, sizeof cursession, fields[1]);
+				qunlock(&statelk);
+			}
+			setstatus("ready");
+		} else if(strcmp(type, "error") == 0) {
+			if(nf >= 2) {
+				char errbuf[256];
+				snprint(errbuf, sizeof errbuf, "\n⚠ %s\n", fields[1]);
+				winappendstr(mainwin, errbuf);
+			}
+			setstatus("error");
+		}
 	}
 }
 
@@ -430,7 +416,6 @@ outproc(void *v)
 	int  n;
 
 	USED(v);
-
 	buf = malloc(TEXTBUF);
 	if(buf == nil)
 		sysfatal("outproc: malloc: %r");
@@ -441,24 +426,21 @@ outproc(void *v)
 			sleep(2000);
 			continue;
 		}
-
-		for(;;) {
-			n = read(fd, buf, TEXTBUF - 1);
-			if(n < 0)
-				break;
-			if(n == 0)
-				break;
-			buf[n] = '\0';
-
-			if(strcmp(buf, "[done]\n") == 0) {
-				winappendstr(mainwin, SEPARATOR);
-				winclean(mainwin);
-				break;
-			}
-			winappend(mainwin, buf, n);
-		}
-
+		n = read(fd, buf, TEXTBUF - 1);
 		close(fd);
+
+		if(n < 0)
+			continue;
+		if(n == 0)
+			continue;
+		buf[n] = '\0';
+
+		if(strcmp(buf, "[done]\n") == 0) {
+			winappendstr(mainwin, SEPARATOR);
+			winclean(mainwin);
+			continue;
+		}
+		winappend(mainwin, buf, n);
 	}
 }
 
@@ -537,7 +519,7 @@ cmd_send(void)
 
 	n = strlen(text);
 	write(fd, text, n);
-	close(fd);   /* clunk triggers agent turn */
+	close(fd);
 	setstatus("running");
 
 	free(text);
@@ -592,7 +574,7 @@ cmd_new(void)
 static void
 cmd_clear(void)
 {
-	int  afd, dfd;
+	int afd, dfd;
 
 	if(aiwrite("ctl", "clear\n", -1) < 0) {
 		winappendstr(mainwin, "\n⚠ 9ai not available\n");
@@ -600,7 +582,6 @@ cmd_clear(void)
 	}
 
 	/* erase body lines 2..$ */
-	qlock(&winlk);
 	afd = acmeopen(mainwin->id, "addr", OWRITE);
 	dfd = acmeopen(mainwin->id, "data", ORDWR);
 	if(afd >= 0 && dfd >= 0) {
@@ -609,7 +590,6 @@ cmd_clear(void)
 	}
 	if(afd >= 0) close(afd);
 	if(dfd >= 0) close(dfd);
-	qunlock(&winlk);
 
 	winclean(mainwin);
 	setstatus("ready");
@@ -846,6 +826,8 @@ eventproc(void *v)
 		if(!getevent(fd, buf, &bufp, &nbuf, &e))
 			break;
 
+		       e.c1, e.c2, e.flag, e.text);
+
 		if(e.c1 == 'M' && (e.c2 == 'x' || e.c2 == 'X')) {
 			text = e.text;
 			while(*text == ' ') text++;
@@ -896,15 +878,11 @@ readinitialstate(void)
 		if(eol) *eol = '\0';
 
 		if(strncmp(p, "model ", 6) == 0) {
-			qlock(&statelk);
 			scopy(curmodel, sizeof curmodel, p + 6);
-			qunlock(&statelk);
 		} else if(strncmp(p, "session ", 8) == 0) {
 			char *sid = p + 8;
 			if(strcmp(sid, "none") != 0) {
-				qlock(&statelk);
 				scopy(cursession, sizeof cursession, sid);
-				qunlock(&statelk);
 			}
 		}
 
@@ -960,12 +938,13 @@ threadmain(int argc, char *argv[])
 	snprint(winname, sizeof winname, "%s/+9ai", cwd);
 
 	mainwin = newwin(winname);
-	winappendstr(mainwin, "● ready\n");
-	setstatus("ready");
-	winclean(mainwin);
+	acmewrite(mainwin->id, "body", "● ready\n", -1);
+	acmewrite(mainwin->id, "ctl", "clean\n", -1);
 
-	threadcreate(aiproc,  nil, STACK);
-	threadcreate(outproc, nil, STACK);
+	proccreate(aiproc,  nil, STACK);
+	proccreate(outproc, nil, STACK);
+
+	setstatus("ready");
 
 	eventproc(mainwin);
 }

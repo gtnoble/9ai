@@ -1310,6 +1310,7 @@ agentproc(void *v)
 		if(req == nil)
 			continue;
 
+
 		if(req->type == AgentReqSteer) {
 			/* phase 14: not yet implemented */
 			free(req->text);
@@ -1371,6 +1372,7 @@ agentproc(void *v)
 			rc = agentrunant(req->text, g->antreq, &cfg);
 		else
 			rc = agentrun(req->text, g->oaireq, &cfg);
+
 
 		/* sync uuid back (agentsessopen may have set it) */
 		qlock(&g->lk);
