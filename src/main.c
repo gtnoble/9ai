@@ -28,7 +28,7 @@
 static void
 usage(void)
 {
-	fprint(2, "usage: 9ai [-m mtpt] [-s srvname] [-S sockpath] [-t tokpath] [-M model]\n");
+	fprint(2, "usage: 9ai [-m mtpt] [-s srvname] [-S sockpath] [-t tokpath] [-M model] [-L]\n");
 	threadexitsall("usage");
 }
 
@@ -40,6 +40,7 @@ threadmain(int argc, char *argv[])
 	char *sockpath = nil;
 	char *tokpath  = nil;
 	char *model    = "gpt-4o";
+	int   forcelogin = 0;
 
 	ARGBEGIN{
 	case 'm':
@@ -56,6 +57,9 @@ threadmain(int argc, char *argv[])
 		break;
 	case 'M':
 		model = ARGF();
+		break;
+	case 'L':
+		forcelogin = 1;
 		break;
 	default:
 		usage();
@@ -81,6 +85,11 @@ threadmain(int argc, char *argv[])
 	}
 
 	AiState *ai = aiinit(model, sockpath, tokpath);
+
+	/* -L flag: force re-login even if a token exists */
+	if(forcelogin)
+		ai->authstatus = 0;
+
 	aimain(ai, srvname, mtpt);
 
 	/* aimain returns after posting; block here so the process stays alive */

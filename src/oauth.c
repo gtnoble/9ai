@@ -137,14 +137,8 @@ getjson(char *sockpath, char *host, char *path,
 
 /* ── Phase 1: device code flow ────────────────────────────────────────── */
 
-typedef struct DeviceCode DeviceCode;
-struct DeviceCode {
-	char device_code[256];
-	char user_code[64];
-	char verification_uri[256];
-	long interval;
-	long expires_in;
-};
+/* DeviceCode is the public OAuthDeviceCode typedef from oauth.h */
+typedef OAuthDeviceCode DeviceCode;
 
 static int
 startdeviceflow(char *sockpath, DeviceCode *dc)
@@ -405,4 +399,275 @@ oauthtokenfree(OAuthToken *t)
 		return;
 	free(t->token);
 	free(t);
+}
+
+/* ── oauthtokenexists ─────────────────────────────────────────────────── */
+
+int
+oauthtokenexists(char *tokpath)
+{
+	int  fd;
+	char buf[4];
+	int  n;
+
+	fd = open(tokpath, OREAD);
+	if(fd < 0)
+		return 0;
+	n = read(fd, buf, sizeof buf);
+	close(fd);
+	return n > 0;
+}
+
+/* ── oauthdevicestart ─────────────────────────────────────────────────── */
+
+OAuthDeviceCode *
+oauthdevicestart(char *sockpath)
+{
+	OAuthDeviceCode *dc;
+
+	dc = mallocz(sizeof *dc, 1);
+	if(dc == nil)
+		return nil;
+	if(startdeviceflow(sockpath, dc) < 0) {
+		free(dc);
+		return nil;
+	}
+	return dc;
+}
+
+/* ── oauthdevicepoll ──────────────────────────────────────────────────── */
+
+int
+oauthdevicepoll(OAuthDeviceCode *dc, char *sockpath, char *tokpath, int *done)
+{
+	enum { MAXTOK = 64 };
+	jsmntok_t toks[MAXTOK];
+	char body[512];
+	char errbuf[64];
+	char *js;
+	int ntoks, vi;
+	HTTPHdr hdrs[4];
+	int nhdrs;
+
+	*done = 0;
+
+	/* deadline check */
+	if(dc->expires_in > 0) {
+		/* we track relative remaining time; decrement per poll */
+		dc->expires_in -= dc->interval;
+		if(dc->expires_in <= 0) {
+			werrstr("oauth: device flow timed out");
+			*done = 1;
+			return -1;
+		}
+	}
+
+	nhdrs = 0;
+	hdrs[nhdrs].name  = "Accept";
+	hdrs[nhdrs].value = "application/json";         nhdrs++;
+	hdrs[nhdrs].name  = "Content-Type";
+	hdrs[nhdrs].value = "application/json";         nhdrs++;
+	hdrs[nhdrs].name  = "User-Agent";
+	hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0"; nhdrs++;
+
+	snprint(body, sizeof body,
+		"{\"client_id\":\"%s\","
+		"\"device_code\":\"%s\","
+		"\"grant_type\":\"urn:ietf:params:oauth:grant-type:device_code\"}",
+		CLIENT_ID, dc->device_code);
+
+	js = postjson(sockpath, GITHUB_HOST,
+	              "/login/oauth/access_token",
+	              hdrs, nhdrs, body, toks, MAXTOK, &ntoks);
+	if(js == nil) {
+		*done = 1;
+		return -1;
+	}
+
+	/* success: access_token present */
+	vi = jsonget(js, toks, ntoks, 0, "access_token");
+	if(vi >= 0) {
+		int   tlen = toks[vi].end - toks[vi].start;
+		char *tok  = mallocz(tlen + 1, 1);
+		if(tok == nil) { free(js); *done = 1; werrstr("malloc"); return -1; }
+		jsonstr(js, &toks[vi], tok, tlen + 1);
+		free(js);
+		if(writetoken(tokpath, tok) < 0) {
+			werrstr("oauth: write token: %r");
+			free(tok);
+			*done = 1;
+			return -1;
+		}
+		free(tok);
+		*done = 1;
+		return 0;
+	}
+
+	/* error field */
+	vi = jsonget(js, toks, ntoks, 0, "error");
+	if(vi >= 0) {
+		jsonstr(js, &toks[vi], errbuf, sizeof errbuf);
+		free(js);
+
+		if(strcmp(errbuf, "authorization_pending") == 0)
+			return 0;   /* done=0: keep polling */
+
+		if(strcmp(errbuf, "slow_down") == 0) {
+			dc->interval += 5;
+			return 0;   /* done=0: keep polling at new rate */
+		}
+
+		werrstr("oauth: device flow failed: %s", errbuf);
+		*done = 1;
+		return -1;
+	}
+
+	free(js);
+	return 0;   /* unexpected response: keep polling */
+}
+
+/* ── oauthdevcodefree ─────────────────────────────────────────────────── */
+
+void
+oauthdevcodefree(OAuthDeviceCode *dc)
+{
+	free(dc);
+}
+
+/* ── oauthenablemodels ────────────────────────────────────────────────── */
+
+/*
+ * oauthenablemodels — POST /models/<id>/policy {"state":"enabled"} for
+ * every model in the Copilot /models list.
+ *
+ * Required after first login to unlock Claude and Grok models.
+ * Errors are silently ignored — best-effort only.
+ */
+void
+oauthenablemodels(char *session, char *sockpath)
+{
+	/* We need to fetch the model list first, then enable each one.
+	 * Import is circular (models.h ↔ oauth.h), so we inline a minimal
+	 * /models fetch here: just collect the "id" strings, nothing else. */
+	HTTPConn *c;
+	HTTPResp *r;
+	char authbuf[1100];
+	HTTPHdr hdrs[8];
+	int nhdrs;
+
+	enum { MAXTOK = 6000 };
+	jsmntok_t *toks;
+	jsmn_parser p;
+	char *js;
+	int ntoks;
+
+	snprint(authbuf, sizeof authbuf, "Bearer %s", session);
+
+	nhdrs = 0;
+	hdrs[nhdrs].name  = "Authorization";           hdrs[nhdrs].value = authbuf;                    nhdrs++;
+	hdrs[nhdrs].name  = "Content-Type";            hdrs[nhdrs].value = "application/json";          nhdrs++;
+	hdrs[nhdrs].name  = "User-Agent";              hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0";  nhdrs++;
+	hdrs[nhdrs].name  = "Editor-Version";          hdrs[nhdrs].value = "vscode/1.107.0";            nhdrs++;
+	hdrs[nhdrs].name  = "Editor-Plugin-Version";   hdrs[nhdrs].value = "copilot-chat/0.35.0";       nhdrs++;
+	hdrs[nhdrs].name  = "Copilot-Integration-Id";  hdrs[nhdrs].value = "vscode-chat";               nhdrs++;
+
+	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
+	if(c == nil)
+		return;
+
+	r = httpget(c, "/models", "api.individual.githubcopilot.com", hdrs, nhdrs);
+	if(r == nil || r->code != 200) {
+		if(r != nil) httprespfree(r);
+		httpclose(c);
+		return;
+	}
+	if(httpreadbody(r) < 0) {
+		httprespfree(r);
+		httpclose(c);
+		return;
+	}
+	httpclose(c);
+
+	js = r->body;
+	r->body = nil;
+	httprespfree(r);
+
+	toks = mallocz(MAXTOK * sizeof(jsmntok_t), 1);
+	if(toks == nil) { free(js); return; }
+
+	jsmn_init(&p);
+	ntoks = jsmn_parse(&p, js, strlen(js), toks, MAXTOK);
+	if(ntoks < 0) { free(toks); free(js); return; }
+
+	/* walk the "data" array; for each element extract "id" and POST policy */
+	{
+		int data_arr = jsonget(js, toks, ntoks, 0, "data");
+		if(data_arr < 0 || toks[data_arr].type != JSMN_ARRAY) {
+			free(toks); free(js); return;
+		}
+
+		int arr_size = toks[data_arr].size;
+		int elem = data_arr + 1;
+		int ei;
+
+		for(ei = 0; ei < arr_size && elem < ntoks; ei++) {
+			int id_vi = jsonget(js, toks, ntoks, elem, "id");
+			if(id_vi >= 0) {
+				char id_buf[128];
+				jsonstr(js, &toks[id_vi], id_buf, sizeof id_buf);
+
+				/* POST /models/<id>/policy {"state":"enabled"} */
+				{
+					char path[256];
+					char body2[32];
+					HTTPConn *c2;
+					HTTPResp *r2;
+					HTTPHdr hdrs2[8];
+					int nh2;
+
+					snprint(path, sizeof path, "/models/%s/policy", id_buf);
+					snprint(body2, sizeof body2, "{\"state\":\"enabled\"}");
+
+					nh2 = 0;
+					hdrs2[nh2].name  = "Authorization";          hdrs2[nh2].value = authbuf;                    nh2++;
+					hdrs2[nh2].name  = "Content-Type";           hdrs2[nh2].value = "application/json";          nh2++;
+					hdrs2[nh2].name  = "User-Agent";             hdrs2[nh2].value = "GitHubCopilotChat/0.35.0";  nh2++;
+					hdrs2[nh2].name  = "Editor-Version";         hdrs2[nh2].value = "vscode/1.107.0";            nh2++;
+					hdrs2[nh2].name  = "Editor-Plugin-Version";  hdrs2[nh2].value = "copilot-chat/0.35.0";       nh2++;
+					hdrs2[nh2].name  = "Copilot-Integration-Id"; hdrs2[nh2].value = "vscode-chat";               nh2++;
+					hdrs2[nh2].name  = "openai-intent";          hdrs2[nh2].value = "chat-policy";               nh2++;
+
+					c2 = portdial("api.individual.githubcopilot.com", "443", sockpath);
+					if(c2 != nil) {
+						r2 = httppost(c2, path,
+						             "api.individual.githubcopilot.com",
+						             hdrs2, nh2,
+						             body2, strlen(body2));
+						if(r2 != nil) httprespfree(r2);
+						httpclose(c2);
+					}
+				}
+			}
+			/* skip to next array element: elem + 1 skips the object token,
+			 * then we need to advance past all children */
+			if(toks[elem].type == JSMN_OBJECT || toks[elem].type == JSMN_ARRAY) {
+				/* jsonnext would work here; we replicate it inline */
+				int skip = elem + 1;
+				int depth = 1;
+				while(skip < ntoks && depth > 0) {
+					if(toks[skip].type == JSMN_OBJECT || toks[skip].type == JSMN_ARRAY)
+						depth += toks[skip].size;
+					else
+						depth--;
+					skip++;
+				}
+				elem = skip;
+			} else {
+				elem++;
+			}
+		}
+	}
+
+	free(toks);
+	free(js);
 }

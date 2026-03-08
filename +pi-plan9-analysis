@@ -822,3 +822,26 @@ Flush handler must cancel both pending_output and pending_event on disconnect.
        tab-separated, newest-first.  splitrec NUL-patches in place (no malloc).
        mk o.9ai-sessions builds clean; live run against 15 session files all correct;
        ellipsis truncation verified at SNIPPET=80; nonexistent dir exits with error.
+  [17] /auth/ subtree — Copilot OAuth login via 9P  ✓ DONE
+       Option B full implementation.  New files/functions:
+       oauth.h: OAuthDeviceCode struct; oauthdevicestart(), oauthdevicepoll(),
+         oauthdevcodefree(), oauthenablemodels(), oauthtokenexists().
+       oauth.c: DeviceCode typedef aliased to OAuthDeviceCode; oauthtokenexists()
+         (read probe); oauthdevicestart() (wraps startdeviceflow); oauthdevicepoll()
+         (single poll iteration, tracks expires_in by decrement, handles slow_down);
+         oauthdevcodefree(); oauthenablemodels() (GET /models then POST
+         /models/<id>/policy {"state":"enabled"} for each model — matches pi's
+         enableAllGitHubCopilotModels).
+       fs.h: AiState extended with authstatus (0=logged_out/1=pending/2=logged_in),
+         authdev[128], authuri[256], autherr[256], loginreqchan, devchan, devpending.
+       fs.c: Qauth/Qauth_status/Qauth_device/Qauth_poll QID constants; authtab[];
+         /auth/ dir in filetab; fswalk1/fsopen/fsread/fswrite/fsdestroyfid/fsstat
+         all updated; devwatcher proc (devchan → parked /auth/device Req*);
+         authproc (loginreqchan → device flow → oauthenablemodels → eventchan);
+         aiinit: loginreqchan+devchan created, authstatus seeded from oauthtokenexists;
+         aimain: spawns devwatcher+authproc, auto-kicks login if authstatus==0.
+       main.c: -L flag sets authstatus=0 to force re-login after aiinit.
+       9ai-acme.c: Login tag command; loginproc (opens auth/poll, reads auth/device,
+         displays URL+code); auth_ok/auth_err event handling in aiproc; startup
+         auth status check shows "login required" / "login pending" as appropriate.
+       Build: mk && mk o.9ai-acme — both build clean; unit tests all pass.

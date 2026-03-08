@@ -47,6 +47,69 @@ struct OAuthToken {
 int oauthlogin(char *sockpath, char *tokpath);
 
 /*
+ * OAuthDeviceCode — in-progress device-code flow state.
+ * Returned by oauthdevicestart(); passed to oauthdevicepoll().
+ * Free with oauthdevcodefree() when done.
+ */
+typedef struct OAuthDeviceCode OAuthDeviceCode;
+struct OAuthDeviceCode {
+	char device_code[256];
+	char user_code[64];
+	char verification_uri[256];
+	long interval;
+	long expires_in;
+};
+
+/*
+ * oauthdevicestart — start the device-code flow, return codes for display.
+ *
+ * sockpath — path to the 9aitls Unix socket
+ *
+ * Returns a heap-allocated OAuthDeviceCode on success, nil on error.
+ * The caller displays dc->verification_uri and dc->user_code, then
+ * calls oauthdevicepoll() in a loop to wait for the user to authorise.
+ */
+OAuthDeviceCode *oauthdevicestart(char *sockpath);
+
+/*
+ * oauthdevicepoll — poll once for the access token.
+ *
+ * dc       — the OAuthDeviceCode from oauthdevicestart()
+ * sockpath — path to the 9aitls Unix socket
+ * tokpath  — where to persist the token on success
+ * done     — set to 1 if flow completed (success or terminal error);
+ *             set to 0 if still pending (caller should sleep dc->interval)
+ *
+ * Returns 0 if the token was obtained and written to tokpath.
+ * Returns -1 on terminal error (sets errstr).
+ * When done=0 and return value is 0, the caller should sleep and retry.
+ * When done=1, the return value indicates success (0) or failure (-1).
+ */
+int oauthdevicepoll(OAuthDeviceCode *dc, char *sockpath, char *tokpath, int *done);
+
+/*
+ * oauthenablemodels — POST /models/<id>/policy {"state":"enabled"} for
+ * every model returned by the Copilot /models endpoint.
+ *
+ * Required after first login to unlock Claude and Grok models.
+ * Errors from individual POSTs are silently ignored.
+ *
+ * session  — Copilot session token (Bearer)
+ * sockpath — path to the 9aitls Unix socket
+ */
+void oauthenablemodels(char *session, char *sockpath);
+
+/*
+ * oauthtokenexists — return 1 if tokpath exists and is non-empty, 0 otherwise.
+ */
+int oauthtokenexists(char *tokpath);
+
+/*
+ * oauthdevcodefree — free an OAuthDeviceCode.
+ */
+void oauthdevcodefree(OAuthDeviceCode *dc);
+
+/*
  * oauthsession — exchange a refresh token for a Copilot session token.
  *
  * refresh   — the GitHub access token (ghu_...)

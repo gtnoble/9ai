@@ -91,6 +91,27 @@ struct AiState {
 	OAIReq *oaireq;   /* OpenAI Completions history (Fmt_Oai models) */
 	ANTReq *antreq;   /* Anthropic Messages history (Fmt_Ant models) */
 	int     fmt;      /* Fmt_Oai or Fmt_Ant — derived from model on each switch */
+
+	/*
+	 * Auth subtree state.
+	 *
+	 * authstatus: 0 = logged_out, 1 = pending (flow in progress), 2 = logged_in
+	 *
+	 * loginreqchan: main → authproc: int (1 = start login)
+	 * devchan:      authproc → main: char* (URL\x1fCODE\x00, or nil on done/err)
+	 * devpending:   parked /auth/device read, waiting for device code
+	 *
+	 * devcode/devuri are written by authproc under lk after oauthdevicestart()
+	 * succeeds; they are read by fsread on /auth/device.
+	 */
+	int   authstatus;    /* 0=logged_out 1=pending 2=logged_in */
+	char  authdev[128];  /* user code, e.g. "ABCD-1234" */
+	char  authuri[256];  /* verification URI */
+	char  autherr[256];  /* last auth error, or "" */
+
+	Channel *loginreqchan;  /* int (1 = start login) */
+	Channel *devchan;       /* char* url\x1fcode (nil = done/error) */
+	Req     *devpending;    /* parked /auth/device read */
 };
 
 /*

@@ -65,7 +65,7 @@ enum {
 	SNIPPET    = 80,     /* max session snippet length */
 };
 
-#define TAG_EXTRA  " | Send Stop Steer New Clear Models Sessions"
+#define TAG_EXTRA  " | Send Stop Steer New Clear Models Sessions Login"
 #define SEPARATOR  "\n\n════════════════════════════════════════════════════════════\n\n"
 
 /* ── Global acme connection ─────────────────────────────────────────── */
@@ -554,6 +554,18 @@ aiproc(void *v)
 					winappendstr(mainwin, errbuf);
 				}
 				setstatus("error");
+
+			} else if(strcmp(type, "auth_ok") == 0) {
+				winappendstr(mainwin, "\n✓ Logged in to GitHub Copilot.\n");
+				setstatus("ready");
+
+			} else if(strcmp(type, "auth_err") == 0) {
+				if(nf >= 2) {
+					char errbuf[256];
+					snprint(errbuf, sizeof errbuf, "\n⚠ Login failed: %s\n", fields[1]);
+					winappendstr(mainwin, errbuf);
+				}
+				setstatus("login required");
 			}
 		}
 
@@ -1387,6 +1399,126 @@ sessionswinproc(void *v)
 	free(w);
 }
 
+/* ── Login command and proc ─────────────────────────────────────────── */
+
+/*
+ * loginproc — opened in a separate thread by cmd_login.
+ *
+ * Flow:
+ *   1. Write to /auth/poll to trigger the device-code flow in authproc.
+ *   2. Read /auth/device (blocks until authproc has the device code).
+ *   3. Display URL and user code in the main window.
+ *   4. Return (authproc is now polling in the background; aiproc will
+ *      display the auth_ok or auth_err event when the flow completes).
+ */
+static void
+loginproc(void *v)
+{
+	CFsys *fs;
+	CFid  *pollfd, *devfd;
+	char   buf[512];
+	int    n;
+
+	USED(v);
+
+	fs = ainewconn();
+	if(fs == nil) {
+		winappendstr(mainwin, "\n⚠ Cannot connect to 9ai\n");
+		return;
+	}
+
+	/* trigger the device flow */
+	pollfd = fsopen(fs, "auth/poll", OWRITE);
+	if(pollfd == nil) {
+		winappendstr(mainwin, "\n⚠ Cannot open auth/poll\n");
+		fsunmount(fs);
+		return;
+	}
+	fswrite(pollfd, "start", 5);
+	fsclose(pollfd);
+
+	/* read the device code (blocks until authproc calls oauthdevicestart) */
+	devfd = fsopen(fs, "auth/device", OREAD);
+	if(devfd == nil) {
+		winappendstr(mainwin, "\n⚠ Cannot open auth/device\n");
+		fsunmount(fs);
+		return;
+	}
+
+	n = fsread(devfd, buf, sizeof buf - 1);
+	fsclose(devfd);
+	fsunmount(fs);
+
+	if(n <= 0) {
+		/* flow already done or error — aiproc will show the result */
+		return;
+	}
+	buf[n] = '\0';
+
+	/*
+	 * buf = "https://github.com/login/device\nABCD-1234\n"
+	 * Display it clearly in the window.
+	 */
+	{
+		/* parse the two lines */
+		char *nl = strchr(buf, '\n');
+		char  url[256], code[64];
+		if(nl != nil) {
+			int ulen = nl - buf;
+			if(ulen >= (int)sizeof url) ulen = sizeof url - 1;
+			memmove(url, buf, ulen);
+			url[ulen] = '\0';
+			char *codep = nl + 1;
+			char *nl2   = strchr(codep, '\n');
+			int   clen  = nl2 ? nl2 - codep : (int)strlen(codep);
+			if(clen >= (int)sizeof code) clen = sizeof code - 1;
+			memmove(code, codep, clen);
+			code[clen] = '\0';
+
+			char msg[512];
+			snprint(msg, sizeof msg,
+			        "\n── Login to GitHub Copilot ──\n"
+			        "Open:  %s\n"
+			        "Code:  %s\n"
+			        "Waiting for authorization…\n",
+			        url, code);
+			winappendstr(mainwin, msg);
+		} else {
+			winappendstr(mainwin, buf);
+		}
+	}
+	setstatus("login pending");
+}
+
+static void
+cmd_login(void)
+{
+	/* check current auth status first */
+	CFid *statfd;
+	char  buf[64];
+	int   n;
+
+	statfd = aiopen("auth/status", OREAD);
+	if(statfd != nil) {
+		n = fsread(statfd, buf, sizeof buf - 1);
+		fsclose(statfd);
+		if(n > 0) {
+			buf[n] = '\0';
+			if(strncmp(buf, "pending", 7) == 0) {
+				winappendstr(mainwin, "\n[Login already in progress]\n");
+				return;
+			}
+			if(strncmp(buf, "logged_in", 9) == 0) {
+				winappendstr(mainwin, "\n[Already logged in. Use -L flag to force re-login.]\n");
+				return;
+			}
+		}
+	}
+
+	/* spawn loginproc so we don't block the event loop */
+	threadcreate(loginproc, nil, STACK);
+}
+
 /* ── Main event proc ────────────────────────────────────────────────── */
 
 static void
@@ -1414,6 +1546,7 @@ eventproc(void *v)
 			if(strcmp(text, "Clear")    == 0) { cmd_clear();    continue; }
 			if(strcmp(text, "Models")   == 0) { cmd_models();   continue; }
 			if(strcmp(text, "Sessions") == 0) { cmd_sessions(); continue; }
+			if(strcmp(text, "Login")    == 0) { cmd_login();    continue; }
 
 			/* unrecognised: pass back if acme can handle it */
 			if(e.flag & 1)
@@ -1533,6 +1666,30 @@ threadmain(int argc, char *argv[])
 	/* write initial status line */
 	winappendstr(mainwin, "● ready\n");
 	setstatus("ready");
+
+	/* check auth status and show login prompt if needed */
+	{
+		CFid *statfd = aiopen("auth/status", OREAD);
+		if(statfd != nil) {
+			char buf[64];
+			int  n = fsread(statfd, buf, sizeof buf - 1);
+			fsclose(statfd);
+			if(n > 0) {
+				buf[n] = '\0';
+				if(strncmp(buf, "logged_out", 10) == 0) {
+					winappendstr(mainwin,
+					    "⚠ Not logged in to GitHub Copilot.\n"
+					    "  Middle-click Login in the tag, or run: 9ai -L\n");
+					setstatus("login required");
+				} else if(strncmp(buf, "pending", 7) == 0) {
+					winappendstr(mainwin,
+					    "Login in progress — check the terminal for the device code.\n");
+					setstatus("login pending");
+				}
+			}
+		}
+	}
+
 	winclean(mainwin);
 
 	/* start reader procs */

@@ -137,6 +137,10 @@ enum {
 	Qsession_new = 11,
 	Qsession_load= 12,
 	Qsession_save= 13,
+	Qauth        = 14,  /* auth/ dir */
+	Qauth_status = 15,
+	Qauth_device = 16,
+	Qauth_poll   = 17,
 	NQID,
 };
 
@@ -160,6 +164,7 @@ static FileEntry filetab[] = {
 	{"model",       Qmodel,        0600},
 	{"models",      Qmodels,       0444},
 	{"session",     Qsession,      DMDIR|0555},
+	{"auth",        Qauth,         DMDIR|0555},
 	{nil, 0, 0},
 };
 
@@ -168,6 +173,13 @@ static FileEntry sessiontab[] = {
 	{"new",  Qsession_new,  0200},
 	{"load", Qsession_load, 0200},
 	{"save", Qsession_save, 0200},
+	{nil, 0, 0},
+};
+
+static FileEntry authtab[] = {
+	{"status", Qauth_status, 0444},
+	{"device", Qauth_device, 0400},
+	{"poll",   Qauth_poll,   0200},
 	{nil, 0, 0},
 };
 
@@ -302,6 +314,8 @@ fswalk1(Fid *fid, char *name, void *v)
 		tab = filetab;
 	} else if(fid->qid.path == Qsession) {
 		tab = sessiontab;
+	} else if(fid->qid.path == Qauth) {
+		tab = authtab;
 	} else {
 		return "file not found";
 	}
@@ -344,6 +358,7 @@ fsopen(Req *r)
 	case Qsession_new:
 	case Qsession_load:
 	case Qsession_save:
+	case Qauth_poll:
 		if(mode != OWRITE) {
 			respond(r, "permission denied");
 			return;
@@ -354,6 +369,8 @@ fsopen(Req *r)
 	case Qstatus:
 	case Qmodels:
 	case Qsession_id:
+	case Qauth_status:
+	case Qauth_device:
 		if(mode != OREAD) {
 			respond(r, "permission denied");
 			return;
@@ -374,7 +391,8 @@ fsopen(Req *r)
 
 	/* allocate write buffer for write-only files */
 	if(path == Qmessage || path == Qsteer ||
-	   path == Qsession_new || path == Qsession_load || path == Qsession_save) {
+	   path == Qsession_new || path == Qsession_load || path == Qsession_save ||
+	   path == Qauth_poll) {
 		r->fid->aux = wbufalloc();
 	}
 
@@ -397,6 +415,11 @@ fsread(Req *r)
 
 	case Qsession:
 		dirread9p(r, fsdirgen, sessiontab);
+		respond(r, nil);
+		return;
+
+	case Qauth:
+		dirread9p(r, fsdirgen, authtab);
 		respond(r, nil);
 		return;
 
@@ -548,6 +571,63 @@ fsread(Req *r)
 		respond(r, nil);
 		return;
 
+	case Qauth_status: {
+		/*
+		 * Non-blocking read.
+		 * Returns one of:
+		 *   "logged_out\n"
+		 *   "pending\n"
+		 *   "logged_in\n"
+		 *   "error: <msg>\n"
+		 */
+		qlock(&g->lk);
+		if(g->autherr[0] != '\0')
+			snprint(buf, sizeof buf, "error: %s\n", g->autherr);
+		else if(g->authstatus == 2)
+			snprint(buf, sizeof buf, "logged_in\n");
+		else if(g->authstatus == 1)
+			snprint(buf, sizeof buf, "pending\n");
+		else
+			snprint(buf, sizeof buf, "logged_out\n");
+		qunlock(&g->lk);
+		readstr(r, buf);
+		respond(r, nil);
+		return;
+	}
+
+	case Qauth_device: {
+		/*
+		 * Blocking read.
+		 *
+		 * If a device code is already available (authstatus == 1 and
+		 * authuri is set), respond immediately with:
+		 *   "<verification_uri>\n<user_code>\n"
+		 *
+		 * Otherwise park the request; authproc will respond when the
+		 * device code arrives (via devchan).
+		 *
+		 * Returns 0 bytes (EOF) when the flow completes (success or error).
+		 */
+		qlock(&g->lk);
+		if(g->authstatus == 1 && g->authuri[0] != '\0') {
+			/* device code already available */
+			snprint(buf, sizeof buf, "%s\n%s\n", g->authuri, g->authdev);
+			qunlock(&g->lk);
+			readstr(r, buf);
+			respond(r, nil);
+			return;
+		}
+		if(g->devpending != nil) {
+			qunlock(&g->lk);
+			respond(r, "concurrent reads on /auth/device not supported");
+			return;
+		}
+		g->devpending = r;
+		qunlock(&g->lk);
+		/* devwatcher will respond when authproc sends on devchan */
+		return;
+	}
+
 	case Qoutput: {
 		char *chunk;
 		/* if a chunk is already buffered, respond immediately */
@@ -621,6 +701,7 @@ fswrite(Req *r)
 	case Qsession_new:
 	case Qsession_load:
 	case Qsession_save:
+	case Qauth_poll:
 		w = r->fid->aux;
 		if(w == nil) {
 			respond(r, "not open for write");
@@ -955,6 +1036,20 @@ fsdestroyfid(Fid *fid)
 		fid->aux = nil;
 		break;
 
+	case Qauth_poll:
+		/*
+		 * Writing anything to /auth/poll starts (or restarts) the device
+		 * code flow.  We send a signal to authproc via loginreqchan.
+		 * authproc handles the actual OAuth work.
+		 */
+		if(w != nil && (fid->omode & 3) == OWRITE) {
+			int one = 1;
+			chansendp(g->loginreqchan, (void*)(uintptr)one);
+		}
+		wbuffree(w);
+		fid->aux = nil;
+		break;
+
 	default:
 		break;
 	}
@@ -990,6 +1085,11 @@ fsstat(Req *r)
 	}
 	if(fe == nil) {
 		for(tab = sessiontab; tab->name != nil; tab++) {
+			if(tab->qpath == path) { fe = tab; break; }
+		}
+	}
+	if(fe == nil) {
+		for(tab = authtab; tab->name != nil; tab++) {
 			if(tab->qpath == path) { fe = tab; break; }
 		}
 	}
@@ -1295,6 +1395,186 @@ agentproc(void *v)
 	}
 }
 
+/* ── devwatcher — relays devchan → parked /auth/device Req* ───────────── */
+
+static void
+devwatcher(void *v)
+{
+	char *payload;  /* "uri\ncode\n" or nil (flow done/error) */
+	Req  *r;
+
+	USED(v);
+	for(;;) {
+		payload = chanrecvp(g->devchan);
+		qlock(&g->lk);
+		r = g->devpending;
+		if(r != nil) {
+			g->devpending = nil;
+			qunlock(&g->lk);
+			r->ifcall.offset = 0;
+			if(payload == nil) {
+				/* flow done or error — EOF */
+				r->ofcall.count = 0;
+				respond(r, nil);
+			} else {
+				readstr(r, payload);
+				respond(r, nil);
+				free(payload);
+			}
+		} else {
+			/* no reader parked: if payload non-nil, drop it (client
+			 * will read authuri/authdev fields from /auth/status next open) */
+			if(payload != nil)
+				free(payload);
+			qunlock(&g->lk);
+		}
+	}
+}
+
+/* ── authproc — OAuth device-code flow ────────────────────────────────── */
+
+/*
+ * authproc runs in its own proc.  It waits for a signal on loginreqchan,
+ * then runs the OAuth device-code flow:
+ *
+ *   1. oauthdevicestart() → OAuthDeviceCode
+ *   2. Update g->authstatus=1, g->authuri, g->authdev under lk
+ *   3. Send "uri\ncode\n" on devchan (wakes any parked /auth/device reader)
+ *   4. Poll oauthdevicepoll() with sleep(interval)
+ *   5. On success: get session token, enable models, set authstatus=2
+ *      Emit auth_ok event on eventchan.
+ *   6. On error: set authstatus=0, autherr; emit auth_err event.
+ *   7. Send nil on devchan (EOF for any still-parked /auth/device reader).
+ *
+ * A new loginreqchan signal while a flow is in progress is ignored
+ * (the current flow continues).
+ */
+static void
+authproc(void *v)
+{
+	USED(v);
+
+	for(;;) {
+		/* wait for a login request */
+		chanrecvp(g->loginreqchan);
+
+		/* check if already logged in */
+		qlock(&g->lk);
+		if(g->authstatus == 2) {
+			qunlock(&g->lk);
+			/* already logged in — nothing to do */
+			continue;
+		}
+		if(g->authstatus == 1) {
+			/* already a flow in progress — ignore */
+			qunlock(&g->lk);
+			continue;
+		}
+		g->authstatus  = 1;
+		g->authuri[0]  = '\0';
+		g->authdev[0]  = '\0';
+		g->autherr[0]  = '\0';
+		char sockpath[512], tokpath[512];
+		snprint(sockpath, sizeof sockpath, "%s", g->sockpath ? g->sockpath : "");
+		snprint(tokpath,  sizeof tokpath,  "%s", g->tokpath);
+		qunlock(&g->lk);
+
+		/* step 1: start device flow */
+		OAuthDeviceCode *dc = oauthdevicestart(sockpath[0] ? sockpath : nil);
+		if(dc == nil) {
+			char errbuf[256];
+			rerrstr(errbuf, sizeof errbuf);
+			qlock(&g->lk);
+			g->authstatus = 0;
+			snprint(g->autherr, sizeof g->autherr, "%s", errbuf);
+			qunlock(&g->lk);
+			/* emit error event */
+			{
+				char *ev = smprint("auth_err\x1f%s\x1e", errbuf);
+				chansendp(g->eventchan, ev);
+			}
+			/* EOF for any parked /auth/device reader */
+			chansendp(g->devchan, nil);
+			continue;
+		}
+
+		/* step 2+3: update state and wake /auth/device reader */
+		qlock(&g->lk);
+		snprint(g->authuri, sizeof g->authuri, "%s", dc->verification_uri);
+		snprint(g->authdev, sizeof g->authdev, "%s", dc->user_code);
+		qunlock(&g->lk);
+
+		{
+			char *payload = smprint("%s\n%s\n", dc->verification_uri, dc->user_code);
+			chansendp(g->devchan, payload);
+		}
+
+		/* step 4: poll loop */
+		int done = 0;
+		int rc   = 0;
+		while(!done) {
+			sleep(dc->interval * 1000);
+			rc = oauthdevicepoll(dc, sockpath[0] ? sockpath : nil, tokpath, &done);
+		}
+		oauthdevcodefree(dc);
+
+		if(rc < 0) {
+			/* error */
+			char errbuf[256];
+			rerrstr(errbuf, sizeof errbuf);
+			qlock(&g->lk);
+			g->authstatus = 0;
+			snprint(g->autherr, sizeof g->autherr, "%s", errbuf);
+			qunlock(&g->lk);
+			{
+				char *ev = smprint("auth_err\x1f%s\x1e", errbuf);
+				chansendp(g->eventchan, ev);
+			}
+			chansendp(g->devchan, nil);
+			continue;
+		}
+
+		/* step 5: success — get session token, enable models */
+		{
+			char *refresh;
+			int   fd;
+			char  buf[512];
+			int   n;
+
+			fd = open(tokpath, OREAD);
+			if(fd >= 0) {
+				n = read(fd, buf, sizeof buf - 1);
+				close(fd);
+				if(n > 0) {
+					buf[n] = '\0';
+					while(n > 0 && (buf[n-1]=='\n'||buf[n-1]=='\r'||buf[n-1]==' '))
+						buf[--n] = '\0';
+					refresh = buf;
+					OAuthToken *tok = oauthsession(refresh, sockpath[0] ? sockpath : nil);
+					if(tok != nil) {
+						oauthenablemodels(tok->token, sockpath[0] ? sockpath : nil);
+						oauthtokenfree(tok);
+					}
+				}
+			}
+		}
+
+		qlock(&g->lk);
+		g->authstatus = 2;
+		g->authuri[0] = '\0';
+		g->authdev[0] = '\0';
+		qunlock(&g->lk);
+
+		/* emit auth_ok event */
+		{
+			char *ev = smprint("auth_ok\x1e");
+			chansendp(g->eventchan, ev);
+		}
+		/* EOF for any still-parked /auth/device reader */
+		chansendp(g->devchan, nil);
+	}
+}
+
 /* ── aiinit / aimain ───────────────────────────────────────────────────── */
 
 AiState *
@@ -1313,10 +1593,15 @@ aiinit(char *model, char *sockpath, char *tokpath)
 	ai->antreq   = antreqnew(model);
 	ai->fmt      = Fmt_Oai;  /* default; switched when model changes */
 
-	ai->reqchan   = chancreate(sizeof(void*), 8);  /* buffered: fsdestroyfid must not block srv */
-	ai->outchan   = chancreate(sizeof(void*), 16);
-	ai->eventchan = chancreate(sizeof(void*), 16);
-	ai->abortchan = chancreate(sizeof(void*), 4);
+	ai->reqchan      = chancreate(sizeof(void*), 8);  /* buffered: fsdestroyfid must not block srv */
+	ai->outchan      = chancreate(sizeof(void*), 16);
+	ai->eventchan    = chancreate(sizeof(void*), 16);
+	ai->abortchan    = chancreate(sizeof(void*), 4);
+	ai->loginreqchan = chancreate(sizeof(void*), 4);
+	ai->devchan      = chancreate(sizeof(void*), 4);
+
+	/* initialise auth status based on whether a token already exists */
+	ai->authstatus = oauthtokenexists(tokpath) ? 2 : 0;
 
 	return ai;
 }
@@ -1332,6 +1617,14 @@ aimain(AiState *ai, char *srvname, char *mtpt)
 	/* start channel watcher procs */
 	proccreate(outwatcher,   nil, 16384);
 	proccreate(eventwatcher, nil, 16384);
+	proccreate(devwatcher,   nil, 16384);
+
+	/* start auth proc */
+	proccreate(authproc, nil, 65536);
+
+	/* if no token exists, immediately kick off the login flow */
+	if(ai->authstatus == 0)
+		chansendp(ai->loginreqchan, (void*)(uintptr)1);
 
 	/* post 9P service; proccreate's the srv loop and returns */
 	fs.aux = ai;
