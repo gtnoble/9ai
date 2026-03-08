@@ -36,23 +36,21 @@
  *
  * ── emit / writesession varargs ───────────────────────────────────────
  *
- * emitevent(), writesession(), emitandsave() all take a nil-terminated
- * list of char* fields after cfg.  They format:
- *   field₀ FS field₁ … FS fieldₙ RS
- * into a stack buffer, then deliver it.
+ * emit / writesession varargs format records using fmtrecfields(), which
+ * measures the required size and heap-allocates exactly the right buffer,
+ * so records of any length are handled correctly.
  *
- * We use a fixed 64KB buffer which is sufficient for any tool output
- * in a single record (the exec output in tool_end can be large, but
- * the session file gets the full output and the record format can hold it).
- * If the buffer overflows we silently truncate — the alternative would
- * be to heap-allocate, which complicates the code substantially.
+ * argsbuf for tool call JSON arguments grows dynamically via realloc(),
+ * matching the same pattern used for textbuf.
  */
 
 #include <u.h>
 #include <libc.h>
 #include <bio.h>
 #include <thread.h>
+#ifndef PLAN9
 #include <stdarg.h>
+#endif
 
 #include "9ai.h"
 #include "http.h"
@@ -511,14 +509,17 @@ agentsessload(char *path, OAIReq *req, AgentCfg *cfg)
 			 * text (if any) + tool call, then the tool result.
 			 */
 			char *tool_args_json;
+			char *empty_argv[2];
 			int   i;
 
+			empty_argv[0] = nil;
+			empty_argv[1] = nil;
 			if(nf >= 2) tr_is_error = (strcmp(fields[1], "err") == 0);
 			if(nf >= 3) { free(tr_output); tr_output = strdup(fields[2]); }
 
 			/* build JSON args from argv */
 			tool_args_json = argv2json(
-			    tc_argv != nil ? tc_argv : (char*[]){NULL, NULL},
+			    tc_argv != nil ? tc_argv : empty_argv,
 			    tc_argc);
 
 			oaireqaddmsg(req, oaimsgtoolcall(
@@ -611,82 +612,103 @@ nextrecord:
 /* ── Record formatting ────────────────────────────────────────────────── */
 
 /*
- * fmtrec — format a nil-terminated vararg field list into buf.
+ * fmtrecfields — format a char*[] field list into a heap-allocated buffer.
  *
- * Returns the number of bytes written (not counting NUL).
- * Truncates silently if buf is too small (n bytes available).
+ * Format: field₀ FS field₁ FS … FS fieldₙ RS NUL
  *
- * Format: field₀ FS field₁ FS … FS fieldₙ RS
+ * Returns a malloc'd buffer sized exactly for the record (including the
+ * trailing RS and NUL), with *lenp set to the number of bytes before the
+ * NUL.  Returns nil on allocation failure.
  */
-static long
-fmtrec(char *buf, int n, va_list ap)
+static char *
+fmtrecfields(char **fields, int nfields, long *lenp)
 {
-	char  *field;
-	int    first = 1;
-	long   total = 0;
-	long   flen, rem;
+	long  total = 0;
+	long  wpos  = 0;
+	int   i;
+	char *buf;
 
-	while((field = va_arg(ap, char *)) != nil) {
-		if(!first) {
-			if(total < n - 1) buf[total] = '\x1f';
-			total++;
-		}
-		first = 0;
-		flen = strlen(field);
-		rem  = n - 1 - total;
-		if(rem < 0) rem = 0;
-		if(flen > rem) flen = rem;
-		if(flen > 0) memmove(buf + total, field, flen);
-		total += strlen(field);  /* track true total even if truncated */
+	/* measure */
+	for(i = 0; i < nfields; i++) {
+		if(i > 0) total++;          /* FS separator */
+		total += strlen(fields[i]);
 	}
-	/* RS terminator */
-	if(total < n - 1) buf[total < 0 ? 0 : total] = '\x1e';
-	total++;
+	total++;  /* RS terminator */
 
-	/* NUL-terminate within buf */
-	{
-		long cap = total < n ? total : n - 1;
-		if(cap >= 0) buf[cap] = '\0';
+	buf = malloc(total + 1);
+	if(buf == nil)
+		return nil;
+
+	/* write */
+	for(i = 0; i < nfields; i++) {
+		long flen = strlen(fields[i]);
+		if(i > 0) buf[wpos++] = '\x1f';
+		memmove(buf + wpos, fields[i], flen);
+		wpos += flen;
 	}
-	return total;
+	buf[wpos++] = '\x1e';
+	buf[wpos]   = '\0';
+
+	*lenp = total;
+	return buf;
+}
+
+/*
+ * fmtrecva — collect varargs into a fields array, then call fmtrecfields.
+ *
+ * Takes a nil-terminated va_list of char *.
+ * Returns a malloc'd record buffer, or nil on failure.
+ */
+static char *
+fmtrecva(va_list ap, long *lenp)
+{
+	char  *tmp[64];
+	int    n = 0;
+	char  *f;
+
+	while((f = va_arg(ap, char *)) != nil && n < 64)
+		tmp[n++] = f;
+	return fmtrecfields(tmp, n, lenp);
 }
 
 void
 emitevent(AgentCfg *cfg, ...)
 {
-	char   buf[65536];
-	long   len;
+	char   *buf;
+	long    len;
 	va_list ap;
 
 	if(cfg->onevent == nil)
 		return;
 
 	va_start(ap, cfg);
-	len = fmtrec(buf, sizeof buf, ap);
+	buf = fmtrecva(ap, &len);
 	va_end(ap);
 
-	cfg->onevent(buf, len < (long)sizeof buf ? len : (long)sizeof buf - 1, cfg->aux);
+	if(buf == nil)
+		return;
+	cfg->onevent(buf, len, cfg->aux);
+	free(buf);
 }
 
 void
 writesession(AgentCfg *cfg, ...)
 {
-	char   buf[65536];
-	long   len;
+	char   *buf;
+	long    len;
 	va_list ap;
 
 	if(cfg->sess_bio == nil)
 		return;
 
 	va_start(ap, cfg);
-	len = fmtrec(buf, sizeof buf, ap);
+	buf = fmtrecva(ap, &len);
 	va_end(ap);
 
-	/* write the capped buf; true len may exceed buf if truncated */
-	{
-		long wlen = len < (long)sizeof buf ? len : (long)sizeof buf - 1;
-		Bwrite(cfg->sess_bio, buf, wlen);
-	}
+	if(buf == nil)
+		return;
+	Bwrite(cfg->sess_bio, buf, len);
+	free(buf);
 }
 
 /*
@@ -700,24 +722,21 @@ writesession(AgentCfg *cfg, ...)
 void
 emitandsave(AgentCfg *cfg, ...)
 {
-	char   buf[65536];
-	long   len;
+	char   *buf;
+	long    len;
 	va_list ap;
 
-	/* format once into buf */
 	va_start(ap, cfg);
-	len = fmtrec(buf, sizeof buf, ap);
+	buf = fmtrecva(ap, &len);
 	va_end(ap);
 
-	{
-		long wlen = len < (long)sizeof buf ? len : (long)sizeof buf - 1;
-
-		if(cfg->onevent != nil)
-			cfg->onevent(buf, wlen, cfg->aux);
-
-		if(cfg->sess_bio != nil)
-			Bwrite(cfg->sess_bio, buf, wlen);
-	}
+	if(buf == nil)
+		return;
+	if(cfg->onevent != nil)
+		cfg->onevent(buf, len, cfg->aux);
+	if(cfg->sess_bio != nil)
+		Bwrite(cfg->sess_bio, buf, len);
+	free(buf);
 }
 
 /* ── Token loading ────────────────────────────────────────────────────── */
@@ -776,20 +795,28 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 	/* tool call accumulation */
 	char  tool_id[128];
 	char  tool_name[128];
-	char  argsbuf[65536];
-	long  argslen;
+	char  *argsbuf;
+	long   argscap, argslen;
 
-	enum { TEXTCAP_INIT = 8192, MAX_ITERATIONS = 32 };
+	enum { TEXTCAP_INIT = 8192, ARGSCAP_INIT = 8192, MAX_ITERATIONS = 32 };
+
+	argscap = ARGSCAP_INIT;
+	argsbuf = mallocz(argscap + 1, 1);
+	if(argsbuf == nil)
+		return -1;
 
 	/* ── load refresh token and get session token ── */
 	refresh = loadrefresh(cfg);
-	if(refresh == nil)
+	if(refresh == nil) {
+		free(argsbuf);
 		return -1;
+	}
 
 	tok = oauthsession(refresh, cfg->sockpath);
 	free(refresh);
 	if(tok == nil) {
 		werrstr("agentrun: oauthsession: %r");
+		free(argsbuf);
 		return -1;
 	}
 
@@ -807,6 +834,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 	textbuf = malloc(textcap + 1);
 	if(textbuf == nil) {
 		oauthtokenfree(tok);
+		free(argsbuf);
 		werrstr("agentrun: malloc textbuf: %r");
 		return -1;
 	}
@@ -834,7 +862,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 		body  = oaireqjson(req, cfg->system, &bodylen);
 		if(body == nil) {
 			oauthtokenfree(tok);
-			free(textbuf);
+			free(textbuf); free(argsbuf);
 			werrstr("agentrun: oaireqjson: %r");
 			return -1;
 		}
@@ -843,7 +871,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 		if(c == nil) {
 			free(body);
 			oauthtokenfree(tok);
-			free(textbuf);
+			free(textbuf); free(argsbuf);
 			werrstr("agentrun: portdial: %r");
 			return -1;
 		}
@@ -871,7 +899,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			}
 			httpclose(c);
 			oauthtokenfree(tok);
-			free(textbuf);
+			free(textbuf); free(argsbuf);
 			return -1;
 		}
 
@@ -931,12 +959,17 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				/* accumulate JSON args */
 				{
 					long dlen = strlen(d.text);
-					if(argslen + dlen < (long)sizeof argsbuf - 1) {
-						memmove(argsbuf + argslen, d.text, dlen);
-						argslen += dlen;
-						argsbuf[argslen] = '\0';
+					if(argslen + dlen >= argscap) {
+						long newcap = argscap * 2 + dlen + 1;
+						char *tmp = realloc(argsbuf, newcap + 1);
+						if(tmp == nil)
+							break;
+						argsbuf = tmp;
+						argscap = newcap;
 					}
-					/* if overflow: silently truncate — exec will fail gracefully */
+					memmove(argsbuf + argslen, d.text, dlen);
+					argslen += dlen;
+					argsbuf[argslen] = '\0';
 				}
 				break;
 
@@ -949,13 +982,14 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 		}
 
 		/* done streaming this iteration */
+		oaiterm(&parser);
 		httprespfree(r);
 		httpclose(c);
 
 		if(rc == OAI_EOF && stop_reason[0] == '\0') {
 			/* SSE ended without a finish_reason — treat as error */
 			oauthtokenfree(tok);
-			free(textbuf);
+			free(textbuf); free(argsbuf);
 			werrstr("agentrun: SSE stream ended without finish_reason");
 			return -1;
 		}
@@ -973,7 +1007,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				Bflush(cfg->sess_bio);
 
 			oauthtokenfree(tok);
-			free(textbuf);
+			free(textbuf); free(argsbuf);
 			return 0;
 		}
 
@@ -1021,44 +1055,19 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				fields[fi++] = tool_id;
 				for(i = 0; i < tsargc; i++)
 					fields[fi++] = tsargv[i];
-				fields[fi] = nil;
 
-				/* call emitevent and writesession using the fields array */
 				{
-					char  buf[65536];
-					long  len, wlen;
-					int   first = 1;
-					long  total = 0;
-					int   j;
+					char *buf;
+					long  len;
 
-					for(j = 0; j < fi; j++) {
-						long flen;
-						if(!first) {
-							if(total < (long)sizeof buf - 1)
-								buf[total] = '\x1f';
-							total++;
-						}
-						first = 0;
-						flen = strlen(fields[j]);
-						{
-							long rem = (long)sizeof buf - 1 - total;
-							if(rem < 0) rem = 0;
-							long copy = flen < rem ? flen : rem;
-							if(copy > 0) memmove(buf + total, fields[j], copy);
-						}
-						total += flen;
+					buf = fmtrecfields(fields, fi, &len);
+					if(buf != nil) {
+						if(cfg->onevent != nil)
+							cfg->onevent(buf, len, cfg->aux);
+						if(cfg->sess_bio != nil)
+							Bwrite(cfg->sess_bio, buf, len);
+						free(buf);
 					}
-					if(total < (long)sizeof buf - 1)
-						buf[total] = '\x1e';
-					total++;
-					wlen = total < (long)sizeof buf ? total : (long)sizeof buf - 1;
-					buf[wlen] = '\0';
-					len = wlen;
-
-					if(cfg->onevent != nil)
-						cfg->onevent(buf, len, cfg->aux);
-					if(cfg->sess_bio != nil)
-						Bwrite(cfg->sess_bio, buf, len);
 				}
 
 				for(i = 0; i < tsargc; i++)
@@ -1072,8 +1081,16 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 		/* execute the tool */
 		{
 			ExecResult *er;
-			char        result[EXEC_MAXOUT + 64];
+			char       *result;
 			int         is_error;
+
+			result = mallocz(EXEC_MAXOUT + 64, 1);
+			if(result == nil) {
+				oauthtokenfree(tok);
+				free(textbuf); free(argsbuf);
+				werrstr("agentrun: malloc result: %r");
+				return -1;
+			}
 
 			er = execrun(argsbuf, argslen);
 			if(er == nil) {
@@ -1087,7 +1104,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				if(cfg->sess_bio != nil) Bflush(cfg->sess_bio);
 			} else {
 				is_error = (er->exitcode != 0);
-				execresultstr(er, result, sizeof result);
+				execresultstr(er, result, EXEC_MAXOUT + 64);
 
 				emitandsave(cfg, "tool_end",
 				    is_error ? "err" : "ok",
@@ -1099,6 +1116,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				    result, is_error));
 				execresultfree(er);
 			}
+			free(result);
 		}
 
 		/* loop: POST again with tool result in history */
@@ -1106,7 +1124,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 
 	/* hit MAX_ITERATIONS */
 	oauthtokenfree(tok);
-	free(textbuf);
+	free(textbuf); free(argsbuf);
 	werrstr("agentrun: exceeded %d tool iterations", MAX_ITERATIONS);
 	return -1;
 }
@@ -1149,20 +1167,28 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 	/* tool call accumulation */
 	char  tool_id[128];
 	char  tool_name[128];
-	char  argsbuf[65536];
-	long  argslen;
+	char  *argsbuf;
+	long   argscap, argslen;
 
-	enum { TEXTCAP_INIT = 8192, MAX_ITERATIONS = 32 };
+	enum { TEXTCAP_INIT = 8192, ARGSCAP_INIT = 8192, MAX_ITERATIONS = 32 };
+
+	argscap = ARGSCAP_INIT;
+	argsbuf = mallocz(argscap + 1, 1);
+	if(argsbuf == nil)
+		return -1;
 
 	/* ── load refresh token and get session token ── */
 	refresh = loadrefresh(cfg);
-	if(refresh == nil)
+	if(refresh == nil) {
+		free(argsbuf);
 		return -1;
+	}
 
 	tok = oauthsession(refresh, cfg->sockpath);
 	free(refresh);
 	if(tok == nil) {
 		werrstr("agentrunant: oauthsession: %r");
+		free(argsbuf);
 		return -1;
 	}
 
@@ -1207,7 +1233,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 		body  = antreqjson(req, cfg->system, &bodylen);
 		if(body == nil) {
 			oauthtokenfree(tok);
-			free(textbuf);
+			free(textbuf); free(argsbuf);
 			werrstr("agentrunant: antreqjson: %r");
 			return -1;
 		}
@@ -1216,7 +1242,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 		if(c == nil) {
 			free(body);
 			oauthtokenfree(tok);
-			free(textbuf);
+			free(textbuf); free(argsbuf);
 			werrstr("agentrunant: portdial: %r");
 			return -1;
 		}
@@ -1244,7 +1270,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			}
 			httpclose(c);
 			oauthtokenfree(tok);
-			free(textbuf);
+			free(textbuf); free(argsbuf);
 			return -1;
 		}
 
@@ -1313,11 +1339,17 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				/* accumulate JSON input */
 				{
 					long dlen = strlen(d.text);
-					if(argslen + dlen < (long)sizeof argsbuf - 1) {
-						memmove(argsbuf + argslen, d.text, dlen);
-						argslen += dlen;
-						argsbuf[argslen] = '\0';
+					if(argslen + dlen >= argscap) {
+						long newcap = argscap * 2 + dlen + 1;
+						char *tmp = realloc(argsbuf, newcap + 1);
+						if(tmp == nil)
+							break;
+						argsbuf = tmp;
+						argscap = newcap;
 					}
+					memmove(argsbuf + argslen, d.text, dlen);
+					argslen += dlen;
+					argsbuf[argslen] = '\0';
 				}
 				break;
 
@@ -1330,12 +1362,13 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 		}
 
 		/* done streaming this iteration */
+		antterm(&parser);
 		httprespfree(r);
 		httpclose(c);
 
 		if(rc == ANT_EOF && stop_reason[0] == '\0') {
 			oauthtokenfree(tok);
-			free(textbuf);
+			free(textbuf); free(argsbuf);
 			werrstr("agentrunant: SSE stream ended without stop_reason");
 			return -1;
 		}
@@ -1353,7 +1386,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				Bflush(cfg->sess_bio);
 
 			oauthtokenfree(tok);
-			free(textbuf);
+			free(textbuf); free(argsbuf);
 			return 0;
 		}
 
@@ -1385,41 +1418,29 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			free(tsstdin);
 
 			if(tsargc > 0) {
-				char  buf[65536];
-				long  total = 0;
-				int   first = 1;
+				char  *buf;
+				char  **flds;
+				long  len;
 				int   j;
 
-				for(j = 0; j < tsargc + 3; j++) {
-					char *fld;
-					long  flen;
-					if(j == 0)      fld = "tool_start";
-					else if(j == 1) fld = tool_name;
-					else if(j == 2) fld = tool_id;
-					else            fld = tsargv[j - 3];
+				flds = malloc((tsargc + 3) * sizeof(char*));
+				if(flds == nil) {
+					for(j = 0; j < tsargc; j++) free(tsargv[j]);
+					break;
+				}
+				flds[0] = "tool_start";
+				flds[1] = tool_name;
+				flds[2] = tool_id;
+				for(j = 0; j < tsargc; j++)
+					flds[3 + j] = tsargv[j];
 
-					if(!first) {
-						if(total < (long)sizeof buf - 1) buf[total] = '\x1f';
-						total++;
-					}
-					first = 0;
-					flen = strlen(fld);
-					{
-						long rem = (long)sizeof buf - 1 - total;
-						if(rem < 0) rem = 0;
-						long copy = flen < rem ? flen : rem;
-						if(copy > 0) memmove(buf + total, fld, copy);
-					}
-					total += flen;
+				buf = fmtrecfields(flds, tsargc + 3, &len);
+				if(buf != nil) {
+					if(cfg->onevent != nil) cfg->onevent(buf, len, cfg->aux);
+					if(cfg->sess_bio != nil) Bwrite(cfg->sess_bio, buf, len);
+					free(buf);
 				}
-				if(total < (long)sizeof buf - 1) buf[total] = '\x1e';
-				total++;
-				{
-					long wlen = total < (long)sizeof buf ? total : (long)sizeof buf - 1;
-					buf[wlen] = '\0';
-					if(cfg->onevent != nil) cfg->onevent(buf, wlen, cfg->aux);
-					if(cfg->sess_bio != nil) Bwrite(cfg->sess_bio, buf, wlen);
-				}
+				free(flds);
 
 				for(j = 0; j < tsargc; j++) free(tsargv[j]);
 			} else {
@@ -1430,8 +1451,16 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 		/* execute the tool */
 		{
 			ExecResult *er;
-			char        result[EXEC_MAXOUT + 64];
+			char       *result;
 			int         is_error;
+
+			result = mallocz(EXEC_MAXOUT + 64, 1);
+			if(result == nil) {
+				oauthtokenfree(tok);
+				free(textbuf); free(argsbuf);
+				werrstr("agentrunant: malloc result: %r");
+				return -1;
+			}
 
 			er = execrun(argsbuf, argslen);
 			if(er == nil) {
@@ -1444,7 +1473,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				if(cfg->sess_bio != nil) Bflush(cfg->sess_bio);
 			} else {
 				is_error = (er->exitcode != 0);
-				execresultstr(er, result, sizeof result);
+				execresultstr(er, result, EXEC_MAXOUT + 64);
 
 				emitandsave(cfg, "tool_end",
 				    is_error ? "err" : "ok",
@@ -1456,6 +1485,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				    result, is_error));
 				execresultfree(er);
 			}
+			free(result);
 		}
 
 		/* loop: POST again with tool result in history */
@@ -1463,7 +1493,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 
 	/* hit MAX_ITERATIONS */
 	oauthtokenfree(tok);
-	free(textbuf);
+	free(textbuf); free(argsbuf);
 	werrstr("agentrunant: exceeded %d tool iterations", MAX_ITERATIONS);
 	return -1;
 }

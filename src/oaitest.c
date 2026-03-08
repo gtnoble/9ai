@@ -35,7 +35,7 @@ static int failures = 0;
 
 #define CHECK(cond, msg) do { \
 	if(!(cond)) { \
-		fprint(2, "FAIL: %s (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s\n", msg); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -44,8 +44,8 @@ static int failures = 0;
 
 #define CHECKEQ(a, b, msg) do { \
 	if((long)(a) != (long)(b)) { \
-		fprint(2, "FAIL: %s: got %ld want %ld (line %d)\n", \
-		       msg, (long)(a), (long)(b), __LINE__); \
+		fprint(2, "FAIL: %s: got %ld want %ld\n", \
+		       msg, (long)(a), (long)(b)); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -55,8 +55,8 @@ static int failures = 0;
 #define CHECKSTR(a, b, msg) do { \
 	const char *_a = (a), *_b = (b); \
 	if(_a == nil || strcmp(_a, _b) != 0) { \
-		fprint(2, "FAIL: %s: got \"%s\" want \"%s\" (line %d)\n", \
-		       msg, _a ? _a : "(nil)", _b, __LINE__); \
+		fprint(2, "FAIL: %s: got \"%s\" want \"%s\"\n", \
+		       msg, _a ? _a : "(nil)", _b); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -65,7 +65,7 @@ static int failures = 0;
 
 #define CHECKNIL(a, msg) do { \
 	if((a) != nil) { \
-		fprint(2, "FAIL: %s: got non-nil (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s: got non-nil\n", msg); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -74,8 +74,8 @@ static int failures = 0;
 
 #define CHECKPREFIX(s, pfx, msg) do { \
 	if((s) == nil || strncmp((s),(pfx),strlen(pfx)) != 0) { \
-		fprint(2, "FAIL: %s: \"%s\" does not start with \"%s\" (line %d)\n", \
-		       msg, (s) ? (s) : "(nil)", (pfx), __LINE__); \
+		fprint(2, "FAIL: %s: \"%s\" does not start with \"%s\"\n", \
+		       msg, (s) ? (s) : "(nil)", (pfx)); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -84,8 +84,8 @@ static int failures = 0;
 
 #define CHECKCONTAINS(s, sub, msg) do { \
 	if((s) == nil || strstr((s),(sub)) == nil) { \
-		fprint(2, "FAIL: %s: \"%s\" does not contain \"%s\" (line %d)\n", \
-		       msg, (s) ? (s) : "(nil)", (sub), __LINE__); \
+		fprint(2, "FAIL: %s: \"%s\" does not contain \"%s\"\n", \
+		       msg, (s) ? (s) : "(nil)", (sub)); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -463,6 +463,7 @@ test_delta_text_fixture(void)
 	CHECKCONTAINS(assembled, "hello", "assembled text contains 'hello'");
 	CHECKCONTAINS(assembled, "world", "assembled text contains 'world'");
 
+	oaiterm(&p);
 	resp_free(resp);
 }
 
@@ -522,6 +523,7 @@ test_delta_tool_fixture(void)
 	CHECKCONTAINS(args, "argv",             "accumulated args contain 'argv'");
 	CHECKCONTAINS(args, "echo",             "accumulated args contain 'echo'");
 
+	oaiterm(&p);
 	resp_free(resp);
 }
 
@@ -621,6 +623,7 @@ test_live_text(char *sockpath, char *tokpath)
 	}
 	print("  assembled: %s\n", assembled);
 
+	oaiterm(&parser);
 	httprespfree(r);
 	httpclose(c);
 	free(body);
@@ -730,6 +733,7 @@ test_live_tool(char *sockpath, char *tokpath)
 	CHECKCONTAINS(args, "argv", "live tool: args contain 'argv'");
 	print("  accumulated args: %s\n", args);
 
+	oaiterm(&parser);
 	httprespfree(r);
 	httpclose(c);
 	free(body);

@@ -32,6 +32,10 @@
  *     nil (EOF)           → return SSE_EOF
  *     anything else       → skip (comments, unknown fields)
  *   After delivering a data line: clear have_event for the next event.
+ *
+ * Buffers:
+ *   evbuf and databuf are heap-allocated and grow as needed.
+ *   Initial size is SSE_INITBUFSZ; doubled on each resize.
  */
 
 #include <u.h>
@@ -41,6 +45,35 @@
 #include "http.h"
 #include "sse.h"
 
+enum {
+	SSE_INITBUFSZ = 256,
+};
+
+/*
+ * growbuf — ensure *buf has room for at least need bytes (including NUL).
+ * Returns 0 on success, -1 on allocation failure.
+ */
+static int
+growbuf(char **buf, long *sz, long need)
+{
+	long newsz;
+	char *p;
+
+	if(need <= *sz)
+		return 0;
+	newsz = *sz;
+	if(newsz == 0)
+		newsz = SSE_INITBUFSZ;
+	while(newsz < need)
+		newsz *= 2;
+	p = realloc(*buf, newsz);
+	if(p == nil)
+		return -1;
+	*buf = p;
+	*sz  = newsz;
+	return 0;
+}
+
 void
 sseinit(SSEParser *p, HTTPResp *resp)
 {
@@ -48,11 +81,22 @@ sseinit(SSEParser *p, HTTPResp *resp)
 	p->resp = resp;
 }
 
+void
+sseterm(SSEParser *p)
+{
+	free(p->evbuf);
+	free(p->databuf);
+	p->evbuf   = nil;
+	p->databuf = nil;
+	p->evbufsz   = 0;
+	p->databufsz = 0;
+}
+
 int
 ssestep(SSEParser *p, SSEEvent *ev)
 {
-	char *line;
-	int   n;
+	char *line, *payload;
+	long  n;
 
 	for(;;) {
 		line = httpreadline(p->resp);
@@ -66,33 +110,31 @@ ssestep(SSEParser *p, SSEEvent *ev)
 
 		if(strncmp(line, "event: ", 7) == 0) {
 			/* save event name; data line follows */
-			n = strlen(line + 7);
-			if(n >= (int)sizeof p->evbuf)
-				n = (int)sizeof p->evbuf - 1;
-			memmove(p->evbuf, line + 7, n);
-			p->evbuf[n] = '\0';
+			payload = line + 7;
+			n = strlen(payload) + 1;
+			if(growbuf(&p->evbuf, &p->evbufsz, n) < 0)
+				return SSE_EOF;
+			memmove(p->evbuf, payload, n);
 			p->have_event = 1;
 			continue;
 		}
 
 		if(strncmp(line, "data: ", 6) == 0) {
-			char *payload = line + 6;
+			payload = line + 6;
 
 			if(strcmp(payload, "[DONE]") == 0)
 				return SSE_DONE;
 
-			/* copy payload into databuf */
-			n = strlen(payload);
-			if(n >= SSE_BUFSZ)
-				n = SSE_BUFSZ - 1;
+			n = strlen(payload) + 1;
+			if(growbuf(&p->databuf, &p->databufsz, n) < 0)
+				return SSE_EOF;
 			memmove(p->databuf, payload, n);
-			p->databuf[n] = '\0';
 
 			ev->data  = p->databuf;
 			ev->event = p->have_event ? p->evbuf : nil;
 
-			/* reset for next event; leave evbuf contents intact —
-			 * caller may read ev->event until the next ssestep() call */
+			/* reset for next event; evbuf contents remain valid
+			 * until the next ssestep() or sseterm() call */
 			p->have_event = 0;
 
 			return SSE_OK;

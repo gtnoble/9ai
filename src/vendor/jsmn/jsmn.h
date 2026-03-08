@@ -24,7 +24,14 @@
 #ifndef JSMN_H
 #define JSMN_H
 
+#ifndef PLAN9
 #include <stddef.h>
+#else
+typedef ulong size_t;
+#ifndef NULL
+#define NULL nil
+#endif
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,10 +52,18 @@ extern "C" {
  */
 typedef enum {
   JSMN_UNDEFINED = 0,
-  JSMN_OBJECT = 1 << 0,
-  JSMN_ARRAY = 1 << 1,
-  JSMN_STRING = 1 << 2,
+#ifndef PLAN9
+  JSMN_OBJECT    = 1 << 0,
+  JSMN_ARRAY     = 1 << 1,
+  JSMN_STRING    = 1 << 2,
   JSMN_PRIMITIVE = 1 << 3
+#else
+  /* Plan 9 C does not support bit-shift expressions in enum constants */
+  JSMN_OBJECT    = 1,
+  JSMN_ARRAY     = 2,
+  JSMN_STRING    = 4,
+  JSMN_PRIMITIVE = 8
+#endif
 } jsmntype_t;
 
 enum jsmnerr {

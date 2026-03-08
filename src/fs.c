@@ -62,6 +62,11 @@
 #include <thread.h>
 #include <9p.h>
 
+#ifndef PLAN9PORT
+#define chansendp(c, v)  sendp(c, v)
+#define chanrecvp(c)     recvp(c)
+#endif
+
 #include "9ai.h"
 #include "http.h"
 #include "json.h"
@@ -1347,7 +1352,7 @@ agentproc(void *v)
 		memset(&cfg, 0, sizeof cfg);
 		qlock(&g->lk);
 		cfg.model    = strdup(g->model);
-		cfg.sockpath = strdup(g->sockpath);
+		cfg.sockpath = g->sockpath ? strdup(g->sockpath) : nil;
 		cfg.tokpath  = strdup(g->tokpath);
 		cfg.system   = strdup((char*)defaultsystem);
 		memmove(cfg.uuid, g->uuid, 37);
@@ -1366,9 +1371,6 @@ agentproc(void *v)
 			rc = agentrunant(req->text, g->antreq, &cfg);
 		else
 			rc = agentrun(req->text, g->oaireq, &cfg);
-
-		/* send [done] sentinel before EOF on /output */
-		chansendp(g->outchan, strdup("[done]\n"));
 
 		/* sync uuid back (agentsessopen may have set it) */
 		qlock(&g->lk);
@@ -1587,7 +1589,7 @@ aiinit(char *model, char *sockpath, char *tokpath)
 		sysfatal("mallocz AiState: %r");
 
 	ai->model    = strdup(model);
-	ai->sockpath = strdup(sockpath);
+	ai->sockpath = sockpath ? strdup(sockpath) : nil;
 	ai->tokpath  = strdup(tokpath);
 	ai->oaireq   = oaireqnew(model);
 	ai->antreq   = antreqnew(model);
@@ -1612,7 +1614,7 @@ aimain(AiState *ai, char *srvname, char *mtpt)
 	g = ai;
 
 	/* start agent proc */
-	proccreate(agentproc, nil, 65536);
+	proccreate(agentproc, nil, 524288);
 
 	/* start channel watcher procs */
 	proccreate(outwatcher,   nil, 16384);

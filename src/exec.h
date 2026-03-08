@@ -82,7 +82,9 @@ int execparse(const char *args_json, int args_len,
  *
  * Returns a heap-allocated ExecResult on success or failure (even if
  * the program exits non-zero).  Returns nil only on internal error
- * (parse failure, pipe creation failure, etc.).
+ * (parse failure, pipe creation failure, etc.) or if the program could
+ * not be found/executed, in which case errstr is set to
+ * "exec: command not found: <argv[0]>" or similar.
  *
  * Caller must free with execresultfree().
  */

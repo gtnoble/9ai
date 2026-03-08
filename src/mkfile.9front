@@ -2,6 +2,7 @@
 
 BIN=/$objtype/bin
 TARG=9ai
+CFLAGS=-DPLAN9
 
 OFILES=\
 	main.$O\
@@ -29,14 +30,66 @@ HFILES=\
 	exec.h\
 	agent.h\
 	fs.h\
+	prompt.h\
+	record.h\
+	render.h\
+	sessfile.h\
+	acmeevent.h\
 
-<sys/src/cmd/mkone
+</sys/src/cmd/mkone
 
-# Test targets
-$O.httptest: httptest.$O port.$O http.$O json.$O
+install: $BIN/$TARG $BIN/9ai-acme $BIN/9ai-sessions
+
+# ── offline unit tests (no network required) ──────────────────────────────
+
+$O.acmetest: acmetest.$O prompt.$O record.$O render.$O sessfile.$O acmeevent.$O
 	$LD $LDFLAGS -o $target $prereq
 
+test-acme:V: $O.acmetest
+	./$O.acmetest
+
 $O.jsontest: jsontest.$O json.$O port.$O http.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-json:V: $O.jsontest
+	./$O.jsontest
+
+$O.ssetest: ssetest.$O port.$O http.$O json.$O oauth.$O sse.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-sse:V: $O.ssetest
+	./$O.ssetest
+
+$O.exectest: exectest.$O port.$O http.$O json.$O exec.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-exec:V: $O.exectest
+	./$O.exectest
+
+$O.oaitest: oaitest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-oai:V: $O.oaitest
+	./$O.oaitest
+
+$O.anttest: anttest.$O port.$O http.$O json.$O oauth.$O sse.$O ant.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-ant:V: $O.anttest
+	./$O.anttest
+
+$O.agenttest: agenttest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O ant.$O exec.$O agent.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-agent:V: $O.agenttest
+	./$O.agenttest
+
+# run all offline unit tests
+test:V: test-acme test-json test-sse test-exec test-oai test-ant test-agent
+
+# ── network/credential tests (require -s sockpath -t tokenpath) ───────────
+
+$O.httptest: httptest.$O port.$O http.$O json.$O
 	$LD $LDFLAGS -o $target $prereq
 
 $O.oauthtest: oauthtest.$O port.$O http.$O json.$O oauth.$O
@@ -45,26 +98,17 @@ $O.oauthtest: oauthtest.$O port.$O http.$O json.$O oauth.$O
 $O.modelstest: modelstest.$O port.$O http.$O json.$O oauth.$O models.$O
 	$LD $LDFLAGS -o $target $prereq
 
-$O.ssetest: ssetest.$O port.$O http.$O json.$O oauth.$O sse.$O
-	$LD $LDFLAGS -o $target $prereq
-
-$O.oaitest: oaitest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O
-	$LD $LDFLAGS -o $target $prereq
-
-$O.exectest: exectest.$O port.$O http.$O json.$O exec.$O
-	$LD $LDFLAGS -o $target $prereq
-
-$O.agenttest: agenttest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O ant.$O exec.$O agent.$O
-	$LD $LDFLAGS -o $target $prereq
-
 $O.fstest: fstest.$O port.$O http.$O json.$O oauth.$O models.$O sse.$O oai.$O ant.$O exec.$O agent.$O fs.$O
 	$LD $LDFLAGS -o $target $prereq
 
-$O.anttest: anttest.$O port.$O http.$O json.$O oauth.$O sse.$O ant.$O
+$O.9ai-acme: 9ai-acme-native.$O prompt.$O record.$O render.$O sessfile.$O acmeevent.$O port.$O http.$O
 	$LD $LDFLAGS -o $target $prereq
 
-$O.9ai-acme: 9ai-acme-native.$O port.$O http.$O
-	$LD $LDFLAGS -o $target $prereq
+$BIN/9ai-acme: $O.9ai-acme
+	cp $O.9ai-acme $BIN/9ai-acme
 
 $O.9ai-sessions: 9ai-sessions.$O port.$O http.$O
 	$LD $LDFLAGS -o $target $prereq
+
+$BIN/9ai-sessions: $O.9ai-sessions
+	cp $O.9ai-sessions $BIN/9ai-sessions

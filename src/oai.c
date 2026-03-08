@@ -252,23 +252,32 @@ emitmsg(Biobuf *b, OAIMsg *m)
 		{
 			/* build the string via an in-memory Biobuf on a pipe */
 			int pfd[2];
-			char buf[65536];
+			char *buf;
 			long n;
-			Biobuf tbuf;
+			Biobuf *tbuf;
 
-			if(pipe(pfd) < 0) sysfatal("pipe: %r");
-			Binit(&tbuf, pfd[1], OWRITE);
-			for(blk = m->content; blk != nil; blk = blk->next)
-				if(blk->type == OAIBlockText && blk->text != nil)
-					Bprint(&tbuf, "%s", blk->text);
-			Bflush(&tbuf);
-			Bterm(&tbuf);
-			close(pfd[1]);
-			n = read(pfd[0], buf, sizeof buf - 1);
-			if(n < 0) n = 0;
-			buf[n] = '\0';
-			close(pfd[0]);
-			jsonemitstr(b, buf);
+			buf = mallocz(65536, 1);
+			tbuf = mallocz(sizeof(Biobuf), 1);
+			if(buf == nil || tbuf == nil) {
+				free(buf); free(tbuf);
+				Bprint(b, "\"\"");
+			} else {
+				if(pipe(pfd) < 0) sysfatal("pipe: %r");
+				Binit(tbuf, pfd[1], OWRITE);
+				for(blk = m->content; blk != nil; blk = blk->next)
+					if(blk->type == OAIBlockText && blk->text != nil)
+						Bprint(tbuf, "%s", blk->text);
+				Bflush(tbuf);
+				Bterm(tbuf);
+				free(tbuf);
+				close(pfd[1]);
+				n = read(pfd[0], buf, 65535);
+				if(n < 0) n = 0;
+				buf[n] = '\0';
+				close(pfd[0]);
+				jsonemitstr(b, buf);
+				free(buf);
+			}
 		}
 
 		/* tool_calls array */
@@ -314,7 +323,7 @@ char *
 oaireqjson(OAIReq *req, char *system_prompt, long *lenp)
 {
 	int pfd[2];
-	Biobuf b;
+	Biobuf *b;
 	OAIMsg *m;
 	char *buf;
 	long cap, len, n;
@@ -324,35 +333,42 @@ oaireqjson(OAIReq *req, char *system_prompt, long *lenp)
 	if(pipe(pfd) < 0)
 		return nil;
 
-	Binit(&b, pfd[1], OWRITE);
+	b = mallocz(sizeof(Biobuf), 1);
+	if(b == nil) {
+		close(pfd[0]);
+		close(pfd[1]);
+		return nil;
+	}
+	Binit(b, pfd[1], OWRITE);
 
-	Bprint(&b, "{\"model\":");
-	jsonemitstr(&b, req->model);
-	Bprint(&b, ",\"stream\":true");
-	Bprint(&b, ",\"max_completion_tokens\":%d", MAX_OUT_TOK);
-	Bprint(&b, ",\"messages\":[");
+	Bprint(b, "{\"model\":");
+	jsonemitstr(b, req->model);
+	Bprint(b, ",\"stream\":true");
+	Bprint(b, ",\"max_completion_tokens\":%d", MAX_OUT_TOK);
+	Bprint(b, ",\"messages\":[");
 
 	/* system prompt first */
 	int first = 1;
 	if(system_prompt != nil && system_prompt[0] != '\0') {
-		Bprint(&b, "{\"role\":\"system\",\"content\":");
-		jsonemitstr(&b, system_prompt);
-		Bprint(&b, "}");
+		Bprint(b, "{\"role\":\"system\",\"content\":");
+		jsonemitstr(b, system_prompt);
+		Bprint(b, "}");
 		first = 0;
 	}
 
 	for(m = req->msgs; m != nil; m = m->next) {
-		if(!first) Bprint(&b, ",");
+		if(!first) Bprint(b, ",");
 		first = 0;
-		emitmsg(&b, m);
+		emitmsg(b, m);
 	}
 
-	Bprint(&b, "]");
-	Bprint(&b, ",\"tools\":[%s]", exec_tool_json);
-	Bprint(&b, "}");
+	Bprint(b, "]");
+	Bprint(b, ",\"tools\":[%s]", exec_tool_json);
+	Bprint(b, "}");
 
-	Bflush(&b);
-	Bterm(&b);
+	Bflush(b);
+	Bterm(b);
+	free(b);
 	close(pfd[1]);
 
 	/* read back into malloc'd buffer */
@@ -420,11 +436,62 @@ oaireqhdrs(OAIReq *req, char *session, HTTPHdr *hdrs, int maxn)
 
 /* ── SSE delta parser ─────────────────────────────────────────────────── */
 
+/*
+ * growbuf — ensure *buf is at least need bytes, doubling from SSE_INITBUFSZ.
+ * Returns 0 on success, -1 on failure.
+ */
+static int
+growbuf(char **buf, long *sz, long need)
+{
+	long newsz;
+	char *p;
+
+	if(need <= *sz)
+		return 0;
+	newsz = *sz ? *sz : 256;
+	while(newsz < need)
+		newsz *= 2;
+	p = realloc(*buf, newsz);
+	if(p == nil)
+		return -1;
+	*buf = p;
+	*sz  = newsz;
+	return 0;
+}
+
+/*
+ * jsonstr_grow — decode JSON string token into p->textbuf, growing as needed.
+ * Returns number of bytes written (>= 0), or -1 on error.
+ */
+static int
+jsonstr_grow(OAIParser *p, const char *js, jsmntok_t *t)
+{
+	long need;
+	int n;
+
+	if(t->type != JSMN_STRING)
+		return -1;
+	need = (t->end - t->start) + 1;  /* upper bound: raw >= decoded */
+	if(growbuf(&p->textbuf, &p->textbufsz, need) < 0)
+		return -1;
+	n = jsonstr(js, t, p->textbuf, (int)p->textbufsz);
+	return n;
+}
+
 void
 oaiinit(OAIParser *p, HTTPResp *resp)
 {
 	memset(p, 0, sizeof *p);
 	sseinit(&p->sse, resp);
+}
+
+void
+oaiterm(OAIParser *p)
+{
+	sseterm(&p->sse);
+	free(p->textbuf);
+	p->textbuf   = nil;
+	p->textbufsz = 0;
 }
 
 /*
@@ -451,21 +518,24 @@ int
 oaidelta(OAIParser *p, OAIDelta *d)
 {
 	SSEEvent ev;
-	int rc;
+	int rc, ret;
 	enum { MAXTOK = 256 };
 	jsmn_parser jp;
-	jsmntok_t toks[MAXTOK];
+	jsmntok_t *toks;
 	int ntoks;
 	int choices_i, choice_i, delta_i, fr_i;
 	int tc_i, tc0_i, fn_i;
 	char buf[128];
 
-	for(;;) {
+	toks = malloc(MAXTOK * sizeof(jsmntok_t));
+	if(toks == nil)
+		return OAI_EOF;
+
+	ret = -1;
+	while(ret < 0) {
 		rc = ssestep(&p->sse, &ev);
-		if(rc == SSE_DONE)
-			return OAI_DONE;
-		if(rc == SSE_EOF)
-			return OAI_EOF;
+		if(rc == SSE_DONE) { ret = OAI_DONE; break; }
+		if(rc == SSE_EOF)  { ret = OAI_EOF;  break; }
 
 		/* parse the JSON chunk */
 		jsmn_init(&jp);
@@ -496,7 +566,8 @@ oaidelta(OAIParser *p, OAIDelta *d)
 					d->tool_id     = nil;
 					d->tool_name   = nil;
 					d->stop_reason = p->stop_reasonbuf;
-					return OAI_OK;
+					ret = OAI_OK;
+					continue;
 				}
 			}
 		}
@@ -510,15 +581,15 @@ oaidelta(OAIParser *p, OAIDelta *d)
 		{
 			int content_i = jsonget(ev.data, toks, ntoks, delta_i, "content");
 			if(content_i >= 0 && toks[content_i].type == JSMN_STRING) {
-				int n = jsonstr(ev.data, &toks[content_i],
-				                p->textbuf, sizeof p->textbuf);
+				int n = jsonstr_grow(p, ev.data, &toks[content_i]);
 				if(n > 0) {
 					d->type      = OAIDText;
 					d->text      = p->textbuf;
 					d->tool_id   = nil;
 					d->tool_name = nil;
 					d->stop_reason = nil;
-					return OAI_OK;
+					ret = OAI_OK;
+					continue;
 				}
 			}
 		}
@@ -551,7 +622,8 @@ oaidelta(OAIParser *p, OAIDelta *d)
 					d->tool_id   = p->tool_idbuf;
 					d->tool_name = p->tool_namebuf;
 					d->stop_reason = nil;
-					return OAI_OK;
+					ret = OAI_OK;
+					continue;
 				}
 			}
 		}
@@ -561,15 +633,15 @@ oaidelta(OAIParser *p, OAIDelta *d)
 		if(fn_i >= 0 && toks[fn_i].type == JSMN_OBJECT) {
 			int args_i = jsonget(ev.data, toks, ntoks, fn_i, "arguments");
 			if(args_i >= 0 && toks[args_i].type == JSMN_STRING) {
-				int n = jsonstr(ev.data, &toks[args_i],
-				                p->textbuf, sizeof p->textbuf);
+				int n = jsonstr_grow(p, ev.data, &toks[args_i]);
 				if(n > 0) {
 					d->type      = OAIDToolArg;
 					d->text      = p->textbuf;
 					d->tool_id   = nil;
 					d->tool_name = nil;
 					d->stop_reason = nil;
-					return OAI_OK;
+					ret = OAI_OK;
+					continue;
 				}
 			}
 		}
@@ -577,4 +649,6 @@ oaidelta(OAIParser *p, OAIDelta *d)
 		/* nothing actionable in this chunk; loop for next SSE event */
 		USED(buf);
 	}
+	free(toks);
+	return ret;
 }

@@ -178,16 +178,18 @@ struct ANTDelta {
 
 struct ANTParser {
 	SSEParser sse;
-	/* internal buffers; fields in ANTDelta point into these */
-	char textbuf[65536];
-	char tool_idbuf[128];
-	char tool_namebuf[128];
-	char stop_reasonbuf[32];
+	/* heap buffers; fields in ANTDelta point into these */
+	char *textbuf;
+	long  textbufsz;
+	char  tool_idbuf[128];
+	char  tool_namebuf[128];
+	char  stop_reasonbuf[32];
 	/* block type tracking between content_block_start and content_block_stop */
 	int  block_type;   /* ANTBlockText, ANTBlockToolUse, or -1 */
 };
 
 void antinit(ANTParser *p, HTTPResp *resp);
+void antterm(ANTParser *p);
 
 /*
  * antdelta — parse the next logical delta event from the SSE stream.

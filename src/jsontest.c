@@ -23,7 +23,7 @@ static int failures = 0;
 
 #define CHECK(cond, msg) do { \
 	if(!(cond)) { \
-		fprint(2, "FAIL: %s (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s\n", msg); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -32,8 +32,8 @@ static int failures = 0;
 
 #define CHECKEQ(a, b, msg) do { \
 	if((a) != (b)) { \
-		fprint(2, "FAIL: %s: got %ld want %ld (line %d)\n", \
-		       msg, (long)(a), (long)(b), __LINE__); \
+		fprint(2, "FAIL: %s: got %ld want %ld\n", \
+		       msg, (long)(a), (long)(b)); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -42,8 +42,8 @@ static int failures = 0;
 
 #define CHECKSTR(a, b, msg) do { \
 	if(strcmp((a),(b)) != 0) { \
-		fprint(2, "FAIL: %s: got \"%s\" want \"%s\" (line %d)\n", \
-		       msg, (a), (b), __LINE__); \
+		fprint(2, "FAIL: %s: got \"%s\" want \"%s\"\n", \
+		       msg, (a), (b)); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -279,7 +279,7 @@ test_escape(void)
 	int ntoks;
 	char buf[256];
 	char out[512];
-	Biobuf b;
+	Biobuf *b;
 
 	ntoks = parse(js, toks, MAXTOK);
 	CHECK(ntoks == 1, "escape: single string token");
@@ -293,10 +293,13 @@ test_escape(void)
 		long n;
 
 		if(pipe(p) < 0) sysfatal("pipe: %r");
-		Binit(&b, p[1], OWRITE);
-		jsonemitstr(&b, buf);
-		Bflush(&b);
-		Bterm(&b);
+		b = mallocz(sizeof(Biobuf), 1);
+		if(b == nil) sysfatal("mallocz Biobuf: %r");
+		Binit(b, p[1], OWRITE);
+		jsonemitstr(b, buf);
+		Bflush(b);
+		Bterm(b);
+		free(b);
 		close(p[1]);
 		n = readn(p[0], out, sizeof out - 1);
 		close(p[0]);
@@ -312,15 +315,18 @@ test_ctrlchar(void)
 {
 	char src[4] = { 'a', 0x01, 'b', '\0' };
 	char out[64];
-	Biobuf b;
+	Biobuf *b;
 	int p[2];
 	long n;
 
 	if(pipe(p) < 0) sysfatal("pipe: %r");
-	Binit(&b, p[1], OWRITE);
-	jsonemitstr(&b, src);
-	Bflush(&b);
-	Bterm(&b);
+	b = mallocz(sizeof(Biobuf), 1);
+	if(b == nil) sysfatal("mallocz Biobuf: %r");
+	Binit(b, p[1], OWRITE);
+	jsonemitstr(b, src);
+	Bflush(b);
+	Bterm(b);
+	free(b);
 	close(p[1]);
 	n = readn(p[0], out, sizeof out - 1);
 	close(p[0]);

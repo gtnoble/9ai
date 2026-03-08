@@ -53,6 +53,11 @@
 #include <9pclient.h>
 
 #include "9ai.h"   /* homedir() */
+#include "prompt.h"
+#include "record.h"
+#include "render.h"
+#include "sessfile.h"
+#include "acmeevent.h"
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
@@ -84,7 +89,7 @@ typedef struct Win Win;
 struct Win {
 	int   id;
 	CFid *ctl;
-	CFid *event;
+	int   eventfd;  /* plain fd for event file — readable and writable */
 	CFid *addr;
 	CFid *data;
 	CFid *body;
@@ -135,7 +140,13 @@ newwin(char *name)
 		}
 	}
 
-	w->event = wopenfile(w, "event", ORDWR);
+	{
+		char evpath[64];
+		snprint(evpath, sizeof evpath, "%d/event", w->id);
+		w->eventfd = fsopenfd(acmefs, evpath, ORDWR);
+		if(w->eventfd < 0)
+			sysfatal("fsopenfd event: %r");
+	}
 	w->body  = wopenfile(w, "body",  OWRITE);
 	/* addr and data opened on demand */
 	w->addr  = nil;
@@ -327,115 +338,23 @@ ainewconn(void)
 	return nsmount("9ai", nil);
 }
 
-/* ── RS/FS record parser ────────────────────────────────────────────── */
-
-/*
- * splitrec — split a RS-terminated record (0x1E) into FS-separated
- * (0x1F) fields.  Handles doubled FS/RS as literal characters.
- *
- * Returns number of fields in fields[]; each is a nul-terminated
- * string pointing into rec (fields are NUL-patched in place).
- *
- * The record must be writable.
- */
-static int
-splitrec(char *rec, int reclen, char **fields, int maxfields)
-{
-	char *p, *end, *start;
-	int   nf = 0;
-
-	end = rec + reclen;
-	/* strip trailing RS */
-	if(end > rec && (uchar)*(end-1) == 0x1e)
-		end--;
-
-	p = rec;
-	while(p < end && nf < maxfields) {
-		start = p;
-		while(p < end && (uchar)*p != 0x1f)
-			p++;
-		/* NUL-terminate the field in place */
-		if(p < end)
-			*p++ = '\0';
-		else
-			*p = '\0';  /* end of record */
-		fields[nf++] = start;
-	}
-	return nf;
-}
-
 /* ── 9ai /event reader proc ─────────────────────────────────────────── */
-
-/*
- * Format a tool_start record for display:
- *   "┌ ⚙ <name> <argv[0]> <argv[1]> ..."
- *   "│ argv: <argv joined>"
- *
- * fields[0] = "tool_start"
- * fields[1] = name
- * fields[2] = id
- * fields[3..nf-1] = argv
- */
-static void
-display_tool_start(char **fields, int nf)
-{
-	char buf[1024];
-	char args[512];
-	int i, alen = 0;
-
-	args[0] = '\0';
-	for(i = 3; i < nf; i++) {
-		if(alen + 2 < (int)sizeof args) {
-			if(i > 3) { args[alen++] = ' '; args[alen] = '\0'; }
-			int slen = strlen(fields[i]);
-			if(alen + slen < (int)sizeof args - 1) {
-				memmove(args + alen, fields[i], slen);
-				alen += slen;
-				args[alen] = '\0';
-			}
-		}
-	}
-	/* truncate args if too long */
-	if(alen > 200) {
-		memmove(args + 197, "...", 4);
-		alen = 200;
-	}
-
-	snprint(buf, sizeof buf, "\n┌ ⚙ %s %s\n",
-	        nf > 1 ? fields[1] : "?",
-	        args);
-	winappendstr(mainwin, buf);
-}
-
-static void
-display_tool_end(char **fields, int nf)
-{
-	int is_err = (nf > 1 && strcmp(fields[1], "err") == 0);
-	if(is_err) {
-		char buf[128];
-		char *out = (nf > 2 && fields[2][0]) ? fields[2] : "";
-		/* show first line of error */
-		char first[80];
-		int i;
-		for(i = 0; i < 79 && out[i] && out[i] != '\n'; i++)
-			first[i] = out[i];
-		first[i] = '\0';
-		snprint(buf, sizeof buf, "└ ✗ %s\n\n", first);
-		winappendstr(mainwin, buf);
-	} else {
-		winappendstr(mainwin, "└ ✓\n\n");
-	}
-}
 
 static void
 aiproc(void *v)
 {
 	CFsys *fs;
 	CFid  *evfd;
-	char   buf[RECBUF];
+	char  *buf;
+	char  *rec;
 	int    n;
 
 	USED(v);
+
+	buf = malloc(RECBUF);
+	rec = malloc(RECBUF);
+	if(buf == nil || rec == nil)
+		sysfatal("aiproc: malloc: %r");
 
 	fs = nil;
 	for(;;) {
@@ -459,7 +378,7 @@ aiproc(void *v)
 
 		/* read records until EOF (turn done) */
 		for(;;) {
-			n = fsread(evfd, buf, sizeof buf - 1);
+			n = fsread(evfd, buf, RECBUF - 1);
 			if(n <= 0)
 				break;   /* EOF = turn end */
 			buf[n] = '\0';
@@ -468,7 +387,6 @@ aiproc(void *v)
 			 * buf contains one RS-terminated record.
 			 * Parse fields in a copy because splitrec patches NULs.
 			 */
-			char rec[RECBUF];
 			char *fields[MAXFIELDS];
 			int   nf;
 
@@ -491,30 +409,20 @@ aiproc(void *v)
 			} else if(strcmp(type, "thinking") == 0) {
 				/* fields: thinking FS chunk */
 				if(nf >= 2) {
-					/* render thinking inline with bar prefix on each line */
-					/* U+2502 BOX DRAWINGS LIGHT VERTICAL = UTF-8 e2 94 82 */
-					char *chunk = fields[1];
-					char  out[RECBUF + 16];
-					int   olen = 0;
-					out[olen++] = '\n';
-					out[olen++] = (char)0xe2; out[olen++] = (char)0x94; out[olen++] = (char)0x82;
-					out[olen++] = ' ';
-					for(int i = 0; chunk[i] && olen < (int)sizeof out - 8; i++) {
-						out[olen++] = chunk[i];
-						if(chunk[i] == '\n' && chunk[i+1]) {
-							out[olen++] = (char)0xe2; out[olen++] = (char)0x94; out[olen++] = (char)0x82;
-							out[olen++] = ' ';
-						}
+					char *out = render_thinking(fields[1]);
+					if(out != nil) {
+						winappendstr(mainwin, out);
+						free(out);
 					}
-					out[olen] = '\0';
-					winappend(mainwin, out, olen);
 				}
 
 			} else if(strcmp(type, "tool_start") == 0) {
-				display_tool_start(fields, nf);
+				char *out = render_tool_start(fields, nf);
+				if(out != nil) { winappendstr(mainwin, out); free(out); }
 
 			} else if(strcmp(type, "tool_end") == 0) {
-				display_tool_end(fields, nf);
+				char *out = render_tool_end(fields, nf);
+				if(out != nil) { winappendstr(mainwin, out); free(out); }
 
 			} else if(strcmp(type, "turn_end") == 0) {
 				/*
@@ -581,10 +489,14 @@ outproc(void *v)
 {
 	CFsys *fs;
 	CFid  *outfd;
-	char   buf[TEXTBUF];
+	char  *buf;
 	int    n;
 
 	USED(v);
+
+	buf = malloc(TEXTBUF);
+	if(buf == nil)
+		sysfatal("outproc: malloc: %r");
 
 	fs = nil;
 	for(;;) {
@@ -607,21 +519,16 @@ outproc(void *v)
 		}
 
 		for(;;) {
-			n = fsread(outfd, buf, sizeof buf - 1);
-			if(n < 0) {
-				/* error on an open fid — close, reconnect */
-				break;
-			}
-			if(n == 0)
-				break;
-			buf[n] = '\0';
-
-			/* "[done]\n" is the end-of-turn sentinel from /output */
-			if(strcmp(buf, "[done]\n") == 0) {
+			n = fsread(outfd, buf, TEXTBUF - 1);
+			if(n < 0)
+				break;   /* error — close, reconnect */
+			if(n == 0) {
+				/* nil EOF = turn done */
 				winappendstr(mainwin, SEPARATOR);
 				winclean(mainwin);
 				break;
 			}
+			buf[n] = '\0';
 
 			/* stream text directly to the window */
 			winappend(mainwin, buf, n);
@@ -632,310 +539,24 @@ outproc(void *v)
 	}
 }
 
-/* ── Acme event reader ──────────────────────────────────────────────── */
-
-/*
- * acme event format (raw):
- *   c1 c2 q0SP q1SP flagSP nrSP text '\n'
- *
- * We parse this from the event file using the same technique as
- * acmeevent.c (getn, getrune).
- */
-
-typedef struct AcmeEvent AcmeEvent;
-struct AcmeEvent {
-	int  c1, c2;
-	int  q0, q1;
-	int  eq0, eq1;  /* expanded range (from flag & 2 follow-up) */
-	int  flag, nr;
-	char text[512];
-};
-
-static int
-evgetc(CFid *f, char *buf, int *bufp, int *nbuf)
-{
-	if(*bufp >= *nbuf) {
-		*nbuf = fsread(f, buf, EVBUF);
-		*bufp = 0;
-		if(*nbuf <= 0)
-			return -1;
-	}
-	return (uchar)buf[(*bufp)++];
-}
-
-static int
-evgetn(CFid *f, char *buf, int *bufp, int *nbuf)
-{
-	int c, n = 0;
-	while((c = evgetc(f, buf, bufp, nbuf)) >= '0' && c <= '9')
-		n = n * 10 + c - '0';
-	if(c != ' ')
-		return -1;  /* parse error */
-	return n;
-}
-
-/*
- * evgetrune — read one UTF-8 rune from the event stream.
- * Returns the rune, or -1 on error.
- * Appends the bytes to dst[*dlen]; dlen must not exceed dsz-4.
- */
-static Rune
-evgetrune(CFid *f, char *buf, int *bufp, int *nbuf, char *dst, int *dlen, int dsz)
-{
-	Rune r;
-	int  c, nb;
-
-	if(*dlen >= dsz - 4)
-		return -1;
-
-	c = evgetc(f, buf, bufp, nbuf);
-	if(c < 0)
-		return -1;
-	dst[*dlen] = c;
-	nb = 1;
-	if(c >= Runeself) {
-		while(!fullrune(dst + *dlen, nb)) {
-			c = evgetc(f, buf, bufp, nbuf);
-			if(c < 0)
-				return -1;
-			dst[*dlen + nb++] = c;
-		}
-	}
-	chartorune(&r, dst + *dlen);
-	*dlen += nb;
-	return r;
-}
-
-/*
- * getevent — read one event from the acme event file.
- * Returns 1 on success, 0 on EOF/error.
- *
- * Also reads the flag-2 expansion event (if present) and the
- * flag-8 chord events (if present), populating e->eq0/eq1 and
- * ignoring the chord text.
- */
-static int
-getevent(CFid *f, char *buf, int *bufp, int *nbuf, AcmeEvent *e)
-{
-	int i, c;
-	char tbuf[512];
-	int  tlen;
-
-	e->c1 = evgetc(f, buf, bufp, nbuf);
-	if(e->c1 < 0)
-		return 0;
-	e->c2 = evgetc(f, buf, bufp, nbuf);
-	if(e->c2 < 0)
-		return 0;
-
-	e->q0   = evgetn(f, buf, bufp, nbuf);
-	e->q1   = evgetn(f, buf, bufp, nbuf);
-	e->flag = evgetn(f, buf, bufp, nbuf);
-	e->nr   = evgetn(f, buf, bufp, nbuf);
-
-	if(e->q0 < 0 || e->q1 < 0 || e->flag < 0 || e->nr < 0)
-		return 0;
-
-	e->eq0 = e->q0;
-	e->eq1 = e->q1;
-
-	if(e->nr > 256)
-		e->nr = 256;
-
-	/* read text runes */
-	tlen = 0;
-	for(i = 0; i < e->nr; i++) {
-		if(evgetrune(f, buf, bufp, nbuf, e->text, &tlen,
-		             sizeof e->text) < 0)
-			return 0;
-	}
-	e->text[tlen] = '\0';
-
-	/* consume trailing newline */
-	c = evgetc(f, buf, bufp, nbuf);
-	if(c != '\n')
-		return 0;
-
-	/* flag & 2: null string with non-null expansion — read follow-up event.
-	 * The expansion is a full event record: c1 c2 q0 q1 flag nr text \n
-	 * We capture the expansion text into e->text (replacing the empty original). */
-	if(e->flag & 2) {
-		int xq0, xq1, xflag, xnr;
-		evgetc(f, buf, bufp, nbuf);  /* c1 of expansion (discard) */
-		evgetc(f, buf, bufp, nbuf);  /* c2 of expansion (discard) */
-		xq0   = evgetn(f, buf, bufp, nbuf);
-		xq1   = evgetn(f, buf, bufp, nbuf);
-		xflag = evgetn(f, buf, bufp, nbuf);
-		xnr   = evgetn(f, buf, bufp, nbuf);
-		e->eq0 = xq0;
-		e->eq1 = xq1;
-		USED(xflag);
-		/* read expansion text into e->text */
-		tlen = 0;
-		if(xnr > 256) xnr = 256;
-		for(i = 0; i < xnr; i++)
-			evgetrune(f, buf, bufp, nbuf, e->text, &tlen, sizeof e->text);
-		e->text[tlen] = '\0';
-		evgetc(f, buf, bufp, nbuf);   /* newline */
-	}
-
-	/* flag & 8: chorded argument — read and discard two follow-up events */
-	if(e->flag & 8) {
-		int pass;
-		for(pass = 0; pass < 2; pass++) {
-			evgetc(f, buf, bufp, nbuf);  /* c1 */
-			evgetc(f, buf, bufp, nbuf);  /* c2 */
-			evgetn(f, buf, bufp, nbuf);  /* q0 */
-			evgetn(f, buf, bufp, nbuf);  /* q1 */
-			evgetn(f, buf, bufp, nbuf);  /* flag */
-			int nr2 = evgetn(f, buf, bufp, nbuf);
-			if(nr2 > 256) nr2 = 256;
-			tlen = 0;
-			for(i = 0; i < nr2; i++)
-				evgetrune(f, buf, bufp, nbuf, tbuf, &tlen, sizeof tbuf);
-			evgetc(f, buf, bufp, nbuf);  /* newline */
-		}
-	}
-
-	return 1;
-}
-
-/*
- * writeevent — write an event back to acme so it handles it natively.
- */
-static void
-writeevent(CFid *evfd, AcmeEvent *e)
-{
-	fsprint(evfd, "%c%c%d %d\n", e->c1, e->c2, e->q0, e->q1);
-}
-
 /* ── Prompt text extraction ─────────────────────────────────────────── */
 
 /*
  * prompttext — extract the text the user wants to send.
- *
- * Strategy (in order):
- *   1. If acme's current selection (dot) is non-empty, use that.
- *   2. Otherwise use the text from after the last separator (═══…) or
- *      the last ▶ echo line, to end-of-body — trimmed of leading/trailing
- *      whitespace.
- *
- * Separators are the ════…════ lines written by outproc after each turn.
- * ▶ lines are the prompt-echo lines written by cmd_send.
- *
+ * Reads the window body and delegates to prompttext_body.
  * Returns a malloc'd nul-terminated string, or nil if nothing useful.
  */
-
-/* issepchr — true if byte is part of a ═ (U+2550, UTF-8 e2 95 90) */
-static int
-issepchr(uchar a, uchar b, uchar c)
-{
-	return (a == 0xe2 && b == 0x95 && c == 0x90);
-}
-
 static char *
 prompttext(Win *w)
 {
 	char *body;
 	int   bodylen;
-	char *after;   /* pointer into body: start of candidate text */
-	char *p;
 	char *result;
-	int   rlen;
 
-	/* ── try dot selection first ── */
-	{
-		char addrpath[64], datapath[64];
-		CFid *af, *df;
-		char  buf[8192];
-		int   n;
-
-		snprint(addrpath, sizeof addrpath, "%d/addr", w->id);
-		snprint(datapath, sizeof datapath, "%d/data", w->id);
-
-		af = fsopen(acmefs, addrpath, ORDWR);
-		df = fsopen(acmefs, datapath, ORDWR);
-		if(af != nil && df != nil) {
-			/* set addr to dot */
-			fswrite(af, ".", 1);
-			n = fsread(df, buf, sizeof buf - 1);
-			if(n > 0) {
-				buf[n] = '\0';
-				/* strip leading/trailing whitespace */
-				char *s = buf, *e = buf + n - 1;
-				while(*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
-				while(e > s && (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r')) e--;
-				*(e+1) = '\0';
-				if(*s != '\0') {
-					if(af) fsclose(af);
-					if(df) fsclose(df);
-					return strdup(s);
-				}
-			}
-		}
-		if(af) fsclose(af);
-		if(df) fsclose(df);
-	}
-
-	/* ── fall back: text after last separator/echo line ── */
 	body = winbody(w, &bodylen);
 	if(body == nil)
 		return nil;
-
-	after = nil;
-	p     = body;
-
-	/*
-	 * Walk line by line.  Record the position after any line that is:
-	 *   - a separator (starts with ═ / 0xe2 0x95 0x90)
-	 *   - a prompt echo (starts with ▶ / 0xe2 0x96 0xb6)
-	 *   - the status line (starts with ● / 0xe2 0x97 0x8f)
-	 * The last such position becomes `after`.
-	 */
-	while(*p) {
-		char *eol = strchr(p, '\n');
-		if(eol == nil) eol = p + strlen(p);
-
-		int linelen = eol - p;
-		if(linelen >= 3) {
-			uchar a = p[0], b = p[1], c = p[2];
-			int is_sep    = issepchr(a, b, c);
-			int is_echo   = (a == 0xe2 && b == 0x96 && c == 0xb6); /* ▶ */
-			int is_status = (a == 0xe2 && b == 0x97 && c == 0x8f); /* ● */
-			int is_tool   = (a == 0xe2 && b == 0x94 && c == 0x8c); /* ┌ */
-			int is_steer  = (a == 0xe2 && b == 0x86 && c == 0xa9); /* ↩ */
-			if(is_sep || is_echo || is_status || is_tool || is_steer)
-				after = (*eol) ? eol + 1 : eol;
-		} else if(linelen == 0) {
-			/* blank line — could be a paragraph break, but don't reset after */
-		}
-		p = (*eol) ? eol + 1 : eol;
-	}
-
-	if(after == nil) {
-		/* nothing found — skip only the status line */
-		after = strchr(body, '\n');
-		after = after ? after + 1 : body;
-	}
-
-	/* trim leading whitespace */
-	while(*after == '\n' || *after == '\r' || *after == ' ' || *after == '\t')
-		after++;
-
-	/* trim trailing whitespace */
-	rlen = strlen(after);
-	while(rlen > 0 && (after[rlen-1] == '\n' || after[rlen-1] == '\r' ||
-	                   after[rlen-1] == ' '  || after[rlen-1] == '\t'))
-		rlen--;
-
-	if(rlen <= 0) {
-		free(body);
-		return nil;
-	}
-
-	result = mallocz(rlen + 1, 1);
-	memmove(result, after, rlen);
-	result[rlen] = '\0';
+	result = prompttext_body(body);
 	free(body);
 	return result;
 }
@@ -1115,88 +736,6 @@ cmd_sessions(void);   /* forward */
 
 /* ── Sessions window ────────────────────────────────────────────────── */
 
-/*
- * parsesessfile — read the first session and first prompt record from a
- * session file.  Populates model, ts, snippet (all static buffers).
- * Returns 0 on success, -1 if not a session file.
- */
-static int
-parsesessfile(char *path, char *uuid, char *model, char *ts, char *snippet)
-{
-	int     fd;
-	Biobuf  b;
-	char   *line;
-	long    linelen;
-	int     gotsess = 0, gotprompt = 0;
-
-	uuid[0] = model[0] = ts[0] = snippet[0] = '\0';
-
-	fd = open(path, OREAD);
-	if(fd < 0)
-		return -1;
-	Binit(&b, fd, OREAD);
-
-	while((!gotsess || !gotprompt) &&
-	      (line = Brdline(&b, 0x1e)) != nil) {
-		linelen = Blinelen(&b);
-		char rec[512];
-		char *fields[8];
-		int   nf;
-		long  cplen = linelen < (long)sizeof rec - 1 ? linelen : (long)sizeof rec - 1;
-		memmove(rec, line, cplen);
-		rec[cplen] = '\0';
-		nf = splitrec(rec, cplen, fields, 8);
-		if(nf < 1)
-			continue;
-
-		if(!gotsess && strcmp(fields[0], "session") == 0) {
-			if(nf >= 2) strlcpy(uuid,  fields[1], 37);
-			if(nf >= 3) strlcpy(model, fields[2], 64);
-			if(nf >= 4) {
-				/* unix timestamp → date string */
-				long  t = atol(fields[3]);
-				Tm   *tm = localtime(t);
-				if(tm)
-					snprint(ts, 32, "%04d-%02d-%02d %02d:%02d",
-					        tm->year+1900, tm->mon+1, tm->mday,
-					        tm->hour, tm->min);
-				else
-					strlcpy(ts, fields[3], 32);
-			}
-			gotsess = 1;
-
-		} else if(gotsess && !gotprompt && strcmp(fields[0], "prompt") == 0) {
-			if(nf >= 2) {
-				/* first SNIPPET chars, collapsing whitespace */
-				char *src = fields[1];
-				int   dlen = 0;
-				int   inspace = 0;
-				while(*src && dlen < SNIPPET - 1) {
-					if(*src == '\n' || *src == '\r' || *src == '\t')
-						*src = ' ';
-					if(*src == ' ' && inspace) { src++; continue; }
-					inspace = (*src == ' ');
-					snippet[dlen++] = *src++;
-				}
-				snippet[dlen] = '\0';
-				if(*src) {
-					/* truncated */
-					if(dlen > 3) {
-						snippet[dlen-1] = '.';
-						snippet[dlen-2] = '.';
-						snippet[dlen-3] = '.';
-					}
-				}
-			}
-			gotprompt = 1;
-		}
-	}
-
-	Bterm(&b);
-	close(fd);
-	return gotsess ? 0 : -1;
-}
-
 static void
 cmd_sessions(void)
 {
@@ -1245,7 +784,7 @@ cmd_sessions(void)
 			continue;
 
 		char path[512];
-		char uuid[37], model[64], ts[32], snippet[SNIPPET + 4];
+		char uuid[37], model[64], ts[32], snippet[SESS_SNIPPET + 4];
 
 		snprint(path, sizeof path, "%s/%s", sessdir, dirs[i].name);
 		if(parsesessfile(path, uuid, model, ts, snippet) < 0)
@@ -1283,7 +822,7 @@ modelswinproc(void *v)
 	AcmeEvent  e;
 
 	for(;;) {
-		if(!getevent(w->event, buf, &bufp, &nbuf, &e))
+		if(!getevent(w->eventfd, buf, &bufp, &nbuf, &e))
 			break;
 
 		if(e.c1 == 'M' && (e.c2 == 'x' || e.c2 == 'X')) {
@@ -1293,15 +832,11 @@ modelswinproc(void *v)
 			while(*text == ' ') text++;
 			if(*text == '\0') {
 				if(e.flag & 1)
-					writeevent(w->event, &e);
+					writeevent(w->eventfd, &e);
 				continue;
 			}
 			/* looks like a model id if it contains no spaces and no # */
-			int ismodel = 1;
-			for(char *p = text; *p; p++)
-				if(*p == ' ' || *p == '#' || *p == '\t') { ismodel = 0; break; }
-
-			if(ismodel && e.c2 != 'X') {  /* Mx = user execute; MX = acme built-in */
+			if(ismodelid(text) && e.c2 != 'X') {  /* Mx = user execute; MX = acme built-in */
 				/* switch model: write to 9ai/model */
 				CFid *modfd = aiopen("model", OWRITE);
 				if(modfd != nil) {
@@ -1320,18 +855,18 @@ modelswinproc(void *v)
 				break;
 			} else {
 				if(e.flag & 1)
-					writeevent(w->event, &e);
+					writeevent(w->eventfd, &e);
 			}
 		} else if(e.c2 == 'L' || e.c2 == 'l') {
 			if(e.flag & 1)
-				writeevent(w->event, &e);
+				writeevent(w->eventfd, &e);
 		} else {
 			if(e.flag & 1)
-				writeevent(w->event, &e);
+				writeevent(w->eventfd, &e);
 		}
 	}
 
-	fsclose(w->event);
+	close(w->eventfd);
 	fsclose(w->ctl);
 	free(w);
 }
@@ -1352,19 +887,14 @@ sessionswinproc(void *v)
 	AcmeEvent  e;
 
 	for(;;) {
-		if(!getevent(w->event, buf, &bufp, &nbuf, &e))
+		if(!getevent(w->eventfd, buf, &bufp, &nbuf, &e))
 			break;
 
 		if(e.c1 == 'M' && (e.c2 == 'x' || e.c2 == 'X')) {
 			char *text = e.text;
 			while(*text == ' ') text++;
 
-			/* a UUID is 36 chars: 8-4-4-4-12 */
-			int isUUID = (strlen(text) == 36 &&
-			              text[8] == '-' && text[13] == '-' &&
-			              text[18] == '-' && text[23] == '-');
-
-			if(isUUID && e.c2 != 'X') {
+			if(isuuid(text) && e.c2 != 'X') {
 				/* load session: write path to 9ai/session/load */
 				char *home   = homedir();
 				char *path   = smprint("%s/.cache/9ai/sessions/%s", home, text);
@@ -1383,18 +913,18 @@ sessionswinproc(void *v)
 				break;
 			} else {
 				if(e.flag & 1)
-					writeevent(w->event, &e);
+					writeevent(w->eventfd, &e);
 			}
 		} else if(e.c2 == 'L' || e.c2 == 'l') {
 			if(e.flag & 1)
-				writeevent(w->event, &e);
+				writeevent(w->eventfd, &e);
 		} else {
 			if(e.flag & 1)
-				writeevent(w->event, &e);
+				writeevent(w->eventfd, &e);
 		}
 	}
 
-	fsclose(w->event);
+	close(w->eventfd);
 	fsclose(w->ctl);
 	free(w);
 }
@@ -1530,7 +1060,7 @@ eventproc(void *v)
 	AcmeEvent  e;
 
 	for(;;) {
-		if(!getevent(w->event, buf, &bufp, &nbuf, &e))
+		if(!getevent(w->eventfd, buf, &bufp, &nbuf, &e))
 			break;
 
 		if(e.c1 == 'M' && (e.c2 == 'x' || e.c2 == 'X')) {
@@ -1550,16 +1080,16 @@ eventproc(void *v)
 
 			/* unrecognised: pass back if acme can handle it */
 			if(e.flag & 1)
-				writeevent(w->event, &e);
+				writeevent(w->eventfd, &e);
 
 		} else if(e.c2 == 'L' || e.c2 == 'l') {
 			/* look-up: pass back for normal plumbing */
 			if(e.flag & 1)
-				writeevent(w->event, &e);
+				writeevent(w->eventfd, &e);
 		} else {
 			/* all other events: pass back if acme can handle */
 			if(e.flag & 1)
-				writeevent(w->event, &e);
+				writeevent(w->eventfd, &e);
 		}
 	}
 

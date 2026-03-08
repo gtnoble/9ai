@@ -171,14 +171,16 @@ struct OAIDelta {
 
 struct OAIParser {
 	SSEParser sse;
-	/* internal buffers; fields in OAIDelta point into these */
-	char textbuf[65536];
-	char tool_idbuf[128];
-	char tool_namebuf[128];
-	char stop_reasonbuf[32];
+	/* heap buffers; fields in OAIDelta point into these */
+	char *textbuf;
+	long  textbufsz;
+	char  tool_idbuf[128];
+	char  tool_namebuf[128];
+	char  stop_reasonbuf[32];
 };
 
 void oaiinit(OAIParser *p, HTTPResp *resp);
+void oaiterm(OAIParser *p);
 
 /*
  * oaidelta — parse the next logical delta event from the SSE stream.

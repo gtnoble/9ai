@@ -88,22 +88,26 @@ static int
 writereq(HTTPConn *c, char *method, char *path, char *host,
          HTTPHdr *hdrs, int nhdrs, char *body, long bodylen)
 {
-	Biobuf wb;
-	int    i, ok;
+	Biobuf *wb;
+	int     i, ok;
 
-	Binit(&wb, c->fd, OWRITE);
-	Bprint(&wb, "%s %s HTTP/1.1\r\n", method, path);
-	Bprint(&wb, "Host: %s\r\n", host);
-	Bprint(&wb, "Connection: close\r\n");
+	wb = mallocz(sizeof(Biobuf), 1);
+	if(wb == nil)
+		return -1;
+	Binit(wb, c->fd, OWRITE);
+	Bprint(wb, "%s %s HTTP/1.1\r\n", method, path);
+	Bprint(wb, "Host: %s\r\n", host);
+	Bprint(wb, "Connection: close\r\n");
 	for(i = 0; i < nhdrs; i++)
-		Bprint(&wb, "%s: %s\r\n", hdrs[i].name, hdrs[i].value);
+		Bprint(wb, "%s: %s\r\n", hdrs[i].name, hdrs[i].value);
 	if(body != nil && bodylen > 0)
-		Bprint(&wb, "Content-Length: %ld\r\n", bodylen);
-	Bprint(&wb, "\r\n");
+		Bprint(wb, "Content-Length: %ld\r\n", bodylen);
+	Bprint(wb, "\r\n");
 	if(body != nil && bodylen > 0)
-		Bwrite(&wb, body, bodylen);
-	ok = Bflush(&wb) != Beof;
-	Bterm(&wb);
+		Bwrite(wb, body, bodylen);
+	ok = Bflush(wb) != Beof;
+	Bterm(wb);
+	free(wb);
 	return ok ? 0 : -1;
 }
 

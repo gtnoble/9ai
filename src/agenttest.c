@@ -47,7 +47,7 @@ static int failures = 0;
 
 #define CHECK(cond, msg) do { \
 	if(!(cond)) { \
-		fprint(2, "FAIL: %s (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s\n", msg); \
 		failures++; \
 	} else { \
 		print("ok:   %s\n", msg); \
@@ -56,8 +56,8 @@ static int failures = 0;
 
 #define CHECKEQ(a, b, msg) do { \
 	if((long)(a) != (long)(b)) { \
-		fprint(2, "FAIL: %s: got %ld want %ld (line %d)\n", \
-		       msg, (long)(a), (long)(b), __LINE__); \
+		fprint(2, "FAIL: %s: got %ld want %ld\n", \
+		       msg, (long)(a), (long)(b)); \
 		failures++; \
 	} else { \
 		print("ok:   %s\n", msg); \
@@ -67,8 +67,8 @@ static int failures = 0;
 #define CHECKSTR(a, b, msg) do { \
 	const char *_a = (a), *_b = (b); \
 	if(_a == nil || strcmp(_a, _b) != 0) { \
-		fprint(2, "FAIL: %s: got \"%s\" want \"%s\" (line %d)\n", \
-		       msg, _a ? _a : "(nil)", _b, __LINE__); \
+		fprint(2, "FAIL: %s: got \"%s\" want \"%s\"\n", \
+		       msg, _a ? _a : "(nil)", _b); \
 		failures++; \
 	} else { \
 		print("ok:   %s\n", msg); \
@@ -78,8 +78,8 @@ static int failures = 0;
 #define CHECKCONTAINS(s, sub, msg) do { \
 	const char *_s = (s), *_sub = (sub); \
 	if(_s == nil || strstr(_s, _sub) == nil) { \
-		fprint(2, "FAIL: %s: \"%s\" does not contain \"%s\" (line %d)\n", \
-		       msg, _s ? _s : "(nil)", _sub, __LINE__); \
+		fprint(2, "FAIL: %s: \"%s\" does not contain \"%s\"\n", \
+		       msg, _s ? _s : "(nil)", _sub); \
 		failures++; \
 	} else { \
 		print("ok:   %s\n", msg); \
@@ -88,7 +88,7 @@ static int failures = 0;
 
 #define CHECKNONIL(a, msg) do { \
 	if((a) == nil) { \
-		fprint(2, "FAIL: %s: got nil (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s: got nil\n", msg); \
 		failures++; \
 	} else { \
 		print("ok:   %s\n", msg); \
@@ -169,30 +169,31 @@ static void
 test_emitevent(void)
 {
 	AgentCfg       cfg;
-	RecordCapture  cap;
+	RecordCapture  *cap;
 
 	print("\n-- 1.3 emitevent: record delivered to callback\n");
 
+	cap = mallocz(sizeof *cap, 1);
 	memset(&cfg, 0, sizeof cfg);
-	memset(&cap, 0, sizeof cap);
 	cfg.onevent = capture_event;
-	cfg.aux     = &cap;
+	cfg.aux     = cap;
 
 	emitevent(&cfg, "text", "hello world", nil);
 
-	CHECKEQ(cap.count, 1,    "callback called once");
+	CHECKEQ(cap->count, 1,    "callback called once");
 	/* record: "text" FS "hello world" RS */
-	CHECK(cap.len >= 2,      "record has at least 2 bytes");
-	CHECKCONTAINS(cap.buf,   "text",        "record contains type");
-	CHECKCONTAINS(cap.buf,   "hello world", "record contains field");
-	CHECK(cap.buf[0] != '\0', "record non-empty");
+	CHECK(cap->len >= 2,      "record has at least 2 bytes");
+	CHECKCONTAINS(cap->buf,   "text",        "record contains type");
+	CHECKCONTAINS(cap->buf,   "hello world", "record contains field");
+	CHECK(cap->buf[0] != '\0', "record non-empty");
 	/* check FS between fields */
 	{
-		char *fs = memchr(cap.buf, '\x1f', cap.len);
+		char *fs = memchr(cap->buf, '\x1f', cap->len);
 		CHECK(fs != nil, "FS (0x1f) present between fields");
 	}
 	/* check RS at end */
-	CHECK(cap.buf[cap.len - 1] == '\x1e', "RS (0x1e) terminates record");
+	CHECK(cap->buf[cap->len - 1] == '\x1e', "RS (0x1e) terminates record");
+	free(cap);
 }
 
 static void
@@ -233,7 +234,7 @@ static void
 test_emitandsave(void)
 {
 	AgentCfg       cfg;
-	RecordCapture  cap;
+	RecordCapture  *cap;
 	int            pfd[2];
 	Biobuf         bio;
 	char           sbuf[256];
@@ -241,13 +242,13 @@ test_emitandsave(void)
 
 	print("\n-- 1.5 emitandsave: record goes to both callback and Biobuf\n");
 
+	cap = mallocz(sizeof *cap, 1);
 	pipe(pfd);
 	Binit(&bio, pfd[1], OWRITE);
 
 	memset(&cfg, 0, sizeof cfg);
-	memset(&cap, 0, sizeof cap);
 	cfg.onevent  = capture_event;
-	cfg.aux      = &cap;
+	cfg.aux      = cap;
 	cfg.sess_bio = &bio;
 
 	emitandsave(&cfg, "tool_end", "ok", "output text", nil);
@@ -262,64 +263,67 @@ test_emitandsave(void)
 	sbuf[n] = '\0';
 
 	/* event callback */
-	CHECKEQ(cap.count, 1,         "event callback called once");
-	CHECKCONTAINS(cap.buf, "tool_end", "event contains type");
-	CHECKCONTAINS(cap.buf, "output text", "event contains output");
+	CHECKEQ(cap->count, 1,         "event callback called once");
+	CHECKCONTAINS(cap->buf, "tool_end", "event contains type");
+	CHECKCONTAINS(cap->buf, "output text", "event contains output");
 
 	/* session file */
 	CHECK(n > 0,               "session bytes written");
 	CHECKCONTAINS(sbuf, "tool_end",    "session contains type");
 	CHECKCONTAINS(sbuf, "output text", "session contains output");
+	free(cap);
 }
 
 static void
 test_record_single_field(void)
 {
 	AgentCfg      cfg;
-	RecordCapture cap;
+	RecordCapture *cap;
 
 	print("\n-- 1.6 single-field record: no FS, has RS\n");
 
+	cap = mallocz(sizeof *cap, 1);
 	memset(&cfg, 0, sizeof cfg);
-	memset(&cap, 0, sizeof cap);
 	cfg.onevent = capture_event;
-	cfg.aux     = &cap;
+	cfg.aux     = cap;
 
 	emitevent(&cfg, "idle", nil);
 
 	{
-		char *fs = memchr(cap.buf, '\x1f', cap.len);
+		char *fs = memchr(cap->buf, '\x1f', cap->len);
 		CHECK(fs == nil,  "no FS in single-field record");
 	}
-	CHECK(cap.buf[cap.len - 1] == '\x1e', "RS terminates single-field record");
-	CHECKCONTAINS(cap.buf, "idle", "field text present");
+	CHECK(cap->buf[cap->len - 1] == '\x1e', "RS terminates single-field record");
+	CHECKCONTAINS(cap->buf, "idle", "field text present");
+	free(cap);
 }
 
 static void
 test_record_three_fields(void)
 {
 	AgentCfg      cfg;
-	RecordCapture cap;
+	RecordCapture *cap;
 	int           fs_count = 0;
 	int           i;
 
 	print("\n-- 1.7 three-field record: two FS, one RS\n");
 
+	cap = mallocz(sizeof *cap, 1);
 	memset(&cfg, 0, sizeof cfg);
-	memset(&cap, 0, sizeof cap);
 	cfg.onevent = capture_event;
-	cfg.aux     = &cap;
+	cfg.aux     = cap;
 
 	emitevent(&cfg, "turn_start", "uuid-abc", "gpt-4o", nil);
 
-	for(i = 0; i < cap.len; i++)
-		if((unsigned char)cap.buf[i] == 0x1f) fs_count++;
+	for(i = 0; i < cap->len; i++)
+		if((unsigned char)cap->buf[i] == 0x1f) fs_count++;
 
 	CHECKEQ(fs_count, 2, "exactly 2 FS in three-field record");
-	CHECK(cap.buf[cap.len - 1] == '\x1e', "RS terminates record");
-	CHECKCONTAINS(cap.buf, "turn_start", "field 0 present");
-	CHECKCONTAINS(cap.buf, "uuid-abc",   "field 1 present");
-	CHECKCONTAINS(cap.buf, "gpt-4o",     "field 2 present");
+	CHECK(cap->buf[cap->len - 1] == '\x1e', "RS terminates record");
+	CHECKCONTAINS(cap->buf, "turn_start", "field 0 present");
+	CHECKCONTAINS(cap->buf, "uuid-abc",   "field 1 present");
+	CHECKCONTAINS(cap->buf, "gpt-4o",     "field 2 present");
+	free(cap);
 }
 
 /* ── Part 2: Live integration test ──────────────────────────────────── */
@@ -399,7 +403,7 @@ check_session_file(const char *sessdir, const char *uuid)
 {
 	char  *path;
 	int    fd;
-	char   buf[65536];
+	char   *buf;
 	long   n;
 	int    ok = 1;
 
@@ -411,11 +415,13 @@ check_session_file(const char *sessdir, const char *uuid)
 		free(path);
 		return 0;
 	}
-	n = read(fd, buf, sizeof buf - 1);
+	buf = mallocz(65536, 1);
+	n = read(fd, buf, 65536 - 1);
 	close(fd);
 	free(path);
 	if(n <= 0) {
 		fprint(2, "  session file empty\n");
+		free(buf);
 		return 0;
 	}
 	buf[n] = '\0';
@@ -436,6 +442,7 @@ check_session_file(const char *sessdir, const char *uuid)
 		}
 	}
 
+	free(buf);
 	return ok;
 }
 
@@ -444,13 +451,13 @@ test_live_agent(char *sockpath, char *tokpath)
 {
 	AgentCfg     cfg;
 	OAIReq      *req;
-	LiveCapture  lc;
+	LiveCapture  *lc;
 	int          rc;
 
 	print("\n-- 2.1 live: agent loop with gpt-4o — list files in /tmp\n");
 
+	lc = mallocz(sizeof *lc, 1);
 	memset(&cfg, 0, sizeof cfg);
-	memset(&lc,  0, sizeof lc);
 
 	cfg.model    = "gpt-4o";
 	cfg.sockpath = sockpath;
@@ -472,12 +479,13 @@ test_live_agent(char *sockpath, char *tokpath)
 	               "When asked to list files, use the exec tool to run ls.";
 	cfg.ontext   = live_ontext;
 	cfg.onevent  = live_onevent;
-	cfg.aux      = &lc;
+	cfg.aux      = lc;
 
 	/* open session file */
 	rc = agentsessopen(&cfg);
 	if(rc < 0) {
 		fprint(2, "  SKIP: agentsessopen failed: %r\n");
+		free(lc);
 		return;
 	}
 	print("  session uuid: %s\n", cfg.uuid);
@@ -491,19 +499,20 @@ test_live_agent(char *sockpath, char *tokpath)
 	if(rc < 0) {
 		fprint(2, "  SKIP: agentrun failed: %r\n");
 		oaireqfree(req);
+		free(lc);
 		return;
 	}
 
 	/* verify results */
-	print("  events received: %d\n", lc.nevents);
-	print("  text output length: %ld\n", lc.textlen);
+	print("  events received: %d\n", lc->nevents);
+	print("  text output length: %ld\n", lc->textlen);
 
-	CHECK(lc.saw_turn_start,  "turn_start event emitted");
-	CHECK(lc.saw_tool_start,  "tool_start event emitted (exec was called)");
-	CHECK(lc.saw_tool_end,    "tool_end event emitted");
-	CHECK(lc.saw_turn_end,    "turn_end event emitted");
-	CHECK(lc.textlen > 0,     "text output non-empty");
-	CHECK(lc.nevents >= 4,    "at least 4 events (turn_start+tool_start+tool_end+turn_end)");
+	CHECK(lc->saw_turn_start,  "turn_start event emitted");
+	CHECK(lc->saw_tool_start,  "tool_start event emitted (exec was called)");
+	CHECK(lc->saw_tool_end,    "tool_end event emitted");
+	CHECK(lc->saw_turn_end,    "turn_end event emitted");
+	CHECK(lc->textlen > 0,     "text output non-empty");
+	CHECK(lc->nevents >= 4,    "at least 4 events (turn_start+tool_start+tool_end+turn_end)");
 
 	/* verify session file */
 	{
@@ -512,6 +521,7 @@ test_live_agent(char *sockpath, char *tokpath)
 	}
 
 	free(cfg.sessdir);
+	free(lc);
 	oaireqfree(req);
 }
 
@@ -535,13 +545,13 @@ test_live_agent_ant(char *sockpath, char *tokpath)
 {
 	AgentCfg     cfg;
 	ANTReq      *req;
-	LiveCapture  lc;
+	LiveCapture  *lc;
 	int          rc;
 
 	print("\n-- 3.1 live: agentrunant with claude-sonnet-4.5 — list files in /tmp\n");
 
+	lc = mallocz(sizeof *lc, 1);
 	memset(&cfg, 0, sizeof cfg);
-	memset(&lc,  0, sizeof lc);
 
 	cfg.model    = "claude-sonnet-4.5";
 	cfg.sockpath = sockpath;
@@ -563,13 +573,14 @@ test_live_agent_ant(char *sockpath, char *tokpath)
 	               "When asked to list files, use the exec tool to run ls.";
 	cfg.ontext   = live_ontext;
 	cfg.onevent  = live_onevent;
-	cfg.aux      = &lc;
+	cfg.aux      = lc;
 
 	/* open session file */
 	rc = agentsessopen(&cfg);
 	if(rc < 0) {
 		fprint(2, "  SKIP: agentsessopen failed: %r\n");
 		free(cfg.sessdir);
+		free(lc);
 		return;
 	}
 	print("  session uuid: %s\n", cfg.uuid);
@@ -586,19 +597,20 @@ test_live_agent_ant(char *sockpath, char *tokpath)
 		fprint(2, "  SKIP: agentrunant failed: %s\n", errbuf);
 		antreqfree(req);
 		free(cfg.sessdir);
+		free(lc);
 		return;
 	}
 
 	/* verify results */
-	print("  events received: %d\n", lc.nevents);
-	print("  text output length: %ld\n", lc.textlen);
+	print("  events received: %d\n", lc->nevents);
+	print("  text output length: %ld\n", lc->textlen);
 
 	/* Count thinking records in event log */
 	int nthinking = 0;
 	{
 		long i = 0;
-		while(i < lc.evlen) {
-			char *rec = lc.evbuf + i;
+		while(i < lc->evlen) {
+			char *rec = lc->evbuf + i;
 			if(strncmp(rec, "thinking", 8) == 0 &&
 			   ((unsigned char)rec[8] == 0x1f || (unsigned char)rec[8] == 0x1e))
 				nthinking++;
@@ -608,12 +620,12 @@ test_live_agent_ant(char *sockpath, char *tokpath)
 	}
 	print("  thinking events: %d\n", nthinking);
 
-	CHECK(lc.saw_turn_start,  "3.1: turn_start event emitted");
-	CHECK(lc.saw_tool_start,  "3.1: tool_start event emitted (exec was called)");
-	CHECK(lc.saw_tool_end,    "3.1: tool_end event emitted");
-	CHECK(lc.saw_turn_end,    "3.1: turn_end event emitted");
-	CHECK(lc.textlen > 0,     "3.1: text output non-empty");
-	CHECK(lc.nevents >= 4,    "3.1: at least 4 events");
+	CHECK(lc->saw_turn_start,  "3.1: turn_start event emitted");
+	CHECK(lc->saw_tool_start,  "3.1: tool_start event emitted (exec was called)");
+	CHECK(lc->saw_tool_end,    "3.1: tool_end event emitted");
+	CHECK(lc->saw_turn_end,    "3.1: turn_end event emitted");
+	CHECK(lc->textlen > 0,     "3.1: text output non-empty");
+	CHECK(lc->nevents >= 4,    "3.1: at least 4 events");
 
 	/* verify session file */
 	{
@@ -622,6 +634,7 @@ test_live_agent_ant(char *sockpath, char *tokpath)
 	}
 
 	free(cfg.sessdir);
+	free(lc);
 	antreqfree(req);
 }
 

@@ -30,6 +30,11 @@ HFILES=\
 	exec.h\
 	agent.h\
 	fs.h\
+	prompt.h\
+	record.h\
+	render.h\
+	sessfile.h\
+	acmeevent.h\
 
 <$PLAN9/src/mkone
 
@@ -110,11 +115,18 @@ test-ant:V: $O.anttest
 	./$O.anttest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
 
 # Stage 15: 9ai-acme — acme integration client
-$O.9ai-acme: 9ai-acme.$O port.$O http.$O
+$O.9ai-acme: 9ai-acme.$O prompt.$O record.$O render.$O sessfile.$O acmeevent.$O port.$O http.$O
 	$LD $LDFLAGS -o $target $prereq -l9pclient
 
 9ai-acme:V: $O.9ai-acme
 	cp $O.9ai-acme $HOME/bin/acme/9ai-acme
+
+# Stage 15b: unit tests for 9ai-acme pure-string helpers (no acme/9pclient needed)
+$O.acmetest: acmetest.$O prompt.$O record.$O render.$O sessfile.$O acmeevent.$O
+	$LD $LDFLAGS -o $target $prereq -lthread -lbio
+
+test-acme:V: $O.acmetest
+	./$O.acmetest
 
 # Stage 16: 9ai-sessions — session listing companion
 $O.9ai-sessions: 9ai-sessions.$O port.$O http.$O

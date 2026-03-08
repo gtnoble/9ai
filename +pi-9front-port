@@ -1,9 +1,8 @@
 # 9ai: 9front Port — Implementation Tracker
 
-## Status: COMPLETE (pending hardware test on 9front)
+## Status: COMPLETE — build verified on 9front hardware
 
-All source changes are done.  The plan9port build is verified clean (`mk clean && mk`
-builds every binary; all unit tests pass).
+All source changes are done and the 9front build compiles clean.
 
 ---
 
@@ -11,14 +10,14 @@ builds every binary; all unit tests pass).
 
 | File | What changed |
 |------|-------------|
-| `port.c` | `portwaitnohang()` (waitnohang vs nbrecvp); `portdial()` (httpdial vs dial+tlsClient); `#include <libsec.h>` guarded |
-| `9ai.h` | Declared `portwaitnohang()` |
+| `port.c` | `portwaitnohang()` (waitnohang vs nbrecvp); `portdial()` (httpdial vs dial+tlsClient); `#include <libsec.h>` guarded; added `portspawn()` (rfork+exec vs threadspawn); added `portwait()` (wait loop vs procwait) |
+| `9ai.h` | Declared `portwaitnohang()`, `portspawn()`, `portwait()` |
 | `http.h` | Declared `portdial()` alongside `httpdial()` |
-| `exec.c` | `waitnohang()` → `portwaitnohang()`; added `#include "9ai.h"` |
-| `agent.c` | `httpdial()` → `portdial()`; `strlcpy` → `snprint` in mkdirpath |
+| `exec.c` | `waitnohang()` → `portwaitnohang()`; `threadspawn()` → `portspawn()`; `procwait()` → `portwait()`; added `#include "9ai.h"` |
+| `agent.c` | `httpdial()` → `portdial()`; `strlcpy` → `snprint` in mkdirpath; `#include <stdarg.h>` guarded by `#ifndef PLAN9`; compound literal `(char*[]){NULL,NULL}` replaced with local array |
 | `oauth.c` | `httpdial()` → `portdial()`; added `#include "9ai.h"` |
 | `models.c` | `httpdial()` → `portdial()`; added `#include "9ai.h"` |
-| `fs.c` | All `p9strdup/free/malloc/realloc/close/open/pipe` → unprefixed |
+| `fs.c` | All `p9strdup/free/malloc/realloc/close/open/pipe` → unprefixed; `chansendp`/`chanrecvp` → `sendp`/`recvp` via `#ifdef PLAN9` defines |
 | `main.c` | Default paths guarded: `#ifdef PLAN9PORT` keeps `.cache`; else `configpath()` |
 | `9ai-sessions.c` | `strlcpy` → `strecpy`; default sessdir guarded by `#ifdef PLAN9PORT` |
 | `agenttest.c` | `strlcpy` → `snprint`; sessdir derivation guarded by `#ifdef PLAN9PORT` |
@@ -29,8 +28,9 @@ builds every binary; all unit tests pass).
 | `httptest.c` | same |
 | `fstest.c` | same; default paths guarded by `#ifdef PLAN9PORT` |
 | `mkfile` | Added `-DPLAN9PORT` to `CFLAGS`; added `http.$O` to lightweight test link rules |
-| `mkfile.9front` | New — 9front build system (`</$objtype/mkfile`, `<sys/src/cmd/mkone`) |
+| `mkfile.9front` | New — 9front build system (`</$objtype/mkfile`, `<sys/src/cmd/mkone`); `CFLAGS=-DPLAN9` |
 | `9ai-acme-native.c` | New — 9front acme integration (direct `/mnt/acme` + `/mnt/9ai`, no lib9pclient) |
+| `vendor/jsmn/jsmn.h` | `#include <stddef.h>` guarded by `#ifndef PLAN9`; `typedef ulong size_t` and `#define NULL nil` added for Plan 9 build |
 
 ---
 

@@ -14,9 +14,9 @@
  *
  * Part 2: execrun — basic execution
  *   2.1  echo hello                    → output "hello\n", exitcode 0
- *   2.2  printf '%s\n' world           → output "world\n", exitcode 0
+ *   2.2  echo world                    → output "world\n", exitcode 0
  *   2.3  cat with stdin "hello"        → output "hello", exitcode 0
- *   2.4  exit 42 (via sh -c)           → exitcode 42
+ *   2.4  test 0 = 1                     → exitcode non-zero
  *   2.5  ls /nonexistent               → exitcode non-zero
  *   2.6  unknown binary                → execrun returns nil (exec fails)
  *
@@ -44,7 +44,7 @@ static int failures = 0;
 
 #define CHECK(cond, msg) do { \
 	if(!(cond)) { \
-		fprint(2, "FAIL: %s (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s\n", msg); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -53,8 +53,8 @@ static int failures = 0;
 
 #define CHECKEQ(a, b, msg) do { \
 	if((long)(a) != (long)(b)) { \
-		fprint(2, "FAIL: %s: got %ld want %ld (line %d)\n", \
-		       msg, (long)(a), (long)(b), __LINE__); \
+		fprint(2, "FAIL: %s: got %ld want %ld\n", \
+		       msg, (long)(a), (long)(b)); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -64,8 +64,8 @@ static int failures = 0;
 #define CHECKSTR(a, b, msg) do { \
 	const char *_a = (a), *_b = (b); \
 	if(_a == nil || strcmp(_a, _b) != 0) { \
-		fprint(2, "FAIL: %s: got \"%s\" want \"%s\" (line %d)\n", \
-		       msg, _a ? _a : "(nil)", _b, __LINE__); \
+		fprint(2, "FAIL: %s: got \"%s\" want \"%s\"\n", \
+		       msg, _a ? _a : "(nil)", _b); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -74,8 +74,8 @@ static int failures = 0;
 
 #define CHECKNIL(a, msg) do { \
 	if((a) != nil) { \
-		fprint(2, "FAIL: %s: expected nil, got non-nil (line %d)\n", \
-		       msg, __LINE__); \
+		fprint(2, "FAIL: %s: expected nil, got non-nil\n", \
+		       msg); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -84,7 +84,7 @@ static int failures = 0;
 
 #define CHECKNONIL(a, msg) do { \
 	if((a) == nil) { \
-		fprint(2, "FAIL: %s: got nil (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s: got nil\n", msg); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -94,8 +94,8 @@ static int failures = 0;
 #define CHECKCONTAINS(s, sub, msg) do { \
 	const char *_s = (s), *_sub = (sub); \
 	if(_s == nil || strstr(_s, _sub) == nil) { \
-		fprint(2, "FAIL: %s: \"%s\" does not contain \"%s\" (line %d)\n", \
-		       msg, _s ? _s : "(nil)", _sub, __LINE__); \
+		fprint(2, "FAIL: %s: \"%s\" does not contain \"%s\"\n", \
+		       msg, _s ? _s : "(nil)", _sub); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -231,7 +231,7 @@ test_run_echo(void)
 {
 	ExecResult *r;
 	print("\n-- 2.1 execrun: echo hello\n");
-	r = run("{\"argv\":[\"echo\",\"hello\"]}");
+	r = run("{\"argv\":[\"/bin/echo\",\"hello\"]}");
 	CHECKNONIL(r,                          "execrun returns non-nil");
 	if(r == nil) return;
 	CHECKCONTAINS(r->output, "hello",      "output contains 'hello'");
@@ -241,11 +241,11 @@ test_run_echo(void)
 }
 
 static void
-test_run_printf(void)
+test_run_echo_world(void)
 {
 	ExecResult *r;
-	print("\n-- 2.2 execrun: printf\n");
-	r = run("{\"argv\":[\"printf\",\"%s\\n\",\"world\"]}");
+	print("\n-- 2.2 execrun: echo world\n");
+	r = run("{\"argv\":[\"echo\",\"world\"]}");
 	CHECKNONIL(r, "execrun returns non-nil");
 	if(r == nil) return;
 	CHECKCONTAINS(r->output, "world", "output contains 'world'");
@@ -271,11 +271,11 @@ test_run_nonzero_exit(void)
 {
 	ExecResult *r;
 	print("\n-- 2.4 execrun: non-zero exit\n");
-	/* 'false' exits with code 1 on all Unix systems */
-	r = run("{\"argv\":[\"false\"]}");
+	/* 'test 0 = 1' always fails with a non-zero exit on Plan 9 */
+	r = run("{\"argv\":[\"test\",\"0\",\"=\",\"1\"]}");
 	CHECKNONIL(r, "execrun returns non-nil even on failure");
 	if(r == nil) return;
-	CHECK(r->exitcode != 0, "exitcode non-zero for 'false'");
+	CHECK(r->exitcode != 0, "exitcode non-zero for 'test 0 = 1'");
 	execresultfree(r);
 }
 
@@ -284,7 +284,7 @@ test_run_ls_nonexistent(void)
 {
 	ExecResult *r;
 	print("\n-- 2.5 execrun: ls /nonexistent\n");
-	r = run("{\"argv\":[\"ls\",\"/9ai-nonexistent-path-abc\"]}");
+	r = run("{\"argv\":[\"/bin/ls\",\"/9ai-nonexistent-path-abc\"]}");
 	CHECKNONIL(r, "execrun returns non-nil");
 	if(r == nil) return;
 	CHECK(r->exitcode != 0, "exitcode non-zero for missing path");
@@ -297,8 +297,13 @@ test_run_unknown_binary(void)
 	ExecResult *r;
 	print("\n-- 2.6 execrun: unknown binary → nil\n");
 	r = run("{\"argv\":[\"/9ai-no-such-binary-xyz\"]}");
-	/* threadspawn fails → execrun returns nil */
 	CHECKNIL(r, "execrun returns nil for unknown binary");
+	if(r == nil) {
+		char errbuf[256];
+		rerrstr(errbuf, sizeof errbuf);
+		CHECKCONTAINS(errbuf, "not found", "errstr mentions 'not found'");
+		CHECKCONTAINS(errbuf, "/9ai-no-such-binary-xyz", "errstr names the binary");
+	}
 	if(r != nil) execresultfree(r);
 }
 
@@ -359,29 +364,47 @@ test_resultstr_empty_output(void)
 /* ── Part 4: output truncation ──────────────────────────────────────── */
 
 /*
- * Build a JSON exec call that writes exactly `nbytes` to stdout via
- * a shell here-doc approach.  We use dd to produce exactly N bytes.
+ * run_cat_stdin_n — run cat with exactly nbytes of 'x' as stdin.
+ *
+ * Builds the JSON on the heap since nbytes can be > EXEC_MAXOUT.
+ * The JSON is:  {"argv":["cat"],"stdin":"xxx..."}
+ * The stdin value is nbytes 'x' characters (no JSON escaping needed).
  */
+static ExecResult *
+run_cat_stdin_n(long nbytes)
+{
+	/* JSON overhead: {"argv":["cat"],"stdin":"..."} */
+	long jlen = 30 + nbytes;
+	char *json = malloc(jlen + 1);
+	char *p;
+	ExecResult *r;
+
+	if(json == nil)
+		return nil;
+	p = json;
+	p += sprint(p, "{\"argv\":[\"cat\"],\"stdin\":\"");
+	memset(p, 'x', nbytes);
+	p += nbytes;
+	p += sprint(p, "\"}");
+	*p = '\0';
+	r = execrun(json, (int)(p - json));
+	free(json);
+	return r;
+}
+
 static void
 test_truncation_exact(void)
 {
 	ExecResult *r;
-	char json[256];
 	long want = EXEC_MAXOUT;
 
 	print("\n-- 4.1 output exactly EXEC_MAXOUT bytes → not truncated\n");
-
-	/* dd if=/dev/zero bs=1 count=N | tr '\0' 'x' */
-	snprint(json, sizeof json,
-	        "{\"argv\":[\"sh\",\"-c\","
-	        "\"dd if=/dev/zero bs=1 count=%ld 2>/dev/null | tr '\\\\0' 'x'\"]}",
-	        want);
-	r = run(json);
+	r = run_cat_stdin_n(want);
 	CHECKNONIL(r, "execrun returns non-nil");
 	if(r == nil) return;
-	CHECKEQ(r->truncated, 0,  "not truncated at exactly EXEC_MAXOUT");
+	CHECKEQ(r->truncated, 0,    "not truncated at exactly EXEC_MAXOUT");
 	CHECKEQ(r->outputlen, want, "outputlen == EXEC_MAXOUT");
-	CHECKEQ(r->exitcode, 0,   "exitcode 0");
+	CHECKEQ(r->exitcode, 0,     "exitcode 0");
 	execresultfree(r);
 }
 
@@ -389,34 +412,40 @@ static void
 test_truncation_overflow(void)
 {
 	ExecResult *r;
-	char json[256];
 	long extra = 100;
 	long total = EXEC_MAXOUT + extra;
 
-	print("\n-- 4.2 output EXEC_MAXOUT+100 bytes → truncated, tail kept\n");
-
-	snprint(json, sizeof json,
-	        "{\"argv\":[\"sh\",\"-c\","
-	        "\"dd if=/dev/zero bs=1 count=%ld 2>/dev/null | tr '\\\\0' 'x'\"]}",
-	        total);
-	r = run(json);
+	print("\n-- 4.2 output EXEC_MAXOUT+100 bytes → truncated, head kept\n");
+	r = run_cat_stdin_n(total);
 	CHECKNONIL(r, "execrun returns non-nil");
 	if(r == nil) return;
-	CHECKEQ(r->truncated, 1,        "truncated flag set");
+	CHECKEQ(r->truncated, 1,           "truncated flag set");
 	CHECKEQ(r->outputlen, EXEC_MAXOUT, "outputlen capped at EXEC_MAXOUT");
 	CHECKCONTAINS(r->output, "[...truncated...]", "truncation marker present");
-	/* tail should be all 'x' bytes (past the marker) */
+	/* head should be all 'x' bytes (before the marker) */
 	{
-		const char *tail = r->output + strlen("[...truncated...]\n");
+		const char *marker = strstr(r->output, "[...truncated...]");
+		long head_len = marker ? (long)(marker - r->output) : 0;
+		/* strip leading newline in "\n[...truncated...]" */
+		if(head_len > 0 && r->output[head_len - 1] == '\n')
+			head_len--;
 		int all_x = 1, i;
-		for(i = 0; tail[i] != '\0'; i++)
-			if(tail[i] != 'x') { all_x = 0; break; }
-		CHECK(all_x, "tail bytes are all 'x' (most recent data)");
+		for(i = 0; i < head_len; i++)
+			if(r->output[i] != 'x') { all_x = 0; break; }
+		CHECK(all_x, "head bytes are all 'x'");
 	}
 	execresultfree(r);
 }
 
 /* ── Main ────────────────────────────────────────────────────────────── */
+
+/*
+ * execparse uses heap-allocated toks[] (8 KB) and buf[] (4 KB), but the
+ * execrun call chain still needs headroom for execparse's other locals,
+ * collectoutput's locals, and the test functions themselves.  Use a
+ * generous stack to be safe, matching the pattern in anttest.c.
+ */
+int mainstacksize = 65536;
 
 void
 threadmain(int argc, char *argv[])
@@ -434,7 +463,7 @@ threadmain(int argc, char *argv[])
 
 	print("\n=== Part 2: execrun ===\n");
 	test_run_echo();
-	test_run_printf();
+	test_run_echo_world();
 	test_run_cat_stdin();
 	test_run_nonzero_exit();
 	test_run_ls_nonexistent();

@@ -319,25 +319,24 @@ emitmsg(Biobuf *b, ANTMsg *m)
 			}
 			Bprint(b, "]");
 		} else {
-			/* plain text: concatenate all text blocks */
-			int pfd[2];
-			char buf[65536];
-			long n;
-			Biobuf tbuf;
-
-			if(pipe(pfd) < 0) sysfatal("pipe: %r");
-			Binit(&tbuf, pfd[1], OWRITE);
+			/* plain text: concatenate all text blocks into a heap buffer */
+			long tlen = 0;
+			char *tbuf, *p;
 			for(blk = m->content; blk != nil; blk = blk->next)
 				if(blk->type == ANTBlockText && blk->text != nil)
-					Bprint(&tbuf, "%s", blk->text);
-			Bflush(&tbuf);
-			Bterm(&tbuf);
-			close(pfd[1]);
-			n = read(pfd[0], buf, sizeof buf - 1);
-			if(n < 0) n = 0;
-			buf[n] = '\0';
-			close(pfd[0]);
-			jsonemitstr(b, buf);
+					tlen += strlen(blk->text);
+			tbuf = malloc(tlen + 1);
+			if(tbuf == nil) sysfatal("malloc: %r");
+			p = tbuf;
+			for(blk = m->content; blk != nil; blk = blk->next)
+				if(blk->type == ANTBlockText && blk->text != nil) {
+					long n = strlen(blk->text);
+					memmove(p, blk->text, n);
+					p += n;
+				}
+			*p = '\0';
+			jsonemitstr(b, tbuf);
+			free(tbuf);
 		}
 		Bprint(b, "}");
 		break;
@@ -392,7 +391,7 @@ char *
 antreqjson(ANTReq *req, char *system_prompt, long *lenp)
 {
 	int pfd[2];
-	Biobuf b;
+	Biobuf *b;
 	ANTMsg *m;
 	char *buf;
 	long len;
@@ -400,34 +399,41 @@ antreqjson(ANTReq *req, char *system_prompt, long *lenp)
 	if(pipe(pfd) < 0)
 		return nil;
 
-	Binit(&b, pfd[1], OWRITE);
+	b = mallocz(sizeof(Biobuf), 1);
+	if(b == nil) {
+		close(pfd[0]);
+		close(pfd[1]);
+		return nil;
+	}
+	Binit(b, pfd[1], OWRITE);
 
-	Bprint(&b, "{\"model\":");
-	jsonemitstr(&b, req->model);
-	Bprint(&b, ",\"stream\":true");
-	Bprint(&b, ",\"max_tokens\":%d", MAX_OUT_TOK);
+	Bprint(b, "{\"model\":");
+	jsonemitstr(b, req->model);
+	Bprint(b, ",\"stream\":true");
+	Bprint(b, ",\"max_tokens\":%d", MAX_OUT_TOK);
 
 	if(system_prompt != nil && system_prompt[0] != '\0') {
-		Bprint(&b, ",\"system\":");
-		jsonemitstr(&b, system_prompt);
+		Bprint(b, ",\"system\":");
+		jsonemitstr(b, system_prompt);
 	}
 
-	Bprint(&b, ",\"messages\":[");
+	Bprint(b, ",\"messages\":[");
 	{
 		int first = 1;
 		for(m = req->msgs; m != nil; m = m->next) {
-			if(!first) Bprint(&b, ",");
+			if(!first) Bprint(b, ",");
 			first = 0;
-			emitmsg(&b, m);
+			emitmsg(b, m);
 		}
 	}
-	Bprint(&b, "]");
+	Bprint(b, "]");
 
-	Bprint(&b, ",\"tools\":[%s]", exec_tool_json);
-	Bprint(&b, "}");
+	Bprint(b, ",\"tools\":[%s]", exec_tool_json);
+	Bprint(b, "}");
 
-	Bflush(&b);
-	Bterm(&b);
+	Bflush(b);
+	Bterm(b);
+	free(b);
 	close(pfd[1]);
 
 	buf = readpipe(pfd[0], &len);
@@ -475,12 +481,63 @@ antreqhdrs(ANTReq *req, char *session, HTTPHdr *hdrs, int maxn)
 
 /* ── SSE delta parser ─────────────────────────────────────────────────── */
 
+/*
+ * growbuf — ensure *buf is at least need bytes, doubling from 256.
+ * Returns 0 on success, -1 on failure.
+ */
+static int
+growbuf(char **buf, long *sz, long need)
+{
+	long newsz;
+	char *p;
+
+	if(need <= *sz)
+		return 0;
+	newsz = *sz ? *sz : 256;
+	while(newsz < need)
+		newsz *= 2;
+	p = realloc(*buf, newsz);
+	if(p == nil)
+		return -1;
+	*buf = p;
+	*sz  = newsz;
+	return 0;
+}
+
+/*
+ * jsonstr_grow — decode JSON string token into p->textbuf, growing as needed.
+ * Returns number of bytes written (>= 0), or -1 on error.
+ */
+static int
+jsonstr_grow(ANTParser *p, const char *js, jsmntok_t *t)
+{
+	long need;
+	int n;
+
+	if(t->type != JSMN_STRING)
+		return -1;
+	need = (t->end - t->start) + 1;
+	if(growbuf(&p->textbuf, &p->textbufsz, need) < 0)
+		return -1;
+	n = jsonstr(js, t, p->textbuf, (int)p->textbufsz);
+	return n;
+}
+
 void
 antinit(ANTParser *p, HTTPResp *resp)
 {
 	memset(p, 0, sizeof *p);
 	sseinit(&p->sse, resp);
 	p->block_type = -1;
+}
+
+void
+antterm(ANTParser *p)
+{
+	sseterm(&p->sse);
+	free(p->textbuf);
+	p->textbuf   = nil;
+	p->textbufsz = 0;
 }
 
 /*
@@ -503,18 +560,21 @@ int
 antdelta(ANTParser *p, ANTDelta *d)
 {
 	SSEEvent ev;
-	int rc;
+	int rc, ret;
 	enum { MAXTOK = 256 };
 	jsmn_parser jp;
-	jsmntok_t toks[MAXTOK];
+	jsmntok_t *toks;
 	int ntoks;
 
-	for(;;) {
+	toks = malloc(MAXTOK * sizeof(jsmntok_t));
+	if(toks == nil)
+		return ANT_EOF;
+
+	ret = -1;
+	while(ret < 0) {
 		rc = ssestep(&p->sse, &ev);
-		if(rc == SSE_DONE)
-			return ANT_DONE;
-		if(rc == SSE_EOF)
-			return ANT_EOF;
+		if(rc == SSE_DONE) { ret = ANT_DONE; break; }
+		if(rc == SSE_EOF)  { ret = ANT_EOF;  break; }
 
 		/* ev.event may be nil for lines without an "event:" prefix */
 		if(ev.event == nil || ev.data == nil)
@@ -563,7 +623,7 @@ antdelta(ANTParser *p, ANTDelta *d)
 				d->tool_id   = p->tool_idbuf;
 				d->tool_name = p->tool_namebuf;
 				d->stop_reason = nil;
-				return ANT_OK;
+				ret = ANT_OK;
 			}
 			continue;
 		}
@@ -581,38 +641,38 @@ antdelta(ANTParser *p, ANTDelta *d)
 			if(strcmp(dtypebuf, "text_delta") == 0) {
 				int text_i = jsonget(ev.data, toks, ntoks, delta_i, "text");
 				if(text_i < 0 || toks[text_i].type != JSMN_STRING) continue;
-				int n = jsonstr(ev.data, &toks[text_i], p->textbuf, sizeof p->textbuf);
+				int n = jsonstr_grow(p, ev.data, &toks[text_i]);
 				if(n <= 0) continue;
 				d->type      = ANTDText;
 				d->text      = p->textbuf;
 				d->tool_id   = nil;
 				d->tool_name = nil;
 				d->stop_reason = nil;
-				return ANT_OK;
+				ret = ANT_OK;
 
 			} else if(strcmp(dtypebuf, "thinking_delta") == 0) {
 				int think_i = jsonget(ev.data, toks, ntoks, delta_i, "thinking");
 				if(think_i < 0 || toks[think_i].type != JSMN_STRING) continue;
-				int n = jsonstr(ev.data, &toks[think_i], p->textbuf, sizeof p->textbuf);
+				int n = jsonstr_grow(p, ev.data, &toks[think_i]);
 				if(n <= 0) continue;
 				d->type      = ANTDThinking;
 				d->text      = p->textbuf;
 				d->tool_id   = nil;
 				d->tool_name = nil;
 				d->stop_reason = nil;
-				return ANT_OK;
+				ret = ANT_OK;
 
 			} else if(strcmp(dtypebuf, "input_json_delta") == 0) {
 				int pj_i = jsonget(ev.data, toks, ntoks, delta_i, "partial_json");
 				if(pj_i < 0 || toks[pj_i].type != JSMN_STRING) continue;
-				int n = jsonstr(ev.data, &toks[pj_i], p->textbuf, sizeof p->textbuf);
+				int n = jsonstr_grow(p, ev.data, &toks[pj_i]);
 				if(n <= 0) continue;
 				d->type      = ANTDToolArg;
 				d->text      = p->textbuf;
 				d->tool_id   = nil;
 				d->tool_name = nil;
 				d->stop_reason = nil;
-				return ANT_OK;
+				ret = ANT_OK;
 			}
 			continue;
 		}
@@ -638,9 +698,11 @@ antdelta(ANTParser *p, ANTDelta *d)
 			d->tool_id     = nil;
 			d->tool_name   = nil;
 			d->stop_reason = p->stop_reasonbuf;
-			return ANT_OK;
+			ret = ANT_OK;
 		}
 
 		/* message_start, message_stop, ping: ignore */
 	}
+	free(toks);
+	return ret;
 }

@@ -54,7 +54,7 @@ static int failures = 0;
 
 #define CHECK(cond, msg) do { \
 	if(!(cond)) { \
-		fprint(2, "FAIL: %s (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s\n", msg); \
 		failures++; \
 	} else { \
 		print("ok:   %s\n", msg); \
@@ -63,8 +63,8 @@ static int failures = 0;
 
 #define CHECKEQ(a, b, msg) do { \
 	if((long)(a) != (long)(b)) { \
-		fprint(2, "FAIL: %s: got %ld want %ld (line %d)\n", \
-		       msg, (long)(a), (long)(b), __LINE__); \
+		fprint(2, "FAIL: %s: got %ld want %ld\n", \
+		       msg, (long)(a), (long)(b)); \
 		failures++; \
 	} else { \
 		print("ok:   %s\n", msg); \
@@ -74,8 +74,8 @@ static int failures = 0;
 #define CHECKSTR(a, b, msg) do { \
 	const char *_a = (a), *_b = (b); \
 	if(_a == nil || strcmp(_a, _b) != 0) { \
-		fprint(2, "FAIL: %s: got \"%s\" want \"%s\" (line %d)\n", \
-		       msg, _a ? _a : "(nil)", _b, __LINE__); \
+		fprint(2, "FAIL: %s: got \"%s\" want \"%s\"\n", \
+		       msg, _a ? _a : "(nil)", _b); \
 		failures++; \
 	} else { \
 		print("ok:   %s\n", msg); \
@@ -85,8 +85,8 @@ static int failures = 0;
 #define CHECKCONTAINS(s, sub, msg) do { \
 	const char *_s = (s), *_sub = (sub); \
 	if(_s == nil || strstr(_s, _sub) == nil) { \
-		fprint(2, "FAIL: %s: \"%s\" does not contain \"%s\" (line %d)\n", \
-		       msg, _s ? _s : "(nil)", _sub, __LINE__); \
+		fprint(2, "FAIL: %s: \"%s\" does not contain \"%s\"\n", \
+		       msg, _s ? _s : "(nil)", _sub); \
 		failures++; \
 	} else { \
 		print("ok:   %s\n", msg); \
@@ -95,7 +95,7 @@ static int failures = 0;
 
 #define CHECKNONIL(a, msg) do { \
 	if((a) == nil) { \
-		fprint(2, "FAIL: %s: got nil (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s: got nil\n", msg); \
 		failures++; \
 	} else { \
 		print("ok:   %s\n", msg); \
@@ -444,6 +444,7 @@ test_delta_text(void)
 	/* 2.3: loop ended with ANT_DONE */
 	CHECKEQ(rc, ANT_DONE, "returns ANT_DONE");
 
+	antterm(&p);
 	free_resp(r);
 }
 
@@ -496,6 +497,7 @@ test_delta_tool(void)
 	/* 2.7: loop ended with ANT_DONE */
 	CHECKEQ(rc, ANT_DONE, "returns ANT_DONE");
 
+	antterm(&p);
 	free_resp(r);
 }
 
@@ -594,6 +596,7 @@ test_live_text(char *sockpath, char *tokpath)
 		}
 	}
 
+	antterm(&p);
 	httprespfree(r);
 	httpclose(c);
 	oauthtokenfree(tok);
@@ -707,6 +710,7 @@ test_live_tool(char *sockpath, char *tokpath)
 		}
 	}
 
+	antterm(&p);
 	httprespfree(r);
 	httpclose(c);
 	oauthtokenfree(tok);
@@ -721,6 +725,8 @@ test_live_tool(char *sockpath, char *tokpath)
 }
 
 /* ── threadmain ─────────────────────────────────────────────────────── */
+
+int mainstacksize = 65536;   /* antdelta uses ~4KB of toks[] per call; avoid overflow */
 
 void
 threadmain(int argc, char *argv[])

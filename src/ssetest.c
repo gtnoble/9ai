@@ -38,7 +38,7 @@ static int failures = 0;
 
 #define CHECK(cond, msg) do { \
 	if(!(cond)) { \
-		fprint(2, "FAIL: %s (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s\n", msg); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -47,8 +47,8 @@ static int failures = 0;
 
 #define CHECKEQ(a, b, msg) do { \
 	if((long)(a) != (long)(b)) { \
-		fprint(2, "FAIL: %s: got %ld want %ld (line %d)\n", \
-		       msg, (long)(a), (long)(b), __LINE__); \
+		fprint(2, "FAIL: %s: got %ld want %ld\n", \
+		       msg, (long)(a), (long)(b)); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -58,8 +58,8 @@ static int failures = 0;
 #define CHECKSTR(a, b, msg) do { \
 	const char *_a = (a), *_b = (b); \
 	if(_a == nil || strcmp(_a, _b) != 0) { \
-		fprint(2, "FAIL: %s: got %s want %s (line %d)\n", \
-		       msg, _a ? _a : "(nil)", _b, __LINE__); \
+		fprint(2, "FAIL: %s: got %s want %s\n", \
+		       msg, _a ? _a : "(nil)", _b); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -68,7 +68,7 @@ static int failures = 0;
 
 #define CHECKNIL(a, msg) do { \
 	if((a) != nil) { \
-		fprint(2, "FAIL: %s: got non-nil (line %d)\n", msg, __LINE__); \
+		fprint(2, "FAIL: %s: got non-nil\n", msg); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -77,8 +77,8 @@ static int failures = 0;
 
 #define CHECKPREFIX(s, pfx, msg) do { \
 	if((s) == nil || strncmp((s),(pfx),strlen(pfx)) != 0) { \
-		fprint(2, "FAIL: %s: \"%s\" does not start with \"%s\" (line %d)\n", \
-		       msg, (s) ? (s) : "(nil)", (pfx), __LINE__); \
+		fprint(2, "FAIL: %s: \"%s\" does not start with \"%s\"\n", \
+		       msg, (s) ? (s) : "(nil)", (pfx)); \
 		failures++; \
 	} else { \
 		print("ok: %s\n", msg); \
@@ -325,6 +325,7 @@ run_fixture(const char *name,
 	snprint(label, sizeof label, "%s: final rc==SSE_DONE", name);
 	CHECKEQ(rc, SSE_DONE, label);
 
+	sseterm(&p);
 	free_resp(r);
 	return failures - prev;
 }
@@ -433,6 +434,7 @@ test_eof_without_done(void)
 	rc = ssestep(&p, &ev);
 	CHECKEQ(rc, SSE_EOF, "eof_without_done: second step is SSE_EOF");
 
+	sseterm(&p);
 	free_resp(r);
 }
 
@@ -465,6 +467,7 @@ test_comments(void)
 	rc = ssestep(&p, &ev);
 	CHECKEQ(rc, SSE_DONE, "comments: DONE after comment");
 
+	sseterm(&p);
 	free_resp(r);
 }
 
@@ -547,6 +550,7 @@ test_live_oai(char *session, char *sockpath)
 	      "live OAI: text contains 'hello'");
 	print("  assembled text: %s\n", text);
 
+	sseterm(&p);
 	httprespfree(r);
 	httpclose(c);
 }
@@ -631,6 +635,7 @@ test_live_ant(char *session, char *sockpath)
 	      "live ANT: text contains 'hello'");
 	print("  assembled text: %s\n", text);
 
+	sseterm(&p);
 	httprespfree(r);
 	httpclose(c);
 }

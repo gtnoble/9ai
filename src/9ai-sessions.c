@@ -48,6 +48,7 @@
 #include <libc.h>
 #include <bio.h>
 
+#include "9ai.h"
 #define SNIPPET  80
 #define MAXFIELDS 16
 #define RECBUF   4096
@@ -106,8 +107,7 @@ parsesessfile(char *path,
               char *ts,     /* ≥32 bytes  */
               char *snip)   /* ≥SNIPPET+4 bytes */
 {
-	int    fd;
-	Biobuf b;
+	Biobuf *b;
 	char  *line;
 	long   linelen;
 	int    gotsess   = 0;
@@ -115,19 +115,18 @@ parsesessfile(char *path,
 
 	uuid[0] = model[0] = ts[0] = snip[0] = '\0';
 
-	fd = open(path, OREAD);
-	if(fd < 0)
+	b = Bopen(path, OREAD);
+	if(b == nil)
 		return -1;
-	Binit(&b, fd, OREAD);
 
 	while((!gotsess || !gotprompt) &&
-	      (line = Brdline(&b, 0x1e)) != nil) {
+	      (line = Brdline(b, 0x1e)) != nil) {
 		char   rec[RECBUF];
 		char  *fields[MAXFIELDS];
 		int    nf;
 		long   cplen;
 
-		linelen = Blinelen(&b);
+		linelen = Blinelen(b);
 		cplen   = linelen < (long)sizeof rec - 1 ? linelen : (long)sizeof rec - 1;
 		memmove(rec, line, cplen);
 		rec[cplen] = '\0';
@@ -144,7 +143,7 @@ parsesessfile(char *path,
 				Tm  *tm = localtime(t);
 				if(tm != nil)
 					snprint(ts, 32, "%04d-%02d-%02d %02d:%02d",
-					        tm->year + 1900, tm->mon + 1, tm->mday,
+					        tm->year, tm->mon + 1, tm->mday,
 					        tm->hour, tm->min);
 				else
 					strecpy(ts, ts+32, fields[3]);
@@ -180,8 +179,7 @@ parsesessfile(char *path,
 		}
 	}
 
-	Bterm(&b);
-	close(fd);
+	Bterm(b);
 
 	return gotsess ? 0 : -1;
 }

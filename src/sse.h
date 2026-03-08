@@ -36,18 +36,18 @@
  *   // rc == SSE_EOF:  connection closed without [DONE] (error/abort)
  *
  * Memory:
- *   SSEParser contains a fixed internal buffer (SSE_BUFSZ bytes) that
- *   holds the most recent event and data strings.  Callers must copy
- *   any strings they need to retain across calls to ssestep().
- *   SSEParser itself holds no heap allocations — it may be stack-allocated.
+ *   sseinit() heap-allocates internal buffers; sseterm() frees them.
+ *   ev.event and ev.data point into those buffers and are valid only
+ *   until the next ssestep() or sseterm() call.  Callers must copy
+ *   any strings they need to retain across calls.
+ *   SSEParser itself is small and may be stack-allocated; the large
+ *   data buffer lives on the heap.
  */
 
 enum {
 	SSE_OK   = 0,   /* ev filled; call again                */
 	SSE_DONE = 1,   /* [DONE] received; stream finished     */
 	SSE_EOF  = 2,   /* EOF or read error before [DONE]      */
-
-	SSE_BUFSZ = 65536,  /* max line length; Copilot data lines are < 4KB in practice */
 };
 
 typedef struct SSEParser SSEParser;
@@ -60,11 +60,14 @@ struct SSEEvent {
 
 struct SSEParser {
 	HTTPResp *resp;
-	char      evbuf[128];           /* current event name from "event:" line */
-	char      databuf[SSE_BUFSZ];   /* current data payload */
-	int       have_event;           /* evbuf contains a pending event name */
+	char     *evbuf;       /* heap: current event name from "event:" line */
+	long      evbufsz;     /* allocated size of evbuf */
+	char     *databuf;     /* heap: current data payload */
+	long      databufsz;   /* allocated size of databuf */
+	int       have_event;  /* evbuf contains a pending event name */
 };
 
 /* sse.c */
 void sseinit(SSEParser *p, HTTPResp *resp);
+void sseterm(SSEParser *p);
 int  ssestep(SSEParser *p, SSEEvent *ev);
