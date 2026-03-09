@@ -478,93 +478,18 @@ fsread(Req *r)
 
 	case Qmodels: {
 		/*
-		 * Live fetch from Copilot API.
-		 * Load refresh token, get session token, fetch model list.
-		 * Format into a heap buffer and return it.
+		 * Park the request; modelswatcher will do the HTTP work on its
+		 * own large stack and call respond() when done.
 		 */
-		int    fd;
-		char   tokbuf[512];
-		int    n;
-		char  *refresh;
-		OAuthToken *tok;
-		Model *mlist;
-		Biobuf bio;
-		int   pfd[2];
-
-		/* read refresh token */
-		fd = open(g->tokpath, OREAD);
-		if(fd < 0) {
-			respond(r, "cannot read token");
+		qlock(&g->lk);
+		if(g->pending_models != nil) {
+			qunlock(&g->lk);
+			respond(r, "concurrent reads on /models not supported");
 			return;
 		}
-		n = read(fd, tokbuf, sizeof tokbuf - 1);
-		close(fd);
-		if(n <= 0) {
-			respond(r, "empty token");
-			return;
-		}
-		tokbuf[n] = '\0';
-		while(n > 0 && (tokbuf[n-1]=='\n'||tokbuf[n-1]=='\r'||tokbuf[n-1]==' '))
-			tokbuf[--n] = '\0';
-		refresh = tokbuf;
-
-		tok = oauthsession(refresh, g->sockpath);
-		if(tok == nil) {
-			respond(r, "oauthsession failed");
-			return;
-		}
-
-		mlist = modelsfetch(tok->token, g->sockpath);
-		oauthtokenfree(tok);
-		if(mlist == nil) {
-			respond(r, "modelsfetch failed");
-			return;
-		}
-
-		/* write formatted model list into a pipe; read back as string */
-		if(pipe(pfd) < 0) {
-			modelsfree(mlist);
-			respond(r, "pipe: %r");
-			return;
-		}
-		Binit(&bio, pfd[1], OWRITE);
-		modelsfmt(mlist, &bio);
-		modelsfree(mlist);
-		Bflush(&bio);
-		Bterm(&bio);
-		close(pfd[1]);
-
-		{
-			char *mbuf;
-			long  mcap = 4096, mlen = 0;
-			int   nr;
-
-			mbuf = malloc(mcap);
-			if(mbuf == nil) {
-				close(pfd[0]);
-				respond(r, "malloc");
-				return;
-			}
-			while((nr = read(pfd[0], mbuf + mlen, mcap - mlen - 1)) > 0) {
-				mlen += nr;
-				if(mlen + 1 >= mcap) {
-					mcap *= 2;
-					char *tmp = realloc(mbuf, mcap);
-					if(tmp == nil) {
-						free(mbuf);
-						close(pfd[0]);
-						respond(r, "realloc");
-						return;
-					}
-					mbuf = tmp;
-				}
-			}
-			close(pfd[0]);
-			mbuf[mlen] = '\0';
-			readbuf(r, mbuf, mlen);
-			free(mbuf);
-		}
-		respond(r, nil);
+		g->pending_models = r;
+		qunlock(&g->lk);
+		chansendp(g->modelschan, (void*)(uintptr)1);
 		return;
 	}
 
@@ -1603,11 +1528,125 @@ aiinit(char *model, char *sockpath, char *tokpath)
 	ai->abortchan    = chancreate(sizeof(void*), 4);
 	ai->loginreqchan = chancreate(sizeof(void*), 4);
 	ai->devchan      = chancreate(sizeof(void*), 4);
+	ai->modelschan   = chancreate(sizeof(void*), 4);
 
 	/* initialise auth status based on whether a token already exists */
 	ai->authstatus = oauthtokenexists(tokpath) ? 2 : 0;
 
 	return ai;
+}
+
+/*
+ * modelswatcher — runs in its own proc with a large stack.
+ * Woken by a signal on modelschan; does the OAuth + HTTP fetch that
+ * would overflow the 32 KB srv stack if done inline in fsread.
+ */
+static void
+modelswatcher(void *v)
+{
+	USED(v);
+	for(;;) {
+		int   fd, n;
+		char  tokbuf[512];
+		char *refresh;
+		OAuthToken *tok;
+		Model *mlist;
+		char  *mbuf;
+		long   mcap, mlen;
+		int    nr;
+		Req   *r;
+
+		chanrecvp(g->modelschan);
+
+		qlock(&g->lk);
+		r = g->pending_models;
+		g->pending_models = nil;
+		qunlock(&g->lk);
+
+		if(r == nil)
+			continue;
+
+		/* read refresh token */
+		fd = open(g->tokpath, OREAD);
+		if(fd < 0) {
+			respond(r, "cannot read token");
+			continue;
+		}
+		n = read(fd, tokbuf, sizeof tokbuf - 1);
+		close(fd);
+		if(n <= 0) {
+			respond(r, "empty token");
+			continue;
+		}
+		tokbuf[n] = '\0';
+		while(n > 0 && (tokbuf[n-1]=='\n'||tokbuf[n-1]=='\r'||tokbuf[n-1]==' '))
+			tokbuf[--n] = '\0';
+		refresh = tokbuf;
+
+		tok = oauthsession(refresh, g->sockpath);
+		if(tok == nil) {
+			respond(r, "oauthsession failed");
+			continue;
+		}
+
+		mlist = modelsfetch(tok->token, g->sockpath);
+		oauthtokenfree(tok);
+		if(mlist == nil) {
+			respond(r, "modelsfetch failed");
+			continue;
+		}
+
+		/* format model list into a heap buffer via Biobuf + pipe */
+		{
+			int   pfd[2];
+			Biobuf bio;
+
+			if(pipe(pfd) < 0) {
+				modelsfree(mlist);
+				respond(r, "pipe: %r");
+				continue;
+			}
+			Binit(&bio, pfd[1], OWRITE);
+			modelsfmt(mlist, &bio);
+			modelsfree(mlist);
+			Bflush(&bio);
+			Bterm(&bio);
+			close(pfd[1]);
+
+			mcap = 4096;
+			mlen = 0;
+			mbuf = malloc(mcap);
+			if(mbuf == nil) {
+				close(pfd[0]);
+				respond(r, "malloc");
+				continue;
+			}
+			while((nr = read(pfd[0], mbuf + mlen, mcap - mlen - 1)) > 0) {
+				mlen += nr;
+				if(mlen + 1 >= mcap) {
+					char *tmp;
+					mcap *= 2;
+					tmp = realloc(mbuf, mcap);
+					if(tmp == nil) {
+						free(mbuf);
+						close(pfd[0]);
+						respond(r, "realloc");
+						mbuf = nil;
+						break;
+					}
+					mbuf = tmp;
+				}
+			}
+			close(pfd[0]);
+			if(mbuf == nil)
+				continue;
+			mbuf[mlen] = '\0';
+			r->ifcall.offset = 0;
+			readbuf(r, mbuf, mlen);
+			free(mbuf);
+		}
+		respond(r, nil);
+	}
 }
 
 void
@@ -1619,9 +1658,10 @@ aimain(AiState *ai, char *srvname, char *mtpt)
 	proccreate(agentproc, nil, 524288);
 
 	/* start channel watcher procs */
-	proccreate(outwatcher,   nil, 16384);
-	proccreate(eventwatcher, nil, 16384);
-	proccreate(devwatcher,   nil, 16384);
+	proccreate(outwatcher,    nil, 16384);
+	proccreate(eventwatcher,  nil, 16384);
+	proccreate(devwatcher,    nil, 16384);
+	proccreate(modelswatcher, nil, 131072);  /* needs large stack: OAuth + HTTP */
 
 	/* start auth proc */
 	proccreate(authproc, nil, 65536);

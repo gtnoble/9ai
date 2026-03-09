@@ -112,6 +112,10 @@ struct AiState {
 	Channel *loginreqchan;  /* int (1 = start login) */
 	Channel *devchan;       /* char* url\x1fcode (nil = done/error) */
 	Req     *devpending;    /* parked /auth/device read */
+
+	/* /models: parked read, woken by modelschan signal */
+	Channel *modelschan;    /* int (1 = fetch requested) */
+	Req     *pending_models; /* parked /models read, or nil */
 };
 
 /*

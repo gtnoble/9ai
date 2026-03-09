@@ -449,38 +449,10 @@ outproc(void *v)
 static char *
 prompttext(Win *w)
 {
-	int   afd, dfd;
-	char  buf[8192];
-	int   n;
-	char *s, *e2;
 	char *body;
 	int   bodylen;
 	char *result;
 
-	/* try dot selection first */
-	afd = acmeopen(w->id, "addr", ORDWR);
-	dfd = acmeopen(w->id, "data", ORDWR);
-	if(afd >= 0 && dfd >= 0) {
-		write(afd, ".", 1);
-		n = read(dfd, buf, sizeof buf - 1);
-		if(n > 0) {
-			buf[n] = '\0';
-			s  = buf;
-			e2 = buf + n - 1;
-			while(*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
-			while(e2 > s && (*e2 == ' ' || *e2 == '\t' || *e2 == '\n' || *e2 == '\r')) e2--;
-			*(e2+1) = '\0';
-			if(*s != '\0') {
-				close(afd);
-				close(dfd);
-				return strdup(s);
-			}
-		}
-	}
-	if(afd >= 0) close(afd);
-	if(dfd >= 0) close(dfd);
-
-	/* fall back to paragraph scan of body */
 	body = winbody(w, &bodylen);
 	if(body == nil)
 		return nil;
@@ -518,6 +490,7 @@ cmd_send(void)
 	}
 
 	n = strlen(text);
+	fprint(2, "cmd_send: sending %d bytes: «%s»\n", n, text);
 	write(fd, text, n);
 	close(fd);
 	setstatus("running");
@@ -826,7 +799,7 @@ eventproc(void *v)
 		if(!getevent(fd, buf, &bufp, &nbuf, &e))
 			break;
 
-		       e.c1, e.c2, e.flag, e.text);
+	
 
 		if(e.c1 == 'M' && (e.c2 == 'x' || e.c2 == 'X')) {
 			text = e.text;

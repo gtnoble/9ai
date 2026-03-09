@@ -591,6 +591,7 @@ cmd_send(void)
 		free(display);
 	}
 
+	fprint(2, "cmd_send: sending %d bytes: «%s»\n", (int)strlen(text), text);
 	fswrite(msgfd, text, strlen(text));
 	fsclose(msgfd);   /* clunk triggers the agent turn */
 	setstatus("running");
