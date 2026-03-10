@@ -51,6 +51,7 @@ struct HTTPResp {
 	int       code;
 	char     *body;     /* nil until httpreadbody() */
 	long      bodylen;
+	int       chunked;  /* 1 if Transfer-Encoding: chunked */
 	HTTPConn *conn;     /* back-pointer; response does not own conn */
 };
 

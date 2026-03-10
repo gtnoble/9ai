@@ -1641,7 +1641,6 @@ modelswatcher(void *v)
 			if(mbuf == nil)
 				continue;
 			mbuf[mlen] = '\0';
-			r->ifcall.offset = 0;
 			readbuf(r, mbuf, mlen);
 			free(mbuf);
 		}

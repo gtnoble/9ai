@@ -155,13 +155,15 @@ readstatus(HTTPConn *c)
 
 /*
  * skipheaders — consume HTTP response headers up to the blank line.
+ * Sets *chunkedp = 1 if Transfer-Encoding: chunked is present.
  */
 static int
-skipheaders(HTTPConn *c)
+skipheaders(HTTPConn *c, int *chunkedp)
 {
 	char *line;
 	int   n;
 
+	*chunkedp = 0;
 	for(;;) {
 		line = Brdline(c->bio, '\n');
 		if(line == nil) {
@@ -171,6 +173,13 @@ skipheaders(HTTPConn *c)
 		n = Blinelen(c->bio);
 		if(n == 1 || (n == 2 && line[0] == '\r'))
 			break;
+		/* null-terminate for cistrstr; strip \r\n */
+		if(n >= 2 && line[n-2] == '\r') line[n-2] = '\0';
+		else line[n-1] = '\0';
+		if(cistrstr(line, "Transfer-Encoding") != nil &&
+		   cistrstr(line, "chunked") != nil)
+			*chunkedp = 1;
+		/* restore — not strictly needed since Brdline owns the buffer */
 	}
 	return 0;
 }
@@ -184,21 +193,22 @@ sendreq(HTTPConn *c, char *method, char *path, char *host,
         HTTPHdr *hdrs, int nhdrs, char *body, long bodylen)
 {
 	HTTPResp *r;
-	int       code;
+	int       code, chunked;
 
 	if(writereq(c, method, path, host, hdrs, nhdrs, body, bodylen) < 0)
 		return nil;
 	code = readstatus(c);
 	if(code < 0)
 		return nil;
-	if(skipheaders(c) < 0)
+	if(skipheaders(c, &chunked) < 0)
 		return nil;
 
 	r = mallocz(sizeof *r, 1);
 	if(r == nil)
 		return nil;
-	r->code = code;
-	r->conn = c;
+	r->code    = code;
+	r->conn    = c;
+	r->chunked = chunked;
 	return r;
 }
 
@@ -224,6 +234,7 @@ httppost(HTTPConn *c, char *path, char *host, HTTPHdr *hdrs, int nhdrs,
 /*
  * httpreadbody — slurp entire response body into r->body.
  * Sets r->body (nil-terminated) and r->bodylen.
+ * Handles both identity and chunked transfer encoding.
  */
 int
 httpreadbody(HTTPResp *r)
@@ -238,18 +249,69 @@ httpreadbody(HTTPResp *r)
 	if(buf == nil)
 		return -1;
 
-	for(;;) {
-		if(len + CHUNK > cap) {
-			cap *= 2;
-			buf = realloc(buf, cap + 1);
-			if(buf == nil)
-				return -1;
+	if(r->chunked) {
+		/*
+		 * Chunked transfer encoding: read "<hex-size>\r\n<data>\r\n" until
+		 * a zero-size chunk ("0\r\n\r\n") signals end of body.
+		 */
+		char *line;
+		int   llen;
+		long  chunklen;
+
+		for(;;) {
+			/* read chunk-size line */
+			line = Brdline(r->conn->bio, '\n');
+			if(line == nil)
+				break;
+			llen = Blinelen(r->conn->bio);
+			if(llen >= 2 && line[llen-2] == '\r') line[llen-2] = '\0';
+			else line[llen-1] = '\0';
+
+			/* chunk extensions (after ';') are ignored */
+			chunklen = strtol(line, nil, 16);
+			if(chunklen <= 0)
+				break;  /* last chunk */
+
+			/* grow buffer if needed */
+			if(len + chunklen + 1 > cap) {
+				long newcap = cap * 2 + chunklen + 1;
+				char *tmp = realloc(buf, newcap + 1);
+				if(tmp == nil) {
+					free(buf);
+					return -1;
+				}
+				buf = tmp;
+				cap = newcap;
+			}
+
+			/* read exactly chunklen bytes */
+			n = Bread(r->conn->bio, buf + len, chunklen);
+			if(n < chunklen) {
+				/* short read — take what we got */
+				if(n > 0) len += n;
+				break;
+			}
+			len += n;
+
+			/* consume trailing \r\n after chunk data */
+			Brdline(r->conn->bio, '\n');
 		}
-		n = Bread(r->conn->bio, buf + len, CHUNK);
-		if(n <= 0)
-			break;
-		len += n;
+	} else {
+		/* Identity encoding: read until EOF */
+		for(;;) {
+			if(len + CHUNK > cap) {
+				cap *= 2;
+				buf = realloc(buf, cap + 1);
+				if(buf == nil)
+					return -1;
+			}
+			n = Bread(r->conn->bio, buf + len, CHUNK);
+			if(n <= 0)
+				break;
+			len += n;
+		}
 	}
+
 	buf[len] = '\0';
 	r->body    = buf;
 	r->bodylen = len;
