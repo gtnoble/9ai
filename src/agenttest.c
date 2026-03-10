@@ -326,6 +326,252 @@ test_record_three_fields(void)
 	free(cap);
 }
 
+/* ── Part 1.5: isctxoverflow ────────────────────────────────────────── */
+
+static void
+test_overflow_nil_body(void)
+{
+	print("\n-- 1.5 isctxoverflow: nil body → 0\n");
+	CHECKEQ(isctxoverflow(nil), 0, "nil body not overflow");
+}
+
+static void
+test_overflow_empty_body(void)
+{
+	print("\n-- 1.5 isctxoverflow: empty body → 0\n");
+	CHECKEQ(isctxoverflow(""), 0, "empty body not overflow");
+}
+
+static void
+test_overflow_unrelated_400(void)
+{
+	print("\n-- 1.5 isctxoverflow: unrelated 400 body → 0\n");
+	CHECKEQ(isctxoverflow("{\"error\":{\"message\":\"invalid model\"}}"), 0,
+	        "unrelated 400 not overflow");
+}
+
+static void
+test_overflow_copilot_oai(void)
+{
+	print("\n-- 1.5 isctxoverflow: Copilot OAI 'exceeds the limit' → 1\n");
+	CHECKEQ(isctxoverflow(
+	    "{\"error\":{\"message\":\"This model's maximum context length is "
+	    "128000 tokens. However, your messages resulted in "
+	    "prompt token count of 131072 tokens which exceeds the limit of "
+	    "128000 tokens.\"}}"),
+	    1, "Copilot OAI overflow detected");
+}
+
+static void
+test_overflow_openai_generic(void)
+{
+	print("\n-- 1.5 isctxoverflow: OpenAI 'exceeds the context window' → 1\n");
+	CHECKEQ(isctxoverflow(
+	    "{\"error\":{\"message\":\"This model's maximum context length is "
+	    "128000 tokens. Your prompt (131000) exceeds the context window.\"}}"),
+	    1, "generic OpenAI overflow detected");
+}
+
+static void
+test_overflow_anthropic(void)
+{
+	print("\n-- 1.5 isctxoverflow: Anthropic 'prompt is too long' → 1\n");
+	CHECKEQ(isctxoverflow(
+	    "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\","
+	    "\"message\":\"prompt is too long: 210000 tokens > 200000 maximum\"}}"),
+	    1, "Anthropic overflow detected");
+}
+
+static void
+test_overflow_context_length_exceeded(void)
+{
+	print("\n-- 1.5 isctxoverflow: 'context_length_exceeded' → 1\n");
+	CHECKEQ(isctxoverflow(
+	    "{\"error\":{\"code\":\"context_length_exceeded\","
+	    "\"message\":\"max context exceeded\"}}"),
+	    1, "context_length_exceeded detected");
+}
+
+/* ── Part 1.6: agentsessload trim replay ─────────────────────────────── */
+
+/*
+ * write a minimal session file to a temp path, load it with
+ * agentsessload, and verify the history is correct.
+ *
+ * Session file format: RS-terminated records, fields separated by FS.
+ * We write directly rather than going through agentsessopen/agentrun
+ * so the test has no network dependency.
+ */
+
+#define FS "\x1f"
+#define RS "\x1e"
+
+/* write one RS-terminated record; fields are separated by FS */
+static void
+writerec(int fd, ...)
+{
+	va_list ap;
+	char   *f;
+	int     first = 1;
+
+	va_start(ap, fd);
+	while((f = va_arg(ap, char*)) != nil) {
+		if(!first) write(fd, FS, 1);
+		write(fd, f, strlen(f));
+		first = 0;
+	}
+	write(fd, RS, 1);
+	va_end(ap);
+}
+
+static void
+test_sessload_trim_replay(void)
+{
+	char     path[256];
+	int      fd;
+	OAIReq  *req;
+	AgentCfg cfg;
+	int      rc;
+
+	print("\n-- 1.6 agentsessload: trim record replayed correctly\n");
+
+	/* write session file to a temp file */
+	snprint(path, sizeof path, "/tmp/9aitest-trim-%d", (int)getpid());
+	fd = create(path, OWRITE, 0600);
+	if(fd < 0) {
+		fprint(2, "SKIP 1.6: cannot create temp file %s: %r\n", path);
+		return;
+	}
+
+	/* session header */
+	writerec(fd, "session", "test-uuid-1234-5678-abcd-ef0123456789",
+	         "gpt-4o", "0", nil);
+
+	/* turn 1: prompt + assistant text */
+	writerec(fd, "prompt",     "first question", nil);
+	writerec(fd, "turn_start", nil);
+	writerec(fd, "text",       "first answer", nil);
+	writerec(fd, "turn_end",   "stop", nil);
+
+	/* turn 2: prompt + assistant text */
+	writerec(fd, "prompt",     "second question", nil);
+	writerec(fd, "turn_start", nil);
+	writerec(fd, "text",       "second answer", nil);
+	writerec(fd, "turn_end",   "stop", nil);
+
+	/* trim 1: drop turn 1 */
+	writerec(fd, "trim", "1", nil);
+
+	/* turn 3: written after the trim */
+	writerec(fd, "prompt",     "third question", nil);
+	writerec(fd, "turn_start", nil);
+	writerec(fd, "text",       "third answer", nil);
+	writerec(fd, "turn_end",   "stop", nil);
+
+	close(fd);
+
+	/* load the session */
+	req = oaireqnew("gpt-4o");
+	memset(&cfg, 0, sizeof cfg);
+	cfg.model   = strdup("gpt-4o");
+	cfg.sessdir = nil;
+
+	rc = agentsessload(path, req, &cfg);
+	if(rc < 0) {
+		fprint(2, "SKIP 1.6: agentsessload failed: %r\n");
+		oaireqfree(req);
+		free(cfg.model);
+		remove(path);
+		return;
+	}
+	agentsessclose(&cfg);
+
+	/* verify history via serialisation */
+	{
+		char *body = oaireqjson(req, nil, nil);
+		CHECK(body != nil, "1.6: serialised after load");
+		/* turn 1 must be gone (trimmed) */
+		CHECK(strstr(body, "first question") == nil,
+		      "1.6: turn 1 user absent after trim replay");
+		CHECK(strstr(body, "first answer") == nil,
+		      "1.6: turn 1 assistant absent after trim replay");
+		/* turn 2 must still be present */
+		CHECKCONTAINS(body, "second question",
+		              "1.6: turn 2 user present");
+		CHECKCONTAINS(body, "second answer",
+		              "1.6: turn 2 assistant present");
+		/* turn 3 must also be present */
+		CHECKCONTAINS(body, "third question",
+		              "1.6: turn 3 user present");
+		CHECKCONTAINS(body, "third answer",
+		              "1.6: turn 3 assistant present");
+		free(body);
+	}
+
+	oaireqfree(req);
+	free(cfg.model);
+	remove(path);
+}
+
+static void
+test_sessload_trim_all_then_continue(void)
+{
+	char     path[256];
+	int      fd;
+	OAIReq  *req;
+	AgentCfg cfg;
+	int      rc;
+
+	print("\n-- 1.6 agentsessload: trim-all then new turn\n");
+
+	snprint(path, sizeof path, "/tmp/9aitest-trimall-%d", (int)getpid());
+	fd = create(path, OWRITE, 0600);
+	if(fd < 0) {
+		fprint(2, "SKIP 1.6b: cannot create temp file: %r\n");
+		return;
+	}
+
+	writerec(fd, "session", "uuid-trimall", "gpt-4o", "0", nil);
+	writerec(fd, "prompt",    "question one", nil);
+	writerec(fd, "turn_start", nil);
+	writerec(fd, "text",       "answer one", nil);
+	writerec(fd, "turn_end",   "stop", nil);
+	/* trim all: n=99, more than 1 turn present */
+	writerec(fd, "trim", "99", nil);
+	/* new turn after trim */
+	writerec(fd, "prompt",    "fresh start", nil);
+	writerec(fd, "turn_start", nil);
+	writerec(fd, "text",       "fresh answer", nil);
+	writerec(fd, "turn_end",   "stop", nil);
+	close(fd);
+
+	req = oaireqnew("gpt-4o");
+	memset(&cfg, 0, sizeof cfg);
+	cfg.model = strdup("gpt-4o");
+	rc = agentsessload(path, req, &cfg);
+	if(rc < 0) {
+		fprint(2, "SKIP 1.6b: agentsessload failed: %r\n");
+		oaireqfree(req);
+		free(cfg.model);
+		remove(path);
+		return;
+	}
+	agentsessclose(&cfg);
+
+	{
+		char *body = oaireqjson(req, nil, nil);
+		CHECK(body != nil, "1.6b: serialised");
+		CHECK(strstr(body, "question one") == nil, "1.6b: old turn absent");
+		CHECKCONTAINS(body, "fresh start",  "1.6b: post-trim turn present");
+		CHECKCONTAINS(body, "fresh answer", "1.6b: post-trim answer present");
+		free(body);
+	}
+
+	oaireqfree(req);
+	free(cfg.model);
+	remove(path);
+}
+
 /* ── Part 2: Live integration test ──────────────────────────────────── */
 
 /*
@@ -661,6 +907,19 @@ threadmain(int argc, char *argv[])
 	test_emitandsave();
 	test_record_single_field();
 	test_record_three_fields();
+
+	print("\n=== Part 1.5: isctxoverflow ===\n");
+	test_overflow_nil_body();
+	test_overflow_empty_body();
+	test_overflow_unrelated_400();
+	test_overflow_copilot_oai();
+	test_overflow_openai_generic();
+	test_overflow_anthropic();
+	test_overflow_context_length_exceeded();
+
+	print("\n=== Part 1.6: agentsessload trim replay ===\n");
+	test_sessload_trim_replay();
+	test_sessload_trim_all_then_continue();
 
 	if(sockpath != nil && tokpath != nil) {
 		print("\n=== Part 2: Live integration tests (OAI) ===\n");

@@ -75,9 +75,19 @@ struct AgentCfg {
 	/* session I/O — may be nil to skip session recording */
 	Biobuf *sess_bio;
 	char    uuid[37];  /* current session UUID (set by agentsessopen) */
+
+	/* abort signal — nil to disable; nbrecvp'd each SSE iteration */
+	Channel *abortchan;
 };
 
 /* ── Session management ──────────────────────────────────────────────── */
+
+/*
+ * isctxoverflow — return 1 if an HTTP error body indicates the request
+ * was rejected because the context window was exceeded.
+ * Matches GitHub Copilot OAI/ANT, generic OpenAI, and Anthropic formats.
+ */
+int isctxoverflow(const char *body);
 
 /*
  * genuuid — generate a random UUID v4 string into buf (must be ≥37 bytes).

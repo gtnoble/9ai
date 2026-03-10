@@ -12,6 +12,7 @@
  *   ├── status           ro    0444
  *   ├── model            rw    0600
  *   ├── models           ro    0444
+ *   ├── context          ro    0444
  *   └── session/         dir   0555
  *       ├── id           ro    0444
  *       ├── new          wo    0200

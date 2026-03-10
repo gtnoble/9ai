@@ -126,6 +126,26 @@ ANTMsg   *antmsgtooluse(char *text, char *tool_id, char *tool_name, char *tool_i
 ANTMsg   *antmsgtoolresult(char *tool_id, char *output, int is_error);
 
 /*
+ * antreqctxtokens — estimate context token count for the request.
+ *
+ * Walks every content block in every message and sums strlen(text)/4.
+ * Returns a conservative (slight over-) estimate; no tokeniser needed.
+ * Thread-safe as long as the caller holds any lock protecting req.
+ */
+long      antreqctxtokens(ANTReq *req);
+
+/*
+ * antreqtrim — remove the oldest nturns user+assistant turn pairs.
+ *
+ * A "turn" is one user message plus all immediately following
+ * assistant/tool messages up to (but not including) the next user
+ * message.  Returns the number of messages actually removed.
+ * Safe to call with nturns == 0 (no-op) or nturns > actual turns
+ * (removes all messages).
+ */
+int       antreqtrim(ANTReq *req, int nturns);
+
+/*
  * antreqjson — serialise the full request to a malloc'd JSON string.
  *
  * Produces the request body for POST /v1/messages.  Includes:

@@ -119,6 +119,26 @@ OAIMsg   *oaimsgtoolcall(char *text, char *tool_id, char *tool_name, char *tool_
 OAIMsg   *oaimsgtoolresult(char *tool_id, char *output, int is_error);
 
 /*
+ * oaireqctxtokens — estimate context token count for the request.
+ *
+ * Walks every content block in every message and sums strlen(text)/4.
+ * Returns a conservative (slight over-) estimate; no tokeniser needed.
+ * Thread-safe as long as the caller holds any lock protecting req.
+ */
+long      oaireqctxtokens(OAIReq *req);
+
+/*
+ * oaireqtrim — remove the oldest nturns user+assistant turn pairs.
+ *
+ * A "turn" is one user message plus all immediately following
+ * assistant/tool messages up to (but not including) the next user
+ * message.  Returns the number of messages actually removed.
+ * Safe to call with nturns == 0 (no-op) or nturns > actual turns
+ * (removes all messages).
+ */
+int       oaireqtrim(OAIReq *req, int nturns);
+
+/*
  * oaireqjson — serialise the full request to a malloc'd JSON string.
  *
  * Produces the request body for POST /chat/completions.  Includes:

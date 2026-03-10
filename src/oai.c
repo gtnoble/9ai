@@ -177,6 +177,21 @@ oaireqaddmsg(OAIReq *req, OAIMsg *msg)
 	}
 }
 
+long
+oaireqctxtokens(OAIReq *req)
+{
+	OAIMsg   *m;
+	OAIBlock *b;
+	long      chars = 0;
+
+	for(m = req->msgs; m != nil; m = m->next)
+		for(b = m->content; b != nil; b = b->next) {
+			if(b->text      != nil) chars += strlen(b->text);
+			if(b->tool_args != nil) chars += strlen(b->tool_args);
+		}
+	return (chars + 3) / 4;  /* ceil(chars/4) */
+}
+
 static void
 blockfree(OAIBlock *b)
 {
@@ -211,6 +226,50 @@ oaireqfree(OAIReq *req)
 		msgfree(m);
 	}
 	free(req);
+}
+
+int
+oaireqtrim(OAIReq *req, int nturns)
+{
+	OAIMsg *m, *next;
+	int     turns, removed;
+
+	if(nturns <= 0 || req->msgs == nil)
+		return 0;
+
+	/*
+	 * Walk forward, counting user messages as turn boundaries.
+	 * We stop when we've seen nturns user messages and the next
+	 * message is also a user message (i.e. we're at the start of
+	 * an un-trimmed turn) — or we run out of messages.
+	 *
+	 * The cut point is the first message of the first turn to keep.
+	 */
+	turns = 0;
+	m = req->msgs;
+	while(m != nil) {
+		if(m->role == OAIRoleUser) {
+			if(turns == nturns)
+				break;   /* m is the first message to keep */
+			turns++;
+		}
+		m = m->next;
+	}
+	/* m == nil means we consumed everything (trim all) */
+
+	/* free everything from req->msgs up to (but not including) m */
+	removed = 0;
+	next = req->msgs;
+	while(next != m) {
+		OAIMsg *cur = next;
+		next = cur->next;
+		msgfree(cur);
+		removed++;
+	}
+	req->msgs = m;
+	if(m == nil)
+		req->msgtail = nil;
+	return removed;
 }
 
 /* ── JSON serialisation ────────────────────────────────────────────────── */

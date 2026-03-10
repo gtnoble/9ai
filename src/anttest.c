@@ -102,6 +102,15 @@ static int failures = 0;
 	} \
 } while(0)
 
+#define CHECKNIL(a, msg) do { \
+	if((a) != nil) { \
+		fprint(2, "FAIL: %s: expected nil, got non-nil\n", msg); \
+		failures++; \
+	} else { \
+		print("ok:   %s\n", msg); \
+	} \
+} while(0)
+
 /* ── Fixtures (captured from live Copilot API via ssetest.c) ────────── */
 
 /* ant_text_sse: text response with "hello world", stop_reason "end_turn" */
@@ -501,6 +510,179 @@ test_delta_tool(void)
 	free_resp(r);
 }
 
+/* ── Part 2.5: antreqctxtokens and antreqtrim ────────────────────────── */
+
+static void
+test_ant_ctxtokens_empty(void)
+{
+	ANTReq *req;
+
+	print("-- 2.5 antreqctxtokens: empty req → 0\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	CHECKEQ(antreqctxtokens(req), 0, "empty req has 0 tokens");
+	antreqfree(req);
+}
+
+static void
+test_ant_ctxtokens_counts_text(void)
+{
+	ANTReq *req;
+	long    est;
+
+	print("-- 2.5 antreqctxtokens: 8-char user message → 2 tokens\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("12345678"));  /* exactly 8 chars */
+	est = antreqctxtokens(req);
+	CHECKEQ(est, 2, "8 chars / 4 = 2 tokens");
+	antreqfree(req);
+}
+
+static void
+test_ant_ctxtokens_counts_tool_input(void)
+{
+	ANTReq *req;
+	long    est;
+
+	print("-- 2.5 antreqctxtokens: tool_input counted\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("go"));
+	/* tool use with 8-char input JSON */
+	antreqaddmsg(req, antmsgtooluse(nil, "toolu_01", "exec", "12345678"));
+	est = antreqctxtokens(req);
+	/* "go" = 2 + "12345678" = 8 → 10 → ceil(10/4) = 3 */
+	CHECKEQ(est, 3, "user text + tool_input counted: ceil(10/4)=3");
+	antreqfree(req);
+}
+
+static void
+test_ant_trim_zero_noop(void)
+{
+	ANTReq *req;
+	int     removed;
+
+	print("-- 2.5 antreqtrim: trim 0 is no-op\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("hello"));
+	antreqaddmsg(req, antmsgassistant("world"));
+	removed = antreqtrim(req, 0);
+	CHECKEQ(removed, 0,     "trim 0 removed 0 messages");
+	CHECK(req->msgs != nil, "list non-empty after trim 0");
+	antreqfree(req);
+}
+
+static void
+test_ant_trim_one_turn(void)
+{
+	ANTReq *req;
+	int     removed;
+
+	print("-- 2.5 antreqtrim: trim 1 removes first user+assistant pair\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	/* turn 1 */
+	antreqaddmsg(req, antmsguser("first question"));
+	antreqaddmsg(req, antmsgassistant("first answer"));
+	/* turn 2 */
+	antreqaddmsg(req, antmsguser("second question"));
+	antreqaddmsg(req, antmsgassistant("second answer"));
+
+	removed = antreqtrim(req, 1);
+
+	CHECK(removed > 0, "trim 1 removed messages");
+	CHECK(req->msgs != nil, "list non-empty after trim");
+	CHECKEQ(req->msgs->role, ANTRoleUser, "head is user message");
+	{
+		char *body = antreqjson(req, nil, nil);
+		CHECK(body != nil, "serialised after trim");
+		CHECKCONTAINS(body, "second question", "second turn present");
+		CHECK(strstr(body, "first question") == nil, "first turn absent");
+		free(body);
+	}
+	antreqfree(req);
+}
+
+static void
+test_ant_trim_with_tool_turn(void)
+{
+	ANTReq *req;
+	int     removed;
+
+	print("-- 2.5 antreqtrim: trim 1 removes turn with tool_use+tool_result\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	/* turn 1: user → assistant tool_use → user tool_result */
+	antreqaddmsg(req, antmsguser("list files"));
+	antreqaddmsg(req, antmsgtooluse(nil, "toolu_01", "exec",
+	    "{\"argv\":[\"ls\"]}"));
+	antreqaddmsg(req, antmsgtoolresult("toolu_01", "file1\nfile2\n", 0));
+	/* turn 2 */
+	antreqaddmsg(req, antmsguser("what did you find?"));
+	antreqaddmsg(req, antmsgassistant("two files"));
+
+	removed = antreqtrim(req, 1);
+
+	CHECK(removed >= 3, "at least 3 messages removed");
+	{
+		char *body = antreqjson(req, nil, nil);
+		CHECK(body != nil, "serialised after trim");
+		CHECKCONTAINS(body, "what did you find?", "turn 2 present");
+		CHECK(strstr(body, "list files") == nil, "turn 1 user gone");
+		CHECK(strstr(body, "file1") == nil,      "turn 1 tool result gone");
+		free(body);
+	}
+	antreqfree(req);
+}
+
+static void
+test_ant_trim_all(void)
+{
+	ANTReq *req;
+	int     removed;
+
+	print("-- 2.5 antreqtrim: trim N > actual turns removes everything\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("only question"));
+	antreqaddmsg(req, antmsgassistant("only answer"));
+
+	removed = antreqtrim(req, 99);
+
+	CHECK(removed > 0,   "messages were removed");
+	CHECKNIL(req->msgs,     "msgs nil after trim all");
+	CHECKNIL(req->msgtail,  "msgtail nil after trim all");
+	antreqfree(req);
+}
+
+static void
+test_ant_trim_msgtail_updated(void)
+{
+	ANTReq *req;
+	char   *body;
+
+	print("-- 2.5 antreqtrim: msgtail updated; append after trim works\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("alpha"));
+	antreqaddmsg(req, antmsgassistant("beta"));
+	antreqaddmsg(req, antmsguser("gamma"));
+	antreqaddmsg(req, antmsgassistant("delta"));
+
+	antreqtrim(req, 1);
+	antreqaddmsg(req, antmsguser("epsilon"));
+
+	body = antreqjson(req, nil, nil);
+	CHECK(body != nil, "serialised after trim + append");
+	CHECKCONTAINS(body, "gamma",   "turn 2 present");
+	CHECKCONTAINS(body, "epsilon", "appended message present");
+	CHECK(strstr(body, "alpha") == nil, "turn 1 absent");
+	free(body);
+	antreqfree(req);
+}
+
 /* ── Part 3: Live integration tests ─────────────────────────────────── */
 
 static void
@@ -754,6 +936,16 @@ threadmain(int argc, char *argv[])
 	print("=== Part 2: delta parser fixture tests ===\n");
 	test_delta_text();
 	test_delta_tool();
+
+	print("=== Part 2.5: antreqctxtokens and antreqtrim ===\n");
+	test_ant_ctxtokens_empty();
+	test_ant_ctxtokens_counts_text();
+	test_ant_ctxtokens_counts_tool_input();
+	test_ant_trim_zero_noop();
+	test_ant_trim_one_turn();
+	test_ant_trim_with_tool_turn();
+	test_ant_trim_all();
+	test_ant_trim_msgtail_updated();
 
 	if(sockpath != nil && tokpath != nil) {
 		print("=== Part 3: live integration tests ===\n");

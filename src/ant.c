@@ -190,6 +190,21 @@ antreqaddmsg(ANTReq *req, ANTMsg *msg)
 	}
 }
 
+long
+antreqctxtokens(ANTReq *req)
+{
+	ANTMsg   *m;
+	ANTBlock *b;
+	long      chars = 0;
+
+	for(m = req->msgs; m != nil; m = m->next)
+		for(b = m->content; b != nil; b = b->next) {
+			if(b->text       != nil) chars += strlen(b->text);
+			if(b->tool_input != nil) chars += strlen(b->tool_input);
+		}
+	return (chars + 3) / 4;  /* ceil(chars/4) */
+}
+
 static void
 blockfree(ANTBlock *b)
 {
@@ -224,6 +239,62 @@ antreqfree(ANTReq *req)
 		msgfree(m);
 	}
 	free(req);
+}
+
+int
+antreqtrim(ANTReq *req, int nturns)
+{
+	ANTMsg   *m, *next;
+	ANTBlock *b;
+	int       turns, removed, is_toolresult;
+
+	if(nturns <= 0 || req->msgs == nil)
+		return 0;
+
+	/*
+	 * Walk forward counting turn-starting user messages.
+	 *
+	 * In the Anthropic wire format, tool results are sent as a user
+	 * message containing only ANTBlockToolResult blocks.  These must
+	 * NOT be counted as turn boundaries — they are the tail of the
+	 * preceding assistant/tool turn, not the start of a new one.
+	 *
+	 * We count a user message as a turn start only if it contains
+	 * at least one non-ANTBlockToolResult block (i.e. it has real
+	 * user text).
+	 */
+	turns = 0;
+	m = req->msgs;
+	while(m != nil) {
+		if(m->role == ANTRoleUser) {
+			/* check whether this is a pure tool-result message */
+			is_toolresult = 1;
+			for(b = m->content; b != nil; b = b->next)
+				if(b->type != ANTBlockToolResult) {
+					is_toolresult = 0;
+					break;
+				}
+			if(!is_toolresult) {
+				if(turns == nturns)
+					break;   /* m is the first message to keep */
+				turns++;
+			}
+		}
+		m = m->next;
+	}
+
+	removed = 0;
+	next = req->msgs;
+	while(next != m) {
+		ANTMsg *cur = next;
+		next = cur->next;
+		msgfree(cur);
+		removed++;
+	}
+	req->msgs = m;
+	if(m == nil)
+		req->msgtail = nil;
+	return removed;
 }
 
 /* ── JSON serialisation ────────────────────────────────────────────────── */

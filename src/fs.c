@@ -28,7 +28,7 @@
  * ── /ctl ──────────────────────────────────────────────────────────────
  *
  * Read: "model <id>\nstatus <s>\nsession <uuid>\n"
- * Write: "abort", "clear", "model <id>"
+ * Write: "abort", "clear", "model <id>", "trim <n>"
  *
  * ── /status ───────────────────────────────────────────────────────────
  *
@@ -137,15 +137,16 @@ enum {
 	Qstatus      = 6,
 	Qmodel       = 7,
 	Qmodels      = 8,
-	Qsession     = 9,   /* session/ dir */
-	Qsession_id  = 10,
-	Qsession_new = 11,
-	Qsession_load= 12,
-	Qsession_save= 13,
-	Qauth        = 14,  /* auth/ dir */
-	Qauth_status = 15,
-	Qauth_device = 16,
-	Qauth_poll   = 17,
+	Qcontext     = 9,   /* context token estimate */
+	Qsession     = 10,  /* session/ dir */
+	Qsession_id  = 11,
+	Qsession_new = 12,
+	Qsession_load= 13,
+	Qsession_save= 14,
+	Qauth        = 15,  /* auth/ dir */
+	Qauth_status = 16,
+	Qauth_device = 17,
+	Qauth_poll   = 18,
 	NQID,
 };
 
@@ -168,6 +169,7 @@ static FileEntry filetab[] = {
 	{"status",      Qstatus,       0444},
 	{"model",       Qmodel,        0600},
 	{"models",      Qmodels,       0444},
+	{"context",     Qcontext,      0444},
 	{"session",     Qsession,      DMDIR|0555},
 	{"auth",        Qauth,         DMDIR|0555},
 	{nil, 0, 0},
@@ -373,6 +375,7 @@ fsopen(Req *r)
 	case Qevent:
 	case Qstatus:
 	case Qmodels:
+	case Qcontext:
 	case Qsession_id:
 	case Qauth_status:
 	case Qauth_device:
@@ -450,6 +453,46 @@ fsread(Req *r)
 		readstr(r, buf);
 		respond(r, nil);
 		return;
+
+	case Qcontext: {
+		/*
+		 * Estimate context token usage for the current session.
+		 * Uses the chars/4 heuristic — a conservative over-estimate
+		 * that requires no tokeniser.
+		 *
+		 * Output format (two lines):
+		 *   tokens ~<est> / <limit>k
+		 *   messages <count>
+		 *
+		 * <limit>k is the model's context window from the Model struct,
+		 * or 0 if the model has not been looked up yet.
+		 * <count> is the number of messages in the history list.
+		 */
+		long   est;
+		int    nmsg, fmt;
+		OAIMsg *om;
+		ANTMsg *am;
+
+		qlock(&g->lk);
+		fmt  = g->fmt;
+		est  = 0;
+		nmsg = 0;
+		if(fmt == Fmt_Ant) {
+			est  = antreqctxtokens(g->antreq);
+			for(am = g->antreq->msgs; am != nil; am = am->next)
+				nmsg++;
+		} else {
+			est  = oaireqctxtokens(g->oaireq);
+			for(om = g->oaireq->msgs; om != nil; om = om->next)
+				nmsg++;
+		}
+		qunlock(&g->lk);
+
+		snprint(buf, sizeof buf, "tokens ~%ld\nmessages %d\n", est, nmsg);
+		readstr(r, buf);
+		respond(r, nil);
+		return;
+	}
 
 	case Qctl: {
 		char uuid[37];
@@ -733,6 +776,34 @@ fswrite(Req *r)
 			}
 			/* infer wire format from model id */
 			g->fmt = (strncmp(nm, "claude-", 7) == 0) ? Fmt_Ant : Fmt_Oai;
+			qunlock(&g->lk);
+			r->ofcall.count = r->ifcall.count;
+			respond(r, nil);
+		} else if(strncmp(cmd, "trim ", 5) == 0) {
+			char *end;
+			long  n;
+			int   removed;
+
+			n = strtol(cmd + 5, &end, 10);
+			if(end == cmd + 5 || n < 1) {
+				respond(r, "trim: expected positive integer");
+				return;
+			}
+			qlock(&g->lk);
+			if(g->busy) {
+				qunlock(&g->lk);
+				respond(r, "trim: agent is busy");
+				return;
+			}
+			if(g->fmt == Fmt_Ant)
+				removed = antreqtrim(g->antreq, (int)n);
+			else
+				removed = oaireqtrim(g->oaireq, (int)n);
+			/* record the trim in the session file for replay */
+			if(removed > 0 && g->sess_bio != nil) {
+				Bprint(g->sess_bio, "trim\x1f%d\x1e", (int)n);
+				Bflush(g->sess_bio);
+			}
 			qunlock(&g->lk);
 			r->ofcall.count = r->ifcall.count;
 			respond(r, nil);
@@ -1277,15 +1348,16 @@ agentproc(void *v)
 		/* build AgentCfg pointing at global state */
 		memset(&cfg, 0, sizeof cfg);
 		qlock(&g->lk);
-		cfg.model    = strdup(g->model);
-		cfg.sockpath = g->sockpath ? strdup(g->sockpath) : nil;
-		cfg.tokpath  = strdup(g->tokpath);
-		cfg.system   = strdup((char*)defaultsystem);
+		cfg.model     = strdup(g->model);
+		cfg.sockpath  = g->sockpath ? strdup(g->sockpath) : nil;
+		cfg.tokpath   = strdup(g->tokpath);
+		cfg.system    = strdup((char*)defaultsystem);
 		memmove(cfg.uuid, g->uuid, 37);
-		cfg.sess_bio = g->sess_bio;
-		cfg.ontext   = agent_ontext;
-		cfg.onevent  = agent_onevent;
-		cfg.aux      = nil;
+		cfg.sess_bio  = g->sess_bio;
+		cfg.ontext    = agent_ontext;
+		cfg.onevent   = agent_onevent;
+		cfg.aux       = nil;
+		cfg.abortchan = g->abortchan;
 		qunlock(&g->lk);
 
 		int rc;

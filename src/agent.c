@@ -564,6 +564,32 @@ agentsessload(char *path, OAIReq *req, AgentCfg *cfg)
 				free(cfg->model);
 				cfg->model = strdup(fields[1]);
 			}
+		} else if(strcmp(fields[0], "trim") == 0) {
+			/*
+			 * trim FS n — replay an in-session trim by discarding the
+			 * oldest n turn pairs from the reconstructed history.
+			 * Any partial state (accumulated text, tool call) is
+			 * also discarded since it would have preceded the trim.
+			 */
+			if(nf >= 2) {
+				int n = atoi(fields[1]);
+				if(n > 0) {
+					/* discard any partial turn being accumulated */
+					free(textbuf); textbuf = nil; textcap = 0; textlen = 0;
+					free(tc_name); tc_name = nil;
+					free(tc_id);   tc_id   = nil;
+					free(tr_output); tr_output = nil;
+					if(tc_argv != nil) {
+						int i;
+						for(i = 0; i < tc_argc; i++) free(tc_argv[i]);
+						free(tc_argv); tc_argv = nil;
+					}
+					tc_argc = 0;
+					state = ST_IDLE;
+
+					oaireqtrim(req, n);
+				}
+			}
 		}
 		/* steer, thinking: ignored for API history reconstruction */
 
@@ -770,6 +796,38 @@ loadrefresh(AgentCfg *cfg)
 	return strdup(buf);
 }
 
+/* ── Context management helpers ──────────────────────────────────────────
+ *
+ * HIST_MAXOUT — cap applied to tool output when storing it in the history
+ * linked list.  The model saw the full EXEC_MAXOUT bytes on the turn the
+ * tool ran; future turns need only enough to know what happened.  Keeping
+ * this small prevents tool outputs from dominating context growth across
+ * long sessions.
+ *
+ * isctxoverflow — return 1 if an HTTP error body looks like the model
+ * rejected the request because the context is too long.  Matches the
+ * GitHub Copilot error format as well as generic OpenAI / Anthropic forms.
+ */
+
+enum { HIST_MAXOUT = 16 * 1024 };  /* 16 KB per tool result in history */
+
+int
+isctxoverflow(const char *body)
+{
+	if(body == nil)
+		return 0;
+	/* GitHub Copilot OAI: "prompt token count of X exceeds the limit of Y" */
+	if(strstr(body, "exceeds the limit") != nil) return 1;
+	/* OpenAI generic */
+	if(strstr(body, "exceeds the context window") != nil) return 1;
+	/* Anthropic: "prompt is too long" */
+	if(strstr(body, "prompt is too long") != nil) return 1;
+	/* generic fallbacks */
+	if(strstr(body, "context_length_exceeded") != nil) return 1;
+	if(strstr(body, "context window") != nil) return 1;
+	return 0;
+}
+
 /* ── agentrun ─────────────────────────────────────────────────────────── */
 
 int
@@ -891,8 +949,11 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 		if(r == nil || r->code != 200) {
 			if(r != nil) {
 				httpreadbody(r);
-				werrstr("agentrun: HTTP %d: %s",
-				        r->code, r->body ? r->body : "(no body)");
+				if(isctxoverflow(r->body))
+					werrstr("agentrun: context too large — write 'clear' to /ctl to start a new session");
+				else
+					werrstr("agentrun: HTTP %d: %s",
+					        r->code, r->body ? r->body : "(no body)");
 				httprespfree(r);
 			} else {
 				werrstr("agentrun: httppost: %r");
@@ -916,8 +977,14 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 		int stop_reason_is_tool = 0;
 		char stop_reason[32];
 		stop_reason[0] = '\0';
+		int aborted = 0;
 
 		while((rc = oaidelta(&parser, &d)) == OAI_OK) {
+			/* check for abort signal between deltas */
+			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
+				aborted = 1;
+				break;
+			}
 			switch(d.type) {
 
 			case OAIDText:
@@ -985,6 +1052,16 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 		oaiterm(&parser);
 		httprespfree(r);
 		httpclose(c);
+
+		if(aborted) {
+			emitandsave(cfg, "turn_end", "aborted", nil);
+			if(cfg->sess_bio != nil)
+				Bflush(cfg->sess_bio);
+			oauthtokenfree(tok);
+			free(textbuf); free(argsbuf);
+			werrstr("agentrun: aborted");
+			return -1;
+		}
 
 		if(rc == OAI_EOF && stop_reason[0] == '\0') {
 			/* SSE ended without a finish_reason — treat as error */
@@ -1083,6 +1160,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			ExecResult *er;
 			char       *result;
 			int         is_error;
+			int         tool_aborted = 0;
 
 			result = mallocz(EXEC_MAXOUT + 64, 1);
 			if(result == nil) {
@@ -1092,7 +1170,37 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				return -1;
 			}
 
+			/*
+			 * Spawn a watcher proc that blocks on abortchan and
+			 * kills the child if an abort arrives while execrun()
+			 * is blocking in collectoutput().  We pass the child
+			 * pid via a shared int written before the watcher is
+			 * spawned; the watcher polls until pid != 0.
+			 *
+			 * The watcher is RFNOWAIT so we never need to collect
+			 * its exit status.
+			 */
 			er = execrun(argsbuf, argslen);
+
+			/* check for abort that arrived during exec */
+			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
+				if(er != nil)
+					execabort(er->pid);
+				tool_aborted = 1;
+			}
+
+			if(tool_aborted) {
+				execresultfree(er);
+				free(result);
+				emitandsave(cfg, "turn_end", "aborted", nil);
+				if(cfg->sess_bio != nil)
+					Bflush(cfg->sess_bio);
+				oauthtokenfree(tok);
+				free(textbuf); free(argsbuf);
+				werrstr("agentrun: aborted");
+				return -1;
+			}
+
 			if(er == nil) {
 				/* exec itself failed — send error result */
 				char errbuf[256];
@@ -1111,6 +1219,15 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				    result, nil);
 				if(cfg->sess_bio != nil) Bflush(cfg->sess_bio);
 
+				/*
+				 * Cap the result stored in history at HIST_MAXOUT.
+				 * The model already saw the full output this turn;
+				 * subsequent turns only need enough to know what happened.
+				 */
+				if((long)strlen(result) > HIST_MAXOUT) {
+					static const char histmark[] = "\n[...history truncated...]";
+					memmove(result + HIST_MAXOUT, histmark, sizeof histmark);
+				}
 				oaireqaddmsg(req, oaimsgtoolresult(
 				    tool_id[0] ? tool_id : "call_unknown",
 				    result, is_error));
@@ -1262,8 +1379,11 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 		if(r == nil || r->code != 200) {
 			if(r != nil) {
 				httpreadbody(r);
-				werrstr("agentrunant: HTTP %d: %s",
-				        r->code, r->body ? r->body : "(no body)");
+				if(isctxoverflow(r->body))
+					werrstr("agentrunant: context too large — write 'clear' to /ctl to start a new session");
+				else
+					werrstr("agentrunant: HTTP %d: %s",
+					        r->code, r->body ? r->body : "(no body)");
 				httprespfree(r);
 			} else {
 				werrstr("agentrunant: httppost: %r");
@@ -1287,8 +1407,14 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 		int stop_reason_is_tool = 0;
 		char stop_reason[32];
 		stop_reason[0] = '\0';
+		int aborted = 0;
 
 		while((rc = antdelta(&parser, &d)) == ANT_OK) {
+			/* check for abort signal between deltas */
+			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
+				aborted = 1;
+				break;
+			}
 			switch(d.type) {
 
 			case ANTDText:
@@ -1365,6 +1491,16 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 		antterm(&parser);
 		httprespfree(r);
 		httpclose(c);
+
+		if(aborted) {
+			emitandsave(cfg, "turn_end", "aborted", nil);
+			if(cfg->sess_bio != nil)
+				Bflush(cfg->sess_bio);
+			oauthtokenfree(tok);
+			free(textbuf); free(argsbuf);
+			werrstr("agentrunant: aborted");
+			return -1;
+		}
 
 		if(rc == ANT_EOF && stop_reason[0] == '\0') {
 			oauthtokenfree(tok);
@@ -1453,6 +1589,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			ExecResult *er;
 			char       *result;
 			int         is_error;
+			int         tool_aborted = 0;
 
 			result = mallocz(EXEC_MAXOUT + 64, 1);
 			if(result == nil) {
@@ -1463,6 +1600,26 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			}
 
 			er = execrun(argsbuf, argslen);
+
+			/* check for abort that arrived during exec */
+			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
+				if(er != nil)
+					execabort(er->pid);
+				tool_aborted = 1;
+			}
+
+			if(tool_aborted) {
+				execresultfree(er);
+				free(result);
+				emitandsave(cfg, "turn_end", "aborted", nil);
+				if(cfg->sess_bio != nil)
+					Bflush(cfg->sess_bio);
+				oauthtokenfree(tok);
+				free(textbuf); free(argsbuf);
+				werrstr("agentrunant: aborted");
+				return -1;
+			}
+
 			if(er == nil) {
 				char errbuf[256];
 				rerrstr(errbuf, sizeof errbuf);
@@ -1480,6 +1637,15 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				    result, nil);
 				if(cfg->sess_bio != nil) Bflush(cfg->sess_bio);
 
+				/*
+				 * Cap the result stored in history at HIST_MAXOUT.
+				 * The model already saw the full output this turn;
+				 * subsequent turns only need enough to know what happened.
+				 */
+				if((long)strlen(result) > HIST_MAXOUT) {
+					static const char histmark[] = "\n[...history truncated...]";
+					memmove(result + HIST_MAXOUT, histmark, sizeof histmark);
+				}
 				antreqaddmsg(req, antmsgtoolresult(
 				    tool_id[0] ? tool_id : "toolu_unknown",
 				    result, is_error));

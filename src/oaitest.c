@@ -527,6 +527,199 @@ test_delta_tool_fixture(void)
 	resp_free(resp);
 }
 
+/* ── Part 1.5: oaireqctxtokens and oaireqtrim ────────────────────────── */
+
+static void
+test_ctxtokens_empty(void)
+{
+	OAIReq *req;
+
+	print("\n-- 1.5 oaireqctxtokens: empty req → 0\n");
+
+	req = oaireqnew("gpt-4o");
+	CHECKEQ(oaireqctxtokens(req), 0, "empty req has 0 tokens");
+	oaireqfree(req);
+}
+
+static void
+test_ctxtokens_counts_text(void)
+{
+	OAIReq *req;
+	long    est;
+
+	print("\n-- 1.5 oaireqctxtokens: 8-char user message → 2 tokens\n");
+
+	req = oaireqnew("gpt-4o");
+	oaireqaddmsg(req, oaimsguser("12345678"));  /* exactly 8 chars */
+	est = oaireqctxtokens(req);
+	CHECKEQ(est, 2, "8 chars / 4 = 2 tokens");
+	oaireqfree(req);
+}
+
+static void
+test_ctxtokens_counts_tool_args(void)
+{
+	OAIReq *req;
+	long    est;
+
+	print("\n-- 1.5 oaireqctxtokens: tool args counted\n");
+
+	req = oaireqnew("gpt-4o");
+	oaireqaddmsg(req, oaimsguser("go"));
+	/* tool call with 8-char args */
+	oaireqaddmsg(req, oaimsgtoolcall("", "call_x", "exec", "12345678"));
+	est = oaireqctxtokens(req);
+	/* "go" = 2 chars + "12345678" = 8 chars → 10 chars → ceil(10/4) = 3 */
+	CHECKEQ(est, 3, "user text + tool_args counted: ceil(10/4)=3");
+	oaireqfree(req);
+}
+
+static void
+test_trim_zero_noop(void)
+{
+	OAIReq *req;
+	int     removed;
+
+	print("\n-- 1.5 oaireqtrim: trim 0 is no-op\n");
+
+	req = oaireqnew("gpt-4o");
+	oaireqaddmsg(req, oaimsguser("hello"));
+	oaireqaddmsg(req, oaimsgassistant("world"));
+	removed = oaireqtrim(req, 0);
+	CHECKEQ(removed, 0,          "trim 0 removed 0 messages");
+	CHECK(req->msgs != nil,      "list non-empty after trim 0");
+	oaireqfree(req);
+}
+
+static void
+test_trim_one_turn(void)
+{
+	OAIReq *req;
+	int     removed;
+
+	print("\n-- 1.5 oaireqtrim: trim 1 removes first user+assistant pair\n");
+
+	req = oaireqnew("gpt-4o");
+	/* turn 1 */
+	oaireqaddmsg(req, oaimsguser("first question"));
+	oaireqaddmsg(req, oaimsgassistant("first answer"));
+	/* turn 2 */
+	oaireqaddmsg(req, oaimsguser("second question"));
+	oaireqaddmsg(req, oaimsgassistant("second answer"));
+
+	removed = oaireqtrim(req, 1);
+
+	CHECK(removed > 0, "trim 1 removed messages");
+	/* first user message of turn 2 must now be the head */
+	CHECK(req->msgs != nil, "list non-empty after trim");
+	CHECKEQ(req->msgs->role, OAIRoleUser, "head is user message");
+	{
+		/* verify the content is the second turn's user message */
+		char *body = oaireqjson(req, nil, nil);
+		CHECK(body != nil, "serialised after trim");
+		CHECKCONTAINS(body, "second question", "second turn still present");
+		CHECK(strstr(body, "first question") == nil,
+		      "first turn no longer in JSON");
+		free(body);
+	}
+	oaireqfree(req);
+}
+
+static void
+test_trim_with_tool_turn(void)
+{
+	OAIReq *req;
+	int     removed;
+
+	print("\n-- 1.5 oaireqtrim: trim 1 removes turn that contains a tool call\n");
+
+	req = oaireqnew("gpt-4o");
+	/* turn 1: user → assistant tool call → tool result */
+	oaireqaddmsg(req, oaimsguser("list files"));
+	oaireqaddmsg(req, oaimsgtoolcall("", "call_1", "exec", "{\"argv\":[\"ls\"]}"));
+	oaireqaddmsg(req, oaimsgtoolresult("call_1", "file1\nfile2\n", 0));
+	/* turn 2: plain exchange */
+	oaireqaddmsg(req, oaimsguser("what did you find?"));
+	oaireqaddmsg(req, oaimsgassistant("two files"));
+
+	removed = oaireqtrim(req, 1);
+
+	CHECK(removed >= 3, "at least 3 messages removed (user+toolcall+toolresult)");
+	{
+		char *body = oaireqjson(req, nil, nil);
+		CHECK(body != nil, "serialised after trim");
+		CHECKCONTAINS(body, "what did you find?", "turn 2 still present");
+		CHECK(strstr(body, "list files") == nil, "turn 1 user gone");
+		CHECK(strstr(body, "file1") == nil,      "turn 1 tool result gone");
+		free(body);
+	}
+	oaireqfree(req);
+}
+
+static void
+test_trim_all(void)
+{
+	OAIReq *req;
+	int     removed;
+
+	print("\n-- 1.5 oaireqtrim: trim N > actual turns removes everything\n");
+
+	req = oaireqnew("gpt-4o");
+	oaireqaddmsg(req, oaimsguser("only question"));
+	oaireqaddmsg(req, oaimsgassistant("only answer"));
+
+	removed = oaireqtrim(req, 99);
+
+	CHECK(removed > 0,           "messages were removed");
+	CHECKNIL(req->msgs,          "msgs is nil after trimming all");
+	CHECKNIL(req->msgtail,       "msgtail is nil after trimming all");
+	oaireqfree(req);
+}
+
+static void
+test_trim_msgtail_updated(void)
+{
+	OAIReq *req;
+	char   *body;
+
+	print("\n-- 1.5 oaireqtrim: msgtail updated; append after trim works\n");
+
+	req = oaireqnew("gpt-4o");
+	/* turn 1 */
+	oaireqaddmsg(req, oaimsguser("alpha"));
+	oaireqaddmsg(req, oaimsgassistant("beta"));
+	/* turn 2 */
+	oaireqaddmsg(req, oaimsguser("gamma"));
+	oaireqaddmsg(req, oaimsgassistant("delta"));
+
+	oaireqtrim(req, 1);
+
+	/* append a new message — this crashes if msgtail is stale */
+	oaireqaddmsg(req, oaimsguser("epsilon"));
+
+	body = oaireqjson(req, nil, nil);
+	CHECK(body != nil, "serialised after trim + append");
+	CHECKCONTAINS(body, "gamma",   "turn 2 present");
+	CHECKCONTAINS(body, "epsilon", "appended message present");
+	CHECK(strstr(body, "alpha") == nil, "turn 1 absent");
+	free(body);
+	oaireqfree(req);
+}
+
+static void
+test_trim_empty_noop(void)
+{
+	OAIReq *req;
+	int     removed;
+
+	print("\n-- 1.5 oaireqtrim: trim on empty req → 0\n");
+
+	req = oaireqnew("gpt-4o");
+	removed = oaireqtrim(req, 1);
+	CHECKEQ(removed, 0, "trim on empty req removes 0");
+	oaireqfree(req);
+}
+
 /* ── Part 2: Live integration tests ───────────────────────────────────── */
 
 static void
@@ -775,6 +968,17 @@ threadmain(int argc, char *argv[])
 	test_hdrs_agent_initiator();
 	test_delta_text_fixture();
 	test_delta_tool_fixture();
+
+	print("\n=== Part 1.5: oaireqctxtokens and oaireqtrim ===\n");
+	test_ctxtokens_empty();
+	test_ctxtokens_counts_text();
+	test_ctxtokens_counts_tool_args();
+	test_trim_zero_noop();
+	test_trim_one_turn();
+	test_trim_with_tool_turn();
+	test_trim_all();
+	test_trim_msgtail_updated();
+	test_trim_empty_noop();
 
 	if(sockpath != nil && tokpath != nil) {
 		print("\n=== Part 2: live integration tests ===\n");
