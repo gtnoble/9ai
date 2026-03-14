@@ -8,9 +8,9 @@
  * 9P service (posted in $NAMESPACE as "9ai") and to acme's 9P service.
  *
  * Tag commands:
- *   Send     — send the last paragraph as a prompt
+ *   Send     — send the selection, or last paragraph if nothing is selected
  *   Stop     — abort the current turn (writes "abort" to 9ai/ctl)
- *   Steer    — redirect the running turn with the last paragraph
+ *   Steer    — redirect the running turn with the selection, or last paragraph
  *   New      — start a fresh session (writes to 9ai/session/new)
  *   Clear    — clear the in-memory history (writes "clear" to 9ai/ctl)
  *   Models   — open a model picker window (button-3 to switch)
@@ -542,16 +542,84 @@ outproc(void *v)
 /* ── Prompt text extraction ─────────────────────────────────────────── */
 
 /*
+ * winrdsel — read the current dot (selection) from the window.
+ * Opens <id>/rdsel, which acme snapshots atomically at open-time.
+ * Returns a malloc'd, NUL-terminated, whitespace-trimmed string,
+ * or nil if the selection is empty or unavailable.
+ * Caller must free.
+ */
+static char *
+winrdsel(Win *w)
+{
+	char  path[64];
+	CFid *f;
+	char *buf;
+	int   n, na, m;
+	char *s, *e;
+
+	snprint(path, sizeof path, "%d/rdsel", w->id);
+	f = fsopen(acmefs, path, OREAD);
+	if(f == nil)
+		return nil;
+
+	buf = nil;
+	na  = 0;
+	n   = 0;
+	for(;;) {
+		if(na < n + 512) {
+			na += 4096;
+			buf = realloc(buf, na + 1);
+		}
+		m = fsread(f, buf + n, na - n);
+		if(m <= 0)
+			break;
+		n += m;
+	}
+	fsclose(f);
+
+	if(buf == nil || n == 0) {
+		free(buf);
+		return nil;
+	}
+	buf[n] = '\0';
+
+	/* trim leading whitespace */
+	s = buf;
+	while(*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
+		s++;
+	/* trim trailing whitespace */
+	e = buf + n;
+	while(e > s && (*(e-1) == ' ' || *(e-1) == '\t' || *(e-1) == '\n' || *(e-1) == '\r'))
+		e--;
+
+	if(e <= s) {
+		free(buf);
+		return nil;
+	}
+
+	*e = '\0';
+	if(s > buf)
+		memmove(buf, s, e - s + 1);
+	return buf;
+}
+
+/*
  * prompttext — extract the text the user wants to send.
- * Reads the window body and delegates to prompttext_body.
+ * First tries the current selection via rdsel; if empty, falls back
+ * to reading the whole body and finding the last paragraph.
  * Returns a malloc'd nul-terminated string, or nil if nothing useful.
  */
 static char *
 prompttext(Win *w)
 {
+	char *sel;
 	char *body;
 	int   bodylen;
 	char *result;
+
+	sel = winrdsel(w);
+	if(sel != nil)
+		return sel;
 
 	body = winbody(w, &bodylen);
 	if(body == nil)
@@ -560,6 +628,7 @@ prompttext(Win *w)
 	free(body);
 	return result;
 }
+
 
 /* ── Tag command implementations ────────────────────────────────────── */
 
