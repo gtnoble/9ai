@@ -239,13 +239,15 @@ execparse(const char *args_json, int args_len,
 	/* find "argv" array */
 	argv_i = jsonget(args_json, toks, ntoks, 0, "argv");
 	if(argv_i < 0 || toks[argv_i].type != JSMN_ARRAY) {
-		werrstr("exec: missing or non-array 'argv'");
+		werrstr("exec: tool call is missing the required 'argv' field. "
+		        "Expected: {\"argv\":[\"program\",\"arg1\",...],\"stdin\":\"optional\"}");
 		free(toks); free(buf);
 		return -1;
 	}
 	argc = toks[argv_i].size;
 	if(argc <= 0) {
-		werrstr("exec: empty argv");
+		werrstr("exec: 'argv' must be a non-empty array. "
+		        "Expected: {\"argv\":[\"program\",\"arg1\",...],\"stdin\":\"optional\"}");
 		free(toks); free(buf);
 		return -1;
 	}

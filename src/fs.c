@@ -1319,6 +1319,9 @@ agentproc(void *v)
 		g->busy = 1;
 		g->errmsg[0] = '\0';
 		qunlock(&g->lk);
+		/* drain any stale abort signals queued while agent was idle */
+		while(nbrecvp(g->abortchan) != nil)
+			;
 
 		/* open session if not already open */
 		qlock(&g->lk);

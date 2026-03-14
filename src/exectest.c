@@ -178,6 +178,13 @@ test_parse_empty_argv(void)
 	argc = execparse(js, strlen(js), argv, 16, &sin);
 	CHECKEQ(argc, -1, "empty argv returns -1");
 	CHECKNIL(sin,     "stdin not allocated on error");
+	{
+		char errbuf[256];
+		const char *ep = errbuf;
+		rerrstr(errbuf, sizeof errbuf);
+		CHECKCONTAINS(ep, "non-empty array", "empty argv: error mentions non-empty array");
+		CHECKCONTAINS(ep, "Expected:",       "empty argv: error shows expected schema");
+	}
 }
 
 static void
@@ -192,8 +199,15 @@ test_parse_missing_argv(void)
 	argc = execparse(js, strlen(js), argv, 16, &sin);
 	CHECKEQ(argc, -1, "missing argv returns -1");
 	CHECKNIL(sin,     "stdin not allocated on error");
-}
+	{
+		char errbuf[256];
+		const char *ep = errbuf;
+		rerrstr(errbuf, sizeof errbuf);
+		CHECKCONTAINS(ep, "missing the required 'argv'", "missing argv: error identifies missing field");
+		CHECKCONTAINS(ep, "Expected:",                   "missing argv: error shows expected schema");
+	}
 
+}
 static void
 test_parse_nonstring_argv(void)
 {
