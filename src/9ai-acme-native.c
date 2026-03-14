@@ -259,7 +259,6 @@ setstatus(char *state)
 	char buf[256];
 	char modstr[144];
 	char sesstr[16];
-	int  afd, dfd;
 
 	qlock(&statelk);
 	if(curmodel[0])
@@ -273,17 +272,8 @@ setstatus(char *state)
 	qunlock(&statelk);
 
 	snprint(buf, sizeof buf, "● %s%s%s\n", state, modstr, sesstr);
-
-	afd = acmeopen(mainwin->id, "addr", OWRITE);
-	dfd = acmeopen(mainwin->id, "data", ORDWR);
-	if(afd >= 0 && dfd >= 0) {
-		write(afd, "1", 1);
-		write(dfd, buf, strlen(buf));
-	}
-	if(afd >= 0) close(afd);
-	if(dfd >= 0) close(dfd);
+	winappend(mainwin, buf, -1);
 }
-
 /* ── 9ai file access ────────────────────────────────────────────────── */
 
 static int
@@ -629,11 +619,11 @@ cmd_clear(void)
 		return;
 	}
 
-	/* erase body lines 2..$ */
+	/* erase body */
 	afd = acmeopen(mainwin->id, "addr", OWRITE);
 	dfd = acmeopen(mainwin->id, "data", ORDWR);
 	if(afd >= 0 && dfd >= 0) {
-		write(afd, "2,$", 3);
+		write(afd, "1,$", 3);
 		write(dfd, "", 0);
 	}
 	if(afd >= 0) close(afd);
@@ -986,7 +976,6 @@ threadmain(int argc, char *argv[])
 	snprint(winname, sizeof winname, "%s/+9ai", cwd);
 
 	mainwin = newwin(winname);
-	acmewrite(mainwin->id, "body", "● ready\n", -1);
 	acmewrite(mainwin->id, "ctl", "clean\n", -1);
 
 	proccreate(aiproc,  nil, STACK);

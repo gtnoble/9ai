@@ -280,23 +280,7 @@ setstatus(char *state)
 	qunlock(&statelk);
 
 	snprint(buf, sizeof buf, "● %s%s%s\n", state, modstr, sesstr);
-
-	/* replace line 1 */
-	qlock(&winlk);
-	if(mainwin->addr == nil) {
-		char p[64];
-		snprint(p, sizeof p, "%d/addr", mainwin->id);
-		mainwin->addr = fsopen(acmefs, p, OWRITE);
-	}
-	if(mainwin->data == nil) {
-		char p[64];
-		snprint(p, sizeof p, "%d/data", mainwin->id);
-		mainwin->data = fsopen(acmefs, p, ORDWR);
-	}
-	/* address line 1 and replace */
-	fswrite(mainwin->addr, "1", 1);
-	fswrite(mainwin->data, buf, strlen(buf));
-	qunlock(&winlk);
+	winappend(mainwin, buf, -1);
 }
 
 /* ── 9ai service connection ─────────────────────────────────────────── */
@@ -741,7 +725,7 @@ cmd_clear(void)
 	fswrite(ctlfd, "clear\n", 6);
 	fsclose(ctlfd);
 
-	/* also clear the window body, keeping the status line */
+	/* clear the window body */
 	qlock(&winlk);
 	if(mainwin->addr == nil) {
 		char p[64];
@@ -753,10 +737,9 @@ cmd_clear(void)
 		snprint(p, sizeof p, "%d/data", mainwin->id);
 		mainwin->data = fsopen(acmefs, p, ORDWR);
 	}
-	fswrite(mainwin->addr, "2,$", 3);
+	fswrite(mainwin->addr, "1,$", 3);
 	fswrite(mainwin->data, "", 0);
 	qunlock(&winlk);
-
 	winclean(mainwin);
 	setstatus("ready");
 }
@@ -1262,9 +1245,7 @@ threadmain(int argc, char *argv[])
 	snprint(winname, sizeof winname, "%s/+9ai", cwd);
 
 	mainwin = newwin(winname);
-
 	/* write initial status line */
-	winappendstr(mainwin, "● ready\n");
 	setstatus("ready");
 
 	/* check auth status and show login prompt if needed */

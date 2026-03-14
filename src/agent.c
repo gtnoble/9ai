@@ -856,7 +856,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 	char  *argsbuf;
 	long   argscap, argslen;
 
-	enum { TEXTCAP_INIT = 8192, ARGSCAP_INIT = 8192, MAX_ITERATIONS = 32 };
+	enum { TEXTCAP_INIT = 8192, ARGSCAP_INIT = 8192 };
 
 	argscap = ARGSCAP_INIT;
 	argsbuf = mallocz(argscap + 1, 1);
@@ -900,7 +900,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 	textlen    = 0;
 
 	/* ── tool loop ── */
-	for(iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+	for(iteration = 0; ; iteration++) {
 
 		/* refresh token if near expiry */
 		if(iteration > 0 && time(0) > tok->expires_at - 300) {
@@ -1238,13 +1238,9 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 
 		/* loop: POST again with tool result in history */
 	}
-
-	/* hit MAX_ITERATIONS */
-	oauthtokenfree(tok);
-	free(textbuf); free(argsbuf);
-	werrstr("agentrun: exceeded %d tool iterations", MAX_ITERATIONS);
-	return -1;
+	return -1;	/* not reached */
 }
+
 
 /* ── agentrunant ──────────────────────────────────────────────────────────
  *
@@ -1287,7 +1283,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 	char  *argsbuf;
 	long   argscap, argslen;
 
-	enum { TEXTCAP_INIT = 8192, ARGSCAP_INIT = 8192, MAX_ITERATIONS = 32 };
+	enum { TEXTCAP_INIT = 8192, ARGSCAP_INIT = 8192 };
 
 	argscap = ARGSCAP_INIT;
 	argsbuf = mallocz(argscap + 1, 1);
@@ -1330,7 +1326,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 	textlen    = 0;
 
 	/* ── tool loop ── */
-	for(iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+	for(iteration = 0; ; iteration++) {
 
 		/* refresh token if near expiry */
 		if(iteration > 0 && time(0) > tok->expires_at - 300) {
@@ -1657,9 +1653,5 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 		/* loop: POST again with tool result in history */
 	}
 
-	/* hit MAX_ITERATIONS */
-	oauthtokenfree(tok);
-	free(textbuf); free(argsbuf);
-	werrstr("agentrunant: exceeded %d tool iterations", MAX_ITERATIONS);
-	return -1;
+	return -1;	/* not reached */
 }
