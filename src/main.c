@@ -28,7 +28,7 @@
 static void
 usage(void)
 {
-	fprint(2, "usage: 9ai [-m mtpt] [-s srvname] [-S sockpath] [-t tokpath] [-M model] [-L]\n");
+	fprint(2, "usage: 9ai -m mtpt [-s srvname] [-S sockpath] [-t tokpath] [-M model] [-L]\n");
 	threadexitsall("usage");
 }
 
@@ -36,7 +36,7 @@ void
 threadmain(int argc, char *argv[])
 {
 	char *mtpt    = nil;
-	char *srvname = "9ai";
+	char *srvname = nil;
 	char *sockpath = nil;
 	char *tokpath  = nil;
 	char *model    = "gpt-4o";

@@ -223,7 +223,13 @@ test_req_user_system(void)
 	CHECKCONTAINS(body, "\"model\":\"claude-sonnet-4.5\"", "model field");
 	CHECKCONTAINS(body, "\"stream\":true", "stream true");
 	CHECKCONTAINS(body, "\"max_tokens\":32000", "max_tokens 32000");
-	CHECKCONTAINS(body, "\"system\":\"you are helpful\"", "system prompt");
+	/* system must now be a block array, not a plain string */
+	CHECKCONTAINS(body, "\"system\":[", "system is array");
+	CHECKCONTAINS(body, "\"type\":\"text\"", "system block type text");
+	CHECKCONTAINS(body, "you are helpful", "system text present");
+	CHECKCONTAINS(body, "\"cache_control\":{\"type\":\"ephemeral\"}", "system has cache_control");
+	/* must NOT emit system as a bare string */
+	CHECK(strstr(body, "\"system\":\"") == nil, "system not bare string");
 	CHECKCONTAINS(body, "\"role\":\"user\"", "user role");
 	CHECKCONTAINS(body, "hello", "user text");
 	CHECKCONTAINS(body, "\"input_schema\"", "input_schema (not parameters)");
@@ -683,7 +689,200 @@ test_ant_trim_msgtail_updated(void)
 	antreqfree(req);
 }
 
-/* ── Part 3: Live integration tests ─────────────────────────────────── */
+/* ── Part 2.6: cache_control placement ──────────────────────────────── */
+
+static void
+test_cache_system_block_array(void)
+{
+	ANTReq *req;
+	char   *body;
+
+	print("-- 2.6 system prompt emitted as block array with cache_control\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("hi"));
+	body = antreqjson(req, "be helpful", nil);
+
+	CHECKNONIL(body, "body non-nil");
+	CHECKCONTAINS(body, "\"system\":[", "system is array");
+	CHECKCONTAINS(body, "\"type\":\"text\"", "system text block");
+	CHECKCONTAINS(body, "be helpful", "system text present");
+	CHECKCONTAINS(body, "\"cache_control\":{\"type\":\"ephemeral\"}", "system cache_control");
+	CHECK(strstr(body, "\"system\":\"") == nil, "system not bare string");
+
+	free(body);
+	antreqfree(req);
+}
+
+static void
+test_cache_no_system_omitted(void)
+{
+	ANTReq *req;
+	char   *body;
+
+	print("-- 2.6 nil system prompt → no system field at all\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("hi"));
+	body = antreqjson(req, nil, nil);
+
+	CHECKNONIL(body, "body non-nil");
+	CHECK(strstr(body, "\"system\"") == nil, "no system field");
+
+	free(body);
+	antreqfree(req);
+}
+
+static void
+test_cache_last_user_text(void)
+{
+	ANTReq *req;
+	char   *body;
+
+	print("-- 2.6 last user message gets cache_control; earlier ones do not\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("first question"));
+	antreqaddmsg(req, antmsgassistant("first answer"));
+	antreqaddmsg(req, antmsguser("second question"));
+	body = antreqjson(req, nil, nil);
+
+	CHECKNONIL(body, "body non-nil");
+	/* last user message must have cache_control */
+	CHECKCONTAINS(body, "\"cache_control\":{\"type\":\"ephemeral\"}", "cache_control present");
+	/* the second user message is emitted as a content array (block form) */
+	/* first user message is a plain string and must NOT have cache_control
+	 * attached (it appears before the assistant message, so it's not last) */
+	{
+		/*
+		 * Verify that exactly one cache_control appears in the messages[]
+		 * portion (there may also be one in the system block).
+		 * Strategy: count occurrences of "cache_control" in the body.
+		 * With a nil system prompt there is exactly one.
+		 */
+		int count = 0;
+		const char *p = body;
+		while((p = strstr(p, "\"cache_control\"")) != nil) {
+			count++;
+			p++;
+		}
+		CHECKEQ(count, 1, "exactly one cache_control in body (no system)");
+	}
+
+	free(body);
+	antreqfree(req);
+}
+
+static void
+test_cache_with_system_two_markers(void)
+{
+	ANTReq *req;
+	char   *body;
+	int     count;
+	const char *p;
+
+	print("-- 2.6 system + last user → two cache_control markers\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("hello"));
+	body = antreqjson(req, "be concise", nil);
+
+	CHECKNONIL(body, "body non-nil");
+
+	count = 0;
+	p = body;
+	while((p = strstr(p, "\"cache_control\"")) != nil) {
+		count++;
+		p++;
+	}
+	CHECKEQ(count, 2, "two cache_control markers: system + last user");
+
+	free(body);
+	antreqfree(req);
+}
+
+static void
+test_cache_tool_result_not_marked(void)
+{
+	ANTReq *req;
+	char   *body;
+	int     count;
+	const char *p;
+
+	print("-- 2.6 last message is tool_result → user text before it gets cache_control\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("list files"));
+	antreqaddmsg(req, antmsgtooluse(nil, "toolu_01", "exec",
+	    "{\"argv\":[\"ls\"]}"));
+	antreqaddmsg(req, antmsgtoolresult("toolu_01", "file1\nfile2\n", 0));
+	body = antreqjson(req, nil, nil);
+
+	CHECKNONIL(body, "body non-nil");
+
+	/*
+	 * The last message is a tool_result (user role, but pure tool_result
+	 * blocks).  The pre-pass must skip it and mark the "list files" user
+	 * message instead.
+	 *
+	 * With nil system prompt there should be exactly one cache_control.
+	 */
+	count = 0;
+	p = body;
+	while((p = strstr(p, "\"cache_control\"")) != nil) {
+		count++;
+		p++;
+	}
+	CHECKEQ(count, 1, "exactly one cache_control on the user text message");
+
+	/* the tool_result block itself must not have cache_control */
+	{
+		const char *tr = strstr(body, "\"type\":\"tool_result\"");
+		CHECK(tr != nil, "tool_result block present");
+		if(tr != nil) {
+			/* look for cache_control between tool_result and next '}' */
+			const char *end = strchr(tr, '}');
+			int found = 0;
+			if(end != nil) {
+				char tmp[256];
+				long n = end - tr;
+				if(n >= (long)sizeof tmp) n = sizeof tmp - 1;
+				memmove(tmp, tr, n);
+				tmp[n] = '\0';
+				found = (strstr(tmp, "cache_control") != nil);
+			}
+			CHECK(!found, "tool_result block has no cache_control");
+		}
+	}
+
+	free(body);
+	antreqfree(req);
+}
+
+static void
+test_cache_flag_cleared_after_call(void)
+{
+	ANTReq   *req;
+	ANTMsg   *m;
+	ANTBlock *blk;
+	char     *body;
+
+	print("-- 2.6 cache_control flag cleared on ANTBlock after antreqjson returns\n");
+
+	req = antreqnew("claude-sonnet-4.5");
+	antreqaddmsg(req, antmsguser("hello"));
+	body = antreqjson(req, nil, nil);
+	free(body);
+
+	/* verify no block has cache_control set after the call */
+	for(m = req->msgs; m != nil; m = m->next)
+		for(blk = m->content; blk != nil; blk = blk->next)
+			CHECKEQ(blk->cache_control, 0, "cache_control cleared post-call");
+
+	antreqfree(req);
+}
+
+
 
 static void
 test_live_text(char *sockpath, char *tokpath)
@@ -946,6 +1145,14 @@ threadmain(int argc, char *argv[])
 	test_ant_trim_with_tool_turn();
 	test_ant_trim_all();
 	test_ant_trim_msgtail_updated();
+
+	print("=== Part 2.6: cache_control placement ===\n");
+	test_cache_system_block_array();
+	test_cache_no_system_omitted();
+	test_cache_last_user_text();
+	test_cache_with_system_two_markers();
+	test_cache_tool_result_not_marked();
+	test_cache_flag_cleared_after_call();
 
 	if(sockpath != nil && tokpath != nil) {
 		print("=== Part 3: live integration tests ===\n");

@@ -89,13 +89,14 @@ typedef struct ANTMsg   ANTMsg;
 typedef struct ANTReq   ANTReq;
 
 struct ANTBlock {
-	int    type;       /* ANTBlock* constant */
-	char  *text;       /* ANTBlockText: content; ANTBlockThinking: thinking text;
-	                      ANTBlockToolResult: output */
-	char  *tool_id;    /* ANTBlockToolUse, ANTBlockToolResult */
-	char  *tool_name;  /* ANTBlockToolUse: function name */
-	char  *tool_input; /* ANTBlockToolUse: JSON input string */
-	int    is_error;   /* ANTBlockToolResult: 1 if exec failed */
+	int    type;          /* ANTBlock* constant */
+	char  *text;          /* ANTBlockText: content; ANTBlockThinking: thinking text;
+	                         ANTBlockToolResult: output */
+	char  *tool_id;       /* ANTBlockToolUse, ANTBlockToolResult */
+	char  *tool_name;     /* ANTBlockToolUse: function name */
+	char  *tool_input;    /* ANTBlockToolUse: JSON input string */
+	int    is_error;      /* ANTBlockToolResult: 1 if exec failed */
+	int    cache_control; /* 1 → emit cache_control:{"type":"ephemeral"} on this block */
 	ANTBlock *next;
 };
 
@@ -150,9 +151,15 @@ int       antreqtrim(ANTReq *req, int nturns);
  *
  * Produces the request body for POST /v1/messages.  Includes:
  *   - "model", "stream": true, "max_tokens": 32000
- *   - "system": system_prompt (top-level string; omitted if nil/empty)
- *   - all messages in req->msgs
+ *   - "system": block array with cache_control:{"type":"ephemeral"} on the
+ *     text block (omitted entirely if system_prompt is nil/empty)
+ *   - all messages in req->msgs; the last user text block gets
+ *     cache_control:{"type":"ephemeral"} to cache the conversation prefix
  *   - exec tool declaration (using "input_schema")
+ *
+ * The cache_control field on ANTBlock structs is set transiently during
+ * serialisation and cleared before the function returns; callers do not
+ * need to manage it.
  *
  * Returns nil on error.  Caller must free() the result.
  * Sets *lenp to the body length (not counting the NUL terminator).

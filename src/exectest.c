@@ -25,9 +25,9 @@
  *   3.2  exitcode 1  → output + "\nexited 1"
  *   3.3  empty output, exitcode 2 → "\nexited 2"
  *
- * Part 4: output truncation (EXEC_MAXOUT)
- *   4.1  Write exactly EXEC_MAXOUT bytes → not truncated, all present
- *   4.2  Write EXEC_MAXOUT+100 bytes → truncated, tail preserved,
+ * Part 4: output truncation
+ *   4.1  Write exactly TEST_CAP bytes → not truncated, all present
+ *   4.2  Write TEST_CAP+100 bytes → truncated, tail preserved,
  *        marker present
  */
 
@@ -108,7 +108,7 @@ static int failures = 0;
 static ExecResult *
 run(const char *json)
 {
-	return execrun(json, strlen(json));
+	return execrun(json, strlen(json), 512*1024);
 }
 
 /* ── Part 1: execparse ──────────────────────────────────────────────── */
@@ -380,10 +380,13 @@ test_resultstr_empty_output(void)
 /*
  * run_cat_stdin_n — run cat with exactly nbytes of 'x' as stdin.
  *
- * Builds the JSON on the heap since nbytes can be > EXEC_MAXOUT.
+ * Builds the JSON on the heap since nbytes can exceed the test cap.
  * The JSON is:  {"argv":["cat"],"stdin":"xxx..."}
  * The stdin value is nbytes 'x' characters (no JSON escaping needed).
  */
+
+enum { TEST_CAP = 64 * 1024 };  /* 64 KB cap used in truncation tests */
+
 static ExecResult *
 run_cat_stdin_n(long nbytes)
 {
@@ -401,7 +404,7 @@ run_cat_stdin_n(long nbytes)
 	p += nbytes;
 	p += sprint(p, "\"}");
 	*p = '\0';
-	r = execrun(json, (int)(p - json));
+	r = execrun(json, (int)(p - json), TEST_CAP);
 	free(json);
 	return r;
 }
@@ -410,14 +413,14 @@ static void
 test_truncation_exact(void)
 {
 	ExecResult *r;
-	long want = EXEC_MAXOUT;
+	long want = TEST_CAP;
 
-	print("\n-- 4.1 output exactly EXEC_MAXOUT bytes → not truncated\n");
+	print("\n-- 4.1 output exactly TEST_CAP bytes → not truncated\n");
 	r = run_cat_stdin_n(want);
 	CHECKNONIL(r, "execrun returns non-nil");
 	if(r == nil) return;
-	CHECKEQ(r->truncated, 0,    "not truncated at exactly EXEC_MAXOUT");
-	CHECKEQ(r->outputlen, want, "outputlen == EXEC_MAXOUT");
+	CHECKEQ(r->truncated, 0,    "not truncated at exactly TEST_CAP");
+	CHECKEQ(r->outputlen, want, "outputlen == TEST_CAP");
 	CHECKEQ(r->exitcode, 0,     "exitcode 0");
 	execresultfree(r);
 }
@@ -426,27 +429,27 @@ static void
 test_truncation_overflow(void)
 {
 	ExecResult *r;
-	long extra = 100;
-	long total = EXEC_MAXOUT + extra;
+	long extra    = 100;
+	long total    = TEST_CAP + extra;
+	long marklen;
 
-	print("\n-- 4.2 output EXEC_MAXOUT+100 bytes → truncated, head kept\n");
+	print("\n-- 4.2 output TEST_CAP+100 bytes → truncated, tail kept\n");
 	r = run_cat_stdin_n(total);
 	CHECKNONIL(r, "execrun returns non-nil");
 	if(r == nil) return;
-	CHECKEQ(r->truncated, 1,           "truncated flag set");
-	CHECKEQ(r->outputlen, EXEC_MAXOUT, "outputlen capped at EXEC_MAXOUT");
+	CHECKEQ(r->truncated, 1, "truncated flag set");
 	CHECKCONTAINS(r->output, "[...truncated...]", "truncation marker present");
-	/* head should be all 'x' bytes (before the marker) */
+	/* output is marker + TEST_CAP bytes; all payload bytes are 'x' */
 	{
-		const char *marker = strstr(r->output, "[...truncated...]");
-		long head_len = marker ? (long)(marker - r->output) : 0;
-		/* strip leading newline in "\n[...truncated...]" */
-		if(head_len > 0 && r->output[head_len - 1] == '\n')
-			head_len--;
-		int all_x = 1, i;
-		for(i = 0; i < head_len; i++)
-			if(r->output[i] != 'x') { all_x = 0; break; }
-		CHECK(all_x, "head bytes are all 'x'");
+		const char *marker = "[...truncated...]\n";
+		marklen = strlen(marker);
+		long paylen = r->outputlen - marklen;
+		int all_x = 1;
+		long i;
+		for(i = 0; i < paylen; i++)
+			if(r->output[marklen + i] != 'x') { all_x = 0; break; }
+		CHECK(all_x, "tail bytes after marker are all 'x'");
+		CHECKEQ(paylen, TEST_CAP, "tail length == TEST_CAP");
 	}
 	execresultfree(r);
 }

@@ -77,24 +77,19 @@
 #include "ant.h"
 #include "exec.h"
 #include "agent.h"
+#include "skill.h"
 #include "fs.h"
 
 /* ── System prompt ─────────────────────────────────────────────────────── */
 
 /*
- * Default system prompt for 9ai.
+ * Base system prompt for 9ai.
  *
  * Derived from the pi coding-agent system prompt, adapted for 9ai's
  * environment: single exec tool (direct execve, no shell), Plan 9 /
  * plan9port conventions, and no TUI or markdown rendering.
- *
- * Structure mirrors pi's buildSystemPrompt():
- *   1. Role / identity
- *   2. Available tool
- *   3. Guidelines (adapted to exec-only environment)
- *   4. Formatting rules
  */
-static const char defaultsystem[] =
+static const char basesystem[] =
 	"You are an expert coding assistant operating inside 9ai, a Plan 9 "
 	"coding agent. You help users by executing programs, reading files, "
 	"editing code, and building projects.\n"
@@ -127,6 +122,44 @@ static const char defaultsystem[] =
 	"- Show file paths clearly when working with files.\n"
 	"- When summarizing actions, write plain prose — do not re-run cat "
 	"or echo to display what you did.\n";
+
+/*
+ * buildsystem — construct the full system prompt.
+ *
+ * Appends a skills section to basesystem if any skills are present in
+ * ~/lib/9ai/skills/.  Each skill is a plain text file; the first line
+ * is the description shown here.  The full body is available at
+ * ~/lib/9ai/skills/<name> and can be loaded on demand with exec cat.
+ *
+ * Returns a malloc'd string.  Caller must free.
+ */
+static char *
+buildsystem(void)
+{
+	char *skills, *sdir, *out;
+
+	skills = skilllist();
+
+	/* no skills directory or empty — return base prompt as-is */
+	if(skills == nil || skills[0] == '\0') {
+		free(skills);
+		return strdup((char*)basesystem);
+	}
+
+	sdir = skillsdir();
+	out  = smprint(
+	    "%s"
+	    "\nSkills:\n"
+	    "Available skills are listed below as name<TAB>description.\n"
+	    "Full skill text is at %s<name> — load on demand with exec cat.\n"
+	    "\n"
+	    "%s",
+	    basesystem, sdir, skills);
+
+	free(sdir);
+	free(skills);
+	return out;
+}
 
 /* ── QID path constants ────────────────────────────────────────────────── */
 
@@ -463,23 +496,28 @@ fsread(Req *r)
 		 * Uses the chars/4 heuristic — a conservative over-estimate
 		 * that requires no tokeniser.
 		 *
-		 * Output format (two lines):
-		 *   tokens ~<est> / <limit>k
+		 * Output format (four lines):
+		 *   tokens ~<est>
+		 *   limit <ctx_k>k        (0 if model has not been looked up yet)
+		 *   usage <pct>%          (0% if limit is unknown)
 		 *   messages <count>
 		 *
-		 * <limit>k is the model's context window from the Model struct,
-		 * or 0 if the model has not been looked up yet.
+		 * <ctx_k> is the model's context window from the Model struct
+		 * (in thousands of tokens), or 0 if not yet known.
+		 * <pct> is est / (ctx_k * 1000) * 100, rounded to nearest integer.
 		 * <count> is the number of messages in the history list.
 		 */
 		long   est;
-		int    nmsg, fmt;
+		long   ctx_k;
+		int    nmsg, fmt, pct;
 		OAIMsg *om;
 		ANTMsg *am;
 
 		qlock(&g->lk);
-		fmt  = g->fmt;
-		est  = 0;
-		nmsg = 0;
+		fmt   = g->fmt;
+		ctx_k = g->ctx_k;
+		est   = 0;
+		nmsg  = 0;
 		if(fmt == Fmt_Ant) {
 			est  = antreqctxtokens(g->antreq);
 			for(am = g->antreq->msgs; am != nil; am = am->next)
@@ -491,7 +529,10 @@ fsread(Req *r)
 		}
 		qunlock(&g->lk);
 
-		snprint(buf, sizeof buf, "tokens ~%ld\nmessages %d\n", est, nmsg);
+		pct = (ctx_k > 0) ? (int)((est * 100 + ctx_k * 500) / (ctx_k * 1000)) : 0;
+		snprint(buf, sizeof buf,
+		        "tokens ~%ld\nlimit %ldk\nusage %d%%\nmessages %d\n",
+		        est, ctx_k, pct, nmsg);
 		readstr(r, buf);
 		respond(r, nil);
 		return;
@@ -874,6 +915,11 @@ fsdestroyfid(Fid *fid)
 				g->sess_bio = nil;
 			}
 			g->uuid[0] = '\0';
+			/* clear conversation history for the new session */
+			oaireqfree(g->oaireq);
+			g->oaireq = oaireqnew(g->model);
+			antreqfree(g->antreq);
+			g->antreq = antreqnew(g->model);
 			if(agentsessopen(&tmpcfg) == 0) {
 				memmove(g->uuid, tmpcfg.uuid, 37);
 				g->sess_bio = tmpcfg.sess_bio;
@@ -1357,13 +1403,16 @@ agentproc(void *v)
 		cfg.model     = strdup(g->model);
 		cfg.sockpath  = g->sockpath ? strdup(g->sockpath) : nil;
 		cfg.tokpath   = strdup(g->tokpath);
-		cfg.system    = strdup((char*)defaultsystem);
+		cfg.system    = buildsystem();
 		memmove(cfg.uuid, g->uuid, 37);
 		cfg.sess_bio  = g->sess_bio;
 		cfg.ontext    = agent_ontext;
 		cfg.onevent   = agent_onevent;
 		cfg.aux       = nil;
 		cfg.abortchan = g->abortchan;
+		/* exec_maxout: ~20% of context window in bytes (3 bytes/token),
+		 * falling back to 0 (agent.c uses EXEC_MAXOUT_DEFAULT = 512 KB) */
+		cfg.exec_maxout = g->ctx_k > 0 ? g->ctx_k * 1000 * 3 / 5 : 0;
 		qunlock(&g->lk);
 
 		int rc;
@@ -1672,6 +1721,23 @@ modelswatcher(void *v)
 		if(mlist == nil) {
 			respond(r, "modelsfetch failed");
 			continue;
+		}
+
+		/* cache ctx_k for the current model before freeing the list */
+		{
+			Model *m;
+			char   curmodel[128];
+			qlock(&g->lk);
+			snprint(curmodel, sizeof curmodel, "%s", g->model);
+			qunlock(&g->lk);
+			for(m = mlist; m != nil; m = m->next) {
+				if(strcmp(m->id, curmodel) == 0) {
+					qlock(&g->lk);
+					g->ctx_k = m->ctx_k;
+					qunlock(&g->lk);
+					break;
+				}
+			}
 		}
 
 		/* format model list into a heap buffer via Biobuf + pipe */

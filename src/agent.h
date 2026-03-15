@@ -67,6 +67,14 @@ struct AgentCfg {
 	char *system;      /* system prompt (may be nil) */
 	char *sessdir;     /* session directory override (nil → ~/lib/9ai/sessions/) */
 
+	/*
+	 * exec_maxout — output cap for tool execution, in bytes.
+	 * The tail of output is kept on overflow (ring buffer).
+	 * 0 → use default (512 KB).  Set from the model's ctx_k so
+	 * larger context windows allow larger tool outputs.
+	 */
+	long exec_maxout;
+
 	/* output callbacks — both may be nil */
 	void (*ontext)(const char *text, void *aux);
 	void (*onevent)(const char *rec, long len, void *aux);

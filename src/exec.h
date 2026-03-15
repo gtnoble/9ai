@@ -15,19 +15,19 @@
  *
  * ── Usage ─────────────────────────────────────────────────────────────
  *
- *   ExecResult *r = execrun(args_json, args_json_len);
+ *   ExecResult *r = execrun(args_json, args_json_len, maxout);
  *   if(r == nil) {
  *       // parse error or exec failure — check errstr
  *   } else {
  *       // r->output: combined stdout+stderr (nil-terminated)
  *       // r->exitcode: process exit status (0 = success)
- *       // r->truncated: 1 if output was capped at EXEC_MAXOUT
+ *       // r->truncated: 1 if output was capped at maxout
  *   }
  *   execresultfree(r);
  *
  * ── Output cap ────────────────────────────────────────────────────────
  *
- * stdout and stderr are merged and capped at EXEC_MAXOUT bytes.  On
+ * stdout and stderr are merged and capped at maxout bytes.  On
  * overflow the tail is kept: the oldest data is discarded and
  * "[...truncated...]\n" is prepended to the retained tail.
  *
@@ -47,7 +47,6 @@
  */
 
 enum {
-	EXEC_MAXOUT  = 512 * 1024,  /* 512KB output cap            */
 	EXEC_MAXARGV = 256,         /* max argv elements           */
 	EXEC_MAXARG  = 4096,        /* max single argument length  */
 };
@@ -59,7 +58,7 @@ struct ExecResult {
 	int    exitcode;   /* exit status; 0 on success                  */
 	char  *output;     /* combined stdout+stderr, nil-terminated      */
 	long   outputlen;  /* length of output in bytes                   */
-	int    truncated;  /* 1 if output was capped at EXEC_MAXOUT       */
+	int    truncated;  /* 1 if output was capped at maxout            */
 };
 
 /*
@@ -80,6 +79,8 @@ int execparse(const char *args_json, int args_len,
 /*
  * execrun — parse args_json and run the program.
  *
+ * maxout: output cap in bytes; the tail of output is kept on overflow.
+ *
  * Returns a heap-allocated ExecResult on success or failure (even if
  * the program exits non-zero).  Returns nil only on internal error
  * (parse failure, pipe creation failure, etc.) or if the program could
@@ -88,7 +89,7 @@ int execparse(const char *args_json, int args_len,
  *
  * Caller must free with execresultfree().
  */
-ExecResult *execrun(const char *args_json, int args_len);
+ExecResult *execrun(const char *args_json, int args_len, long maxout);
 
 /*
  * execabort — terminate a running exec child.
@@ -105,7 +106,7 @@ void execabort(int pid);
  * Writes output text, then appends "\nexited N" if exitcode != 0.
  * buf is nil-terminated.  Returns buf.
  */
-char *execresultstr(ExecResult *r, char *buf, int n);
+char *execresultstr(ExecResult *r, char *buf, long n);
 
 /*
  * execresultfree — free an ExecResult.

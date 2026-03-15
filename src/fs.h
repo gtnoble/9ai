@@ -92,6 +92,8 @@ struct AiState {
 	OAIReq *oaireq;   /* OpenAI Completions history (Fmt_Oai models) */
 	ANTReq *antreq;   /* Anthropic Messages history (Fmt_Ant models) */
 	int     fmt;      /* Fmt_Oai or Fmt_Ant — derived from model on each switch */
+	long    ctx_k;    /* context window of current model, in thousands of tokens (0 = unknown)
+	                   * /context output: "tokens ~<est>\nlimit <ctx_k>k\nusage <pct>%\nmessages <n>\n" */
 
 	/*
 	 * Auth subtree state.

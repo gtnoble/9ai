@@ -16,6 +16,7 @@ OFILES=\
 	ant.$O\
 	exec.$O\
 	agent.$O\
+	skill.$O\
 	fs.$O\
 
 HFILES=\
@@ -29,6 +30,7 @@ HFILES=\
 	ant.h\
 	exec.h\
 	agent.h\
+	skill.h\
 	fs.h\
 	prompt.h\
 	record.h\
@@ -101,7 +103,7 @@ test-agent:V: $O.agenttest
 	./$O.agenttest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
 
 # Stage 11: 9P server
-$O.fstest: fstest.$O port.$O http.$O json.$O oauth.$O models.$O sse.$O oai.$O ant.$O exec.$O agent.$O fs.$O
+$O.fstest: fstest.$O port.$O http.$O json.$O oauth.$O models.$O sse.$O oai.$O ant.$O exec.$O agent.$O skill.$O fs.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-fs:V: $O.fstest

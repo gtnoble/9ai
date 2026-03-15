@@ -16,6 +16,7 @@ OFILES=\
 	ant.$O\
 	exec.$O\
 	agent.$O\
+	skill.$O\
 	fs.$O\
 
 HFILES=\
@@ -29,6 +30,7 @@ HFILES=\
 	ant.h\
 	exec.h\
 	agent.h\
+	skill.h\
 	fs.h\
 	prompt.h\
 	record.h\
@@ -98,7 +100,7 @@ $O.oauthtest: oauthtest.$O port.$O http.$O json.$O oauth.$O
 $O.modelstest: modelstest.$O port.$O http.$O json.$O oauth.$O models.$O
 	$LD $LDFLAGS -o $target $prereq
 
-$O.fstest: fstest.$O port.$O http.$O json.$O oauth.$O models.$O sse.$O oai.$O ant.$O exec.$O agent.$O fs.$O
+$O.fstest: fstest.$O port.$O http.$O json.$O oauth.$O models.$O sse.$O oai.$O ant.$O exec.$O agent.$O skill.$O fs.$O
 	$LD $LDFLAGS -o $target $prereq
 
 $O.9ai-acme: 9ai-acme-native.$O prompt.$O record.$O render.$O sessfile.$O acmeevent.$O port.$O http.$O

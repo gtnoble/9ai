@@ -28,10 +28,10 @@
  *
  * ── Output ring buffer ────────────────────────────────────────────────
  *
- * We allocate EXEC_MAXOUT bytes upfront and fill them as a ring buffer.
+ * We allocate maxout bytes upfront and fill them as a ring buffer.
  * Once full, new bytes overwrite the oldest (wpos wraps to 0).  At EOF
- * we linearise the ring so the result is the most recent EXEC_MAXOUT
- * bytes, with "[...truncated...]\n" prepended to mark the loss.
+ * we linearise the ring so the result is the most recent maxout bytes,
+ * with "[...truncated...]\n" prepended to mark the loss.
  *
  * ── Wait semantics ────────────────────────────────────────────────────
  *
@@ -312,68 +312,97 @@ execparse(const char *args_json, int args_len,
 /* ── collectoutput ──────────────────────────────────────────────────── */
 
 /*
- * collectoutput — drain fd into a buffer capped at EXEC_MAXOUT bytes.
+ * collectoutput — drain fd into a ring buffer capped at cap bytes.
  *
- * Fills buf[0..CAP) linearly.  Once full, the rest of the output is
- * drained and discarded (sets truncated=1, appends "[...truncated...]").
- * Keeping the head rather than the tail is more useful: the beginning
- * of output is where the meaningful content is; a truncated final line
- * at the cap boundary is less harmful than losing the start entirely.
+ * Uses a ring buffer: once the buffer is full, new bytes overwrite the
+ * oldest (wpos wraps to 0).  At EOF the ring is linearised so the result
+ * is the most recent cap bytes, with "[...truncated...]\n" prepended to
+ * mark the loss.  Keeping the tail is preferable to the head: the end of
+ * tool output is where conclusions, error messages, and final state live.
  *
  * Returns a malloc'd nil-terminated string.
  * Sets *lenp and *truncated.  Returns nil only on allocation failure.
  */
 static char *
-collectoutput(int fd, long *lenp, int *truncated)
+collectoutput(int fd, long cap, long *lenp, int *truncated)
 {
-	static const char trunc_marker[] = "\n[...truncated...]";
+	static const char trunc_marker[] = "[...truncated...]\n";
 	enum { TRUNC_LEN = sizeof(trunc_marker) - 1 };
-	enum { CAP = EXEC_MAXOUT };
 	enum { CHUNK = 8192 };
 
 	char *buf;
-	long  pos;      /* bytes written into buf so far */
+	long  wpos;     /* next write position in ring */
+	long  total;    /* total bytes received */
 	char  tmp[CHUNK];
 	long  n;
 
 	*truncated = 0;
 	*lenp      = 0;
 
-	buf = malloc(CAP + 1);
+	buf = malloc(cap + 1);
 	if(buf == nil)
 		return nil;
 
-	pos = 0;
+	wpos  = 0;
+	total = 0;
 	for(;;) {
 		n = read(fd, tmp, sizeof tmp);
 		if(n <= 0)
 			break;
-		if(pos < CAP) {
-			long take = n;
-			if(pos + take > CAP)
-				take = CAP - pos;
-			memmove(buf + pos, tmp, take);
-			pos += take;
-		} else {
-			/* buf full: drain and discard remaining data */
-			*truncated = 1;
+		total += n;
+		/* write tmp[0..n) into the ring */
+		{
+			long i;
+			for(i = 0; i < n; i++) {
+				buf[wpos] = tmp[i];
+				wpos++;
+				if(wpos >= cap)
+					wpos = 0;
+			}
 		}
 	}
 
-	if(*truncated && (long)TRUNC_LEN <= pos) {
-		/* overwrite the last TRUNC_LEN bytes with the marker */
-		memmove(buf + pos - TRUNC_LEN, trunc_marker, TRUNC_LEN);
+	if(total <= cap) {
+		/* no wrap: buf[0..total) is the complete output */
+		buf[total] = '\0';
+		*lenp = total;
+		return buf;
 	}
 
-	buf[pos] = '\0';
-	*lenp = pos;
-	return buf;
+	/*
+	 * Ring wrapped: buf[wpos..cap) holds the oldest bytes,
+	 * buf[0..wpos) holds the newest.  Linearise into a fresh buffer
+	 * with the truncation marker prepended.
+	 */
+	*truncated = 1;
+	{
+		char *out;
+		long  marklen, taillen, headlen, outlen;
+
+		marklen = TRUNC_LEN;
+		taillen = cap - wpos;   /* bytes from wpos to end of ring   */
+		headlen = wpos;         /* bytes from start of ring to wpos */
+		outlen  = marklen + taillen + headlen;  /* == marklen + cap */
+
+		out = malloc(outlen + 1);
+		if(out == nil) {
+			free(buf);
+			return nil;
+		}
+		memmove(out,                   trunc_marker, marklen);
+		memmove(out + marklen,         buf + wpos,   taillen);
+		memmove(out + marklen + taillen, buf,         headlen);
+		out[outlen] = '\0';
+		free(buf);
+		*lenp = outlen;
+		return out;
+	}
 }
 
 /* ── execrun ────────────────────────────────────────────────────────── */
 
 ExecResult *
-execrun(const char *args_json, int args_len)
+execrun(const char *args_json, int args_len, long maxout)
 {
 	char       *argv[EXEC_MAXARGV + 1];
 	char       *stdin_str;
@@ -502,7 +531,7 @@ execrun(const char *args_json, int args_len)
 	r->pid = pid;
 
 	/* collect combined output */
-	r->output = collectoutput(out_pipe[0], &r->outputlen, &r->truncated);
+	r->output = collectoutput(out_pipe[0], maxout, &r->outputlen, &r->truncated);
 	close(out_pipe[0]);
 
 	if(r->output == nil) {
@@ -596,9 +625,9 @@ execabort(int pid)
 /* ── execresultstr ──────────────────────────────────────────────────── */
 
 char *
-execresultstr(ExecResult *r, char *buf, int n)
+execresultstr(ExecResult *r, char *buf, long n)
 {
-	int outlen;
+	long outlen;
 
 	if(r == nil || buf == nil || n <= 0) {
 		if(buf && n > 0) buf[0] = '\0';
@@ -609,7 +638,7 @@ execresultstr(ExecResult *r, char *buf, int n)
 	 * Reserve 32 bytes for "\nexited N\0" suffix.
 	 * Copy output up to that limit.
 	 */
-	outlen = (int)r->outputlen;
+	outlen = r->outputlen;
 	if(outlen > n - 33)
 		outlen = n - 33;
 	if(outlen < 0)

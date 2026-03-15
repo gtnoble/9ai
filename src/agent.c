@@ -798,8 +798,11 @@ loadrefresh(AgentCfg *cfg)
 
 /* ── Context management helpers ──────────────────────────────────────────
  *
+ * EXEC_MAXOUT_DEFAULT — fallback output cap for tool execution when
+ * cfg->exec_maxout is 0 (model context window unknown).
+ *
  * HIST_MAXOUT — cap applied to tool output when storing it in the history
- * linked list.  The model saw the full EXEC_MAXOUT bytes on the turn the
+ * linked list.  The model saw the full exec_maxout bytes on the turn the
  * tool ran; future turns need only enough to know what happened.  Keeping
  * this small prevents tool outputs from dominating context growth across
  * long sessions.
@@ -809,7 +812,8 @@ loadrefresh(AgentCfg *cfg)
  * GitHub Copilot error format as well as generic OpenAI / Anthropic forms.
  */
 
-enum { HIST_MAXOUT = 16 * 1024 };  /* 16 KB per tool result in history */
+enum { EXEC_MAXOUT_DEFAULT = 512 * 1024 };  /* 512 KB fallback output cap  */
+enum { HIST_MAXOUT = 16 * 1024 };           /* 16 KB per tool result in history */
 
 int
 isctxoverflow(const char *body)
@@ -1161,8 +1165,11 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			char       *result;
 			int         is_error;
 			int         tool_aborted = 0;
+			long        maxout;
 
-			result = mallocz(EXEC_MAXOUT + 64, 1);
+			maxout = cfg->exec_maxout > 0 ? cfg->exec_maxout : EXEC_MAXOUT_DEFAULT;
+
+			result = mallocz(maxout + 64, 1);
 			if(result == nil) {
 				oauthtokenfree(tok);
 				free(textbuf); free(argsbuf);
@@ -1180,7 +1187,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			 * The watcher is RFNOWAIT so we never need to collect
 			 * its exit status.
 			 */
-			er = execrun(argsbuf, argslen);
+			er = execrun(argsbuf, argslen, maxout);
 
 			/* check for abort that arrived during exec */
 			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
@@ -1212,7 +1219,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				if(cfg->sess_bio != nil) Bflush(cfg->sess_bio);
 			} else {
 				is_error = (er->exitcode != 0);
-				execresultstr(er, result, EXEC_MAXOUT + 64);
+				execresultstr(er, result, maxout + 64);
 
 				emitandsave(cfg, "tool_end",
 				    is_error ? "err" : "ok",
@@ -1220,13 +1227,22 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				if(cfg->sess_bio != nil) Bflush(cfg->sess_bio);
 
 				/*
-				 * Cap the result stored in history at HIST_MAXOUT.
-				 * The model already saw the full output this turn;
-				 * subsequent turns only need enough to know what happened.
+				 * Cap the result stored in history at HIST_MAXOUT,
+				 * keeping the tail: the end of output is where the
+				 * conclusion or error lives.  The model already saw
+				 * the full output this turn; subsequent turns only
+				 * need enough to know what happened.
 				 */
-				if((long)strlen(result) > HIST_MAXOUT) {
-					static const char histmark[] = "\n[...history truncated...]";
-					memmove(result + HIST_MAXOUT, histmark, sizeof histmark);
+				{
+					long rlen = (long)strlen(result);
+					if(rlen > HIST_MAXOUT) {
+						static const char histmark[] = "[...history truncated...]\n";
+						long marklen = sizeof(histmark) - 1;
+						long tail_start = rlen - HIST_MAXOUT;
+						memmove(result + marklen, result + tail_start, HIST_MAXOUT);
+						memmove(result, histmark, marklen);
+						result[marklen + HIST_MAXOUT] = '\0';
+					}
 				}
 				oaireqaddmsg(req, oaimsgtoolresult(
 				    tool_id[0] ? tool_id : "call_unknown",
@@ -1586,8 +1602,11 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			char       *result;
 			int         is_error;
 			int         tool_aborted = 0;
+			long        maxout;
 
-			result = mallocz(EXEC_MAXOUT + 64, 1);
+			maxout = cfg->exec_maxout > 0 ? cfg->exec_maxout : EXEC_MAXOUT_DEFAULT;
+
+			result = mallocz(maxout + 64, 1);
 			if(result == nil) {
 				oauthtokenfree(tok);
 				free(textbuf); free(argsbuf);
@@ -1595,7 +1614,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				return -1;
 			}
 
-			er = execrun(argsbuf, argslen);
+			er = execrun(argsbuf, argslen, maxout);
 
 			/* check for abort that arrived during exec */
 			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
@@ -1626,7 +1645,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				if(cfg->sess_bio != nil) Bflush(cfg->sess_bio);
 			} else {
 				is_error = (er->exitcode != 0);
-				execresultstr(er, result, EXEC_MAXOUT + 64);
+				execresultstr(er, result, maxout + 64);
 
 				emitandsave(cfg, "tool_end",
 				    is_error ? "err" : "ok",
@@ -1634,13 +1653,22 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				if(cfg->sess_bio != nil) Bflush(cfg->sess_bio);
 
 				/*
-				 * Cap the result stored in history at HIST_MAXOUT.
-				 * The model already saw the full output this turn;
-				 * subsequent turns only need enough to know what happened.
+				 * Cap the result stored in history at HIST_MAXOUT,
+				 * keeping the tail: the end of output is where the
+				 * conclusion or error lives.  The model already saw
+				 * the full output this turn; subsequent turns only
+				 * need enough to know what happened.
 				 */
-				if((long)strlen(result) > HIST_MAXOUT) {
-					static const char histmark[] = "\n[...history truncated...]";
-					memmove(result + HIST_MAXOUT, histmark, sizeof histmark);
+				{
+					long rlen = (long)strlen(result);
+					if(rlen > HIST_MAXOUT) {
+						static const char histmark[] = "[...history truncated...]\n";
+						long marklen = sizeof(histmark) - 1;
+						long tail_start = rlen - HIST_MAXOUT;
+						memmove(result + marklen, result + tail_start, HIST_MAXOUT);
+						memmove(result, histmark, marklen);
+						result[marklen + HIST_MAXOUT] = '\0';
+					}
 				}
 				antreqaddmsg(req, antmsgtoolresult(
 				    tool_id[0] ? tool_id : "toolu_unknown",

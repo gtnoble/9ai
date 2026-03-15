@@ -307,35 +307,39 @@ emitmsg(Biobuf *b, OAIMsg *m)
 		Bprint(b, "{\"role\":\"assistant\",\"content\":");
 
 		/* content: concatenate all text blocks into one string.
-		 * GitHub Copilot requires a plain string, not an array. */
+		 * GitHub Copilot requires a plain string, not an array.
+		 *
+		 * Use a growable heap buffer instead of a pipe to avoid the
+		 * deadlock that occurred when assistant text exceeded the pipe
+		 * buffer capacity (~73 KB: 8 KB Biobuf + 65536 B pipe), and the
+		 * silent 65535-byte truncation on the read side. */
 		{
-			/* build the string via an in-memory Biobuf on a pipe */
-			int pfd[2];
-			char *buf;
-			long n;
-			Biobuf *tbuf;
+			char *buf = nil;
+			char *tmp;
+			long  cap = 0, len = 0, dlen, newcap;
 
-			buf = mallocz(65536, 1);
-			tbuf = mallocz(sizeof(Biobuf), 1);
-			if(buf == nil || tbuf == nil) {
-				free(buf); free(tbuf);
-				Bprint(b, "\"\"");
-			} else {
-				if(pipe(pfd) < 0) sysfatal("pipe: %r");
-				Binit(tbuf, pfd[1], OWRITE);
-				for(blk = m->content; blk != nil; blk = blk->next)
-					if(blk->type == OAIBlockText && blk->text != nil)
-						Bprint(tbuf, "%s", blk->text);
-				Bflush(tbuf);
-				Bterm(tbuf);
-				free(tbuf);
-				close(pfd[1]);
-				n = read(pfd[0], buf, 65535);
-				if(n < 0) n = 0;
-				buf[n] = '\0';
-				close(pfd[0]);
+			for(blk = m->content; blk != nil; blk = blk->next) {
+				if(blk->type != OAIBlockText || blk->text == nil)
+					continue;
+				dlen = strlen(blk->text);
+				if(len + dlen + 1 > cap) {
+					newcap = cap ? cap * 2 : 4096;
+					while(newcap < len + dlen + 1)
+						newcap *= 2;
+					tmp = realloc(buf, newcap);
+					if(tmp == nil) { free(buf); buf = nil; break; }
+					buf = tmp;
+					cap = newcap;
+				}
+				memmove(buf + len, blk->text, dlen);
+				len += dlen;
+			}
+			if(buf != nil) {
+				buf[len] = '\0';
 				jsonemitstr(b, buf);
 				free(buf);
+			} else {
+				Bprint(b, "\"\"");
 			}
 		}
 

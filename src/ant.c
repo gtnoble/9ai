@@ -366,13 +366,18 @@ emitmsg(Biobuf *b, ANTMsg *m)
 	switch(m->role) {
 	case ANTRoleUser: {
 		/*
-		 * Determine if this is a pure tool_result message or a plain text
-		 * message.  A pure tool_result user message uses an array content;
-		 * a plain text user message uses a string content.
+		 * Determine content shape:
+		 *   - pure tool_result → array of tool_result blocks
+		 *   - any text block has cache_control set → array of text blocks
+		 *     (cache_control requires the block-object form, not a bare string)
+		 *   - otherwise → plain string (concatenation of text blocks)
 		 */
 		int has_toolresult = 0;
-		for(blk = m->content; blk != nil; blk = blk->next)
-			if(blk->type == ANTBlockToolResult) { has_toolresult = 1; break; }
+		int has_cache = 0;
+		for(blk = m->content; blk != nil; blk = blk->next) {
+			if(blk->type == ANTBlockToolResult) has_toolresult = 1;
+			if(blk->cache_control)              has_cache = 1;
+		}
 
 		Bprint(b, "{\"role\":\"user\",\"content\":");
 		if(has_toolresult) {
@@ -387,6 +392,25 @@ emitmsg(Biobuf *b, ANTMsg *m)
 				Bprint(b, ",\"content\":");
 				jsonemitstr(b, blk->text);
 				Bprint(b, ",\"is_error\":%s}", blk->is_error ? "true" : "false");
+			}
+			Bprint(b, "]");
+		} else if(has_cache) {
+			/*
+			 * Emit as a content block array so we can attach
+			 * cache_control to individual blocks.
+			 */
+			Bprint(b, "[");
+			first = 1;
+			for(blk = m->content; blk != nil; blk = blk->next) {
+				if(blk->type != ANTBlockText) continue;
+				if(blk->text == nil || blk->text[0] == '\0') continue;
+				if(!first) Bprint(b, ",");
+				first = 0;
+				Bprint(b, "{\"type\":\"text\",\"text\":");
+				jsonemitstr(b, blk->text);
+				if(blk->cache_control)
+					Bprint(b, ",\"cache_control\":{\"type\":\"ephemeral\"}");
+				Bprint(b, "}");
 			}
 			Bprint(b, "]");
 		} else {
@@ -429,6 +453,8 @@ emitmsg(Biobuf *b, ANTMsg *m)
 				first = 0;
 				Bprint(b, "{\"type\":\"text\",\"text\":");
 				jsonemitstr(b, blk->text);
+				if(blk->cache_control)
+					Bprint(b, ",\"cache_control\":{\"type\":\"ephemeral\"}");
 				Bprint(b, "}");
 				break;
 			case ANTBlockToolUse:
@@ -464,16 +490,60 @@ antreqjson(ANTReq *req, char *system_prompt, long *lenp)
 	int pfd[2];
 	Biobuf *b;
 	ANTMsg *m;
+	ANTBlock *cache_blk;   /* block to mark with cache_control; cleared after */
 	char *buf;
 	long len;
 
-	if(pipe(pfd) < 0)
+	/*
+	 * Pre-pass: find the last user text block to mark with cache_control.
+	 *
+	 * Walk the message list from the tail back to the head.  We want the
+	 * last message that:
+	 *   (a) has role ANTRoleUser, AND
+	 *   (b) contains at least one ANTBlockText block (i.e. is a real user
+	 *       message, not a pure tool_result carrier).
+	 *
+	 * Within that message, mark its last non-empty ANTBlockText block.
+	 * This tells emitmsg() to emit cache_control on that block, caching
+	 * the full conversation prefix up to and including this user turn.
+	 */
+	cache_blk = nil;
+	if(req->msgs != nil) {
+		/* collect message pointers into a temporary array for reverse walk */
+		int    nmsg = 0, i;
+		ANTMsg *tmp[4096];
+		for(m = req->msgs; m != nil; m = m->next) {
+			if(nmsg < 4096)
+				tmp[nmsg++] = m;
+		}
+		for(i = nmsg - 1; i >= 0 && cache_blk == nil; i--) {
+			ANTBlock *blk, *last_text;
+			m = tmp[i];
+			if(m->role != ANTRoleUser)
+				continue;
+			/* check there is at least one text block */
+			last_text = nil;
+			for(blk = m->content; blk != nil; blk = blk->next)
+				if(blk->type == ANTBlockText &&
+				   blk->text != nil && blk->text[0] != '\0')
+					last_text = blk;
+			if(last_text != nil) {
+				last_text->cache_control = 1;
+				cache_blk = last_text;
+			}
+		}
+	}
+
+	if(pipe(pfd) < 0) {
+		if(cache_blk != nil) cache_blk->cache_control = 0;
 		return nil;
+	}
 
 	b = mallocz(sizeof(Biobuf), 1);
 	if(b == nil) {
 		close(pfd[0]);
 		close(pfd[1]);
+		if(cache_blk != nil) cache_blk->cache_control = 0;
 		return nil;
 	}
 	Binit(b, pfd[1], OWRITE);
@@ -483,9 +553,17 @@ antreqjson(ANTReq *req, char *system_prompt, long *lenp)
 	Bprint(b, ",\"stream\":true");
 	Bprint(b, ",\"max_tokens\":%d", MAX_OUT_TOK);
 
+	/*
+	 * System prompt as a block array with cache_control on the text block.
+	 * The block-array form is required to attach cache_control; the Copilot
+	 * proxy forwards it faithfully to the Claude backend.
+	 *
+	 * Omit entirely if system_prompt is nil or empty.
+	 */
 	if(system_prompt != nil && system_prompt[0] != '\0') {
-		Bprint(b, ",\"system\":");
+		Bprint(b, ",\"system\":[{\"type\":\"text\",\"text\":");
 		jsonemitstr(b, system_prompt);
+		Bprint(b, ",\"cache_control\":{\"type\":\"ephemeral\"}}]");
 	}
 
 	Bprint(b, ",\"messages\":[");
@@ -513,6 +591,11 @@ antreqjson(ANTReq *req, char *system_prompt, long *lenp)
 		len = 0;
 	if(lenp != nil)
 		*lenp = len;
+
+	/* post-pass: clear the transient cache_control flag */
+	if(cache_blk != nil)
+		cache_blk->cache_control = 0;
+
 	return buf;
 }
 
