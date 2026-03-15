@@ -562,6 +562,9 @@ oaiterm(OAIParser *p)
  *
  * OAI chunk structure (the "choices[0].delta" sub-object):
  *   delta.content             — text chunk (string or null)
+ *   delta.reasoning_content   — reasoning/thinking chunk (llama.cpp)
+ *   delta.reasoning           — reasoning/thinking chunk (DeepSeek, generic)
+ *   delta.reasoning_text      — reasoning/thinking chunk (some others)
  *   delta.tool_calls[0].id   — tool call id (first chunk only, then "")
  *   delta.tool_calls[0].function.name      — function name (first chunk only)
  *   delta.tool_calls[0].function.arguments — partial JSON args
@@ -571,11 +574,17 @@ oaiterm(OAIParser *p)
  *   "tool_calls" — tool call complete
  *
  * We issue one OAIDelta per event:
+ *   - OAIDThinking for non-empty reasoning_content / reasoning / reasoning_text
  *   - OAIDText for non-empty content
  *   - OAIDTool when a tool call starts (id non-empty)
  *   - OAIDToolArg for each non-empty arguments chunk
  *   - OAIDStop for finish_reason
- *   - Empty/null content is skipped (we loop internally)
+ *   - Empty/null fields are skipped (we loop internally)
+ *
+ * Reasoning fields are checked before content so that chunks containing both
+ * (unlikely but possible) emit thinking first.  We take only the first
+ * non-empty reasoning field to avoid duplicate emission on providers that
+ * return multiple synonymous fields (e.g. chutes.ai).
  */
 int
 oaidelta(OAIParser *p, OAIDelta *d)
@@ -657,7 +666,40 @@ oaidelta(OAIParser *p, OAIDelta *d)
 			}
 		}
 
-		/* check for "tool_calls" array */
+		/*
+		 * Check for reasoning/thinking fields.
+		 * Different providers use different field names; probe in priority
+		 * order and take the first non-empty one:
+		 *   "reasoning_content" — llama.cpp
+		 *   "reasoning"         — DeepSeek, generic OAI-compat
+		 *   "reasoning_text"    — some others
+		 * We emit OAIDThinking; the caller (agentrun) saves it to the session
+		 * and event stream but does NOT feed it back to the API.
+		 */
+		{
+			static const char *rfields[] = {
+				"reasoning_content", "reasoning", "reasoning_text", nil
+			};
+			int ri;
+			for(ri = 0; rfields[ri] != nil; ri++) {
+				int r_i = jsonget(ev.data, toks, ntoks, delta_i, rfields[ri]);
+				if(r_i >= 0 && toks[r_i].type == JSMN_STRING) {
+					int n = jsonstr_grow(p, ev.data, &toks[r_i]);
+					if(n > 0) {
+						d->type        = OAIDThinking;
+						d->text        = p->textbuf;
+						d->tool_id     = nil;
+						d->tool_name   = nil;
+						d->stop_reason = nil;
+						ret = OAI_OK;
+						break;
+					}
+				}
+			}
+			if(ret == OAI_OK)
+				continue;
+		}
+
 		tc_i = jsonget(ev.data, toks, ntoks, delta_i, "tool_calls");
 		if(tc_i < 0 || toks[tc_i].type != JSMN_ARRAY || toks[tc_i].size == 0)
 			continue;

@@ -75,6 +75,15 @@ struct AgentCfg {
 	 */
 	long exec_maxout;
 
+	/*
+	 * exec_unmount_mtpt — if non-nil, unmount this path from the exec
+	 * child's namespace before running the tool.  Use this to prevent
+	 * the LLM-driven exec tool from accessing 9ai's own file system
+	 * (e.g. writing to /message to inject prompts or reading /ctl).
+	 * nil → no unmount (default; exec child inherits the full namespace).
+	 */
+	char *exec_unmount_mtpt;
+
 	/* output callbacks — both may be nil */
 	void (*ontext)(const char *text, void *aux);
 	void (*onevent)(const char *rec, long len, void *aux);

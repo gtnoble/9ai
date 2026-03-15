@@ -630,7 +630,7 @@ threadmain(int argc, char *argv[])
 	snprint(srvname, sizeof srvname, "9ai-test");
 
 	/* init and post the server; aimain returns after threadpostmountsrv */
-	ai = aiinit("gpt-4o", sockpath, tokpath);
+	ai = aiinit("gpt-4o", sockpath, tokpath, nil);
 	aimain(ai, srvname, nil);
 
 	/* mount the posted service */

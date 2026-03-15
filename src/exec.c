@@ -26,6 +26,20 @@
  *   stdin_pipe[1]  — write stdin then close
  *   out_pipe[0]    — read output until EOF
  *
+ * ── Namespace isolation (unmount_mtpt) ────────────────────────────────
+ *
+ * When ExecOpts.unmount_mtpt is non-nil, the child's copy of the
+ * namespace has that path unmounted before exec, preventing the tool
+ * from accessing 9ai's own file system.
+ *
+ * On 9front: RFNAMEG is added to the rfork flags, giving the child a
+ * private copy of the parent's namespace.  unmount(nil, mtpt) is then
+ * called in the child.
+ *
+ * On plan9port/Linux: after fork(), the child calls
+ * unshare(CLONE_NEWNS) to detach from the parent's mount namespace,
+ * then umount2(mtpt, MNT_DETACH).  This is the Linux equivalent.
+ *
  * ── Output ring buffer ────────────────────────────────────────────────
  *
  * We allocate maxout bytes upfront and fill them as a ring buffer.
@@ -45,6 +59,14 @@
  * We scan backward for the trailing integer.
  */
 
+#ifdef __linux__
+/* Must be defined before any system header to expose unshare() in <sched.h>
+ * and MNT_DETACH / umount2() in <sys/mount.h>. */
+#define _GNU_SOURCE
+#include <sched.h>
+#include <sys/mount.h>
+#endif
+
 #include <u.h>
 #include <libc.h>
 #include <bio.h>
@@ -59,10 +81,71 @@
 #ifdef PLAN9PORT
 
 static int
-spawnchild(int child_fds[3], int close_fds[2], char *prog, char *argv[])
+spawnchild(int child_fds[3], int close_fds[2], char *prog, char *argv[],
+           const char *unmount_mtpt)
 {
-	USED(close_fds);  /* threadspawn handles fd cleanup on plan9port */
-	return threadspawn(child_fds, prog, argv);
+	/*
+	 * When unmount_mtpt is nil, use threadspawn() as before.
+	 *
+	 * When unmount_mtpt is set, we need to run pre-exec code in the
+	 * child (unshare + umount on Linux) that threadspawn() doesn't
+	 * support.  Fall back to a plain fork()/exec() in that case:
+	 *   1. fork()
+	 *   2. In child: close parent-side pipe ends, dup child fds to 0/1/2.
+	 *   3. On Linux: unshare(CLONE_NEWNS) + umount2(mtpt, MNT_DETACH).
+	 *   4. exec the program.
+	 *
+	 * threadspawn() is still used for the common (no-unmount) path
+	 * because it integrates with libthread's fd-closing bookkeeping.
+	 */
+	if(unmount_mtpt == nil) {
+		USED(close_fds);
+		return threadspawn(child_fds, prog, argv);
+	}
+
+	/* manual fork path for unmount */
+	{
+		int pid;
+
+		pid = fork();
+		if(pid < 0) {
+			werrstr("spawnchild: fork: %r");
+			return -1;
+		}
+		if(pid == 0) {
+			/* child: close parent-side pipe ends */
+			close(close_fds[0]);
+			close(close_fds[1]);
+			/* dup child fds to stdin/stdout/stderr */
+			dup2(child_fds[0], 0);
+			dup2(child_fds[1], 1);
+			dup2(child_fds[2], 2);
+			if(child_fds[0] > 2) close(child_fds[0]);
+			if(child_fds[1] > 2) close(child_fds[1]);
+			if(child_fds[2] > 2 && child_fds[2] != child_fds[1]) close(child_fds[2]);
+#ifdef __linux__
+			/*
+			 * Detach from the parent's mount namespace and unmount
+			 * the 9ai FS.  MNT_DETACH makes the unmount lazy —
+			 * any processes already using the mount point are not
+			 * disturbed, but new lookups will not see it.
+			 * Errors are intentionally ignored: if unshare or
+			 * umount2 fails (e.g. not mounted, no permission), the
+			 * exec still proceeds — the unmount is best-effort.
+			 */
+			unshare(CLONE_NEWNS);
+			umount2((char*)unmount_mtpt, MNT_DETACH);
+#endif
+			execvp(prog, argv);
+			_exit(1);
+		}
+		/* parent: close the child-side pipe ends */
+		close(child_fds[0]);
+		close(child_fds[1]);
+		if(child_fds[2] != child_fds[1])
+			close(child_fds[2]);
+		return pid;
+	}
 }
 
 static Waitmsg *
@@ -127,9 +210,11 @@ execpath(char *prog, char *argv[])
 }
 
 static int
-spawnchild(int child_fds[3], int close_fds[2], char *prog, char *argv[])
+spawnchild(int child_fds[3], int close_fds[2], char *prog, char *argv[],
+           const char *unmount_mtpt)
 {
 	int pid;
+	int rflags;
 
 	/*
 	 * RFFDG duplicates the parent's fd table into the child.
@@ -139,6 +224,10 @@ spawnchild(int child_fds[3], int close_fds[2], char *prog, char *argv[])
 	 * if either stays open in the child, the corresponding pipe never
 	 * gets EOF and the parent deadlocks.
 	 *
+	 * When unmount_mtpt is set we also add RFNAMEG so the child gets a
+	 * private copy of the parent's namespace.  We can then call
+	 * unmount(nil, mtpt) in the child without affecting the parent.
+	 *
 	 * We do NOT use RFNOWAIT: we need the kernel to queue the exit
 	 * notification so waitchild() can collect the exit message and
 	 * exit code.  Since our child is the only non-libthread waitable
@@ -147,7 +236,11 @@ spawnchild(int child_fds[3], int close_fds[2], char *prog, char *argv[])
 	 * The child signals exec failure via the sentinel exit string
 	 * "__exec_failed__"; execrun() detects this and returns nil.
 	 */
-	pid = rfork(RFPROC|RFFDG);
+	rflags = RFPROC|RFFDG;
+	if(unmount_mtpt != nil)
+		rflags |= RFNAMEG;
+
+	pid = rfork(rflags);
 	if(pid < 0) {
 		werrstr("spawnchild: rfork: %r");
 		return -1;
@@ -163,6 +256,9 @@ spawnchild(int child_fds[3], int close_fds[2], char *prog, char *argv[])
 		if(child_fds[0] > 2) close(child_fds[0]);
 		if(child_fds[1] > 2) close(child_fds[1]);
 		if(child_fds[2] > 2 && child_fds[2] != child_fds[1]) close(child_fds[2]);
+		/* unmount the 9ai FS from the child's private namespace */
+		if(unmount_mtpt != nil)
+			unmount(nil, (char*)unmount_mtpt);
 		execpath(prog, argv);
 		_exits("__exec_failed__");
 	}
@@ -402,7 +498,7 @@ collectoutput(int fd, long cap, long *lenp, int *truncated)
 /* ── execrun ────────────────────────────────────────────────────────── */
 
 ExecResult *
-execrun(const char *args_json, int args_len, long maxout)
+execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 {
 	char       *argv[EXEC_MAXARGV + 1];
 	char       *stdin_str;
@@ -413,6 +509,9 @@ execrun(const char *args_json, int args_len, long maxout)
 	ExecResult *r;
 	Waitmsg    *w;
 	int         i;
+	const char *unmount_mtpt;
+
+	unmount_mtpt = (opts != nil) ? opts->unmount_mtpt : nil;
 
 	/* parse tool args JSON */
 	argc = execparse(args_json, args_len, argv, EXEC_MAXARGV, &stdin_str);
@@ -442,7 +541,7 @@ execrun(const char *args_json, int args_len, long maxout)
 		int close_fds[2];
 		close_fds[0] = stdin_pipe[1];  /* parent write end — child must not keep */
 		close_fds[1] = out_pipe[0];    /* parent read end  — child must not keep */
-		pid = spawnchild(child_fds, close_fds, argv[0], argv);
+		pid = spawnchild(child_fds, close_fds, argv[0], argv, unmount_mtpt);
 	}
 	if(pid < 0) {
 		werrstr("exec: spawnchild %s: %r", argv[0]);

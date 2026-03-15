@@ -65,6 +65,7 @@ struct AiState {
 	char *model;      /* current model id (heap, always non-nil) */
 	char *sockpath;   /* 9aitls proxy socket path */
 	char *tokpath;    /* GitHub refresh token path */
+	char *mtpt;       /* mount point of the 9ai FS, or nil */
 
 	/* agent running state */
 	int   busy;       /* 1 while agent turn is in progress */
@@ -127,10 +128,12 @@ struct AiState {
  * model    — initial model id (e.g. "gpt-4o"); strdup'd
  * sockpath — path to 9aitls Unix socket; strdup'd
  * tokpath  — path to GitHub refresh token file; strdup'd
+ * mtpt     — mount point of the 9ai FS (used to unmount from exec children
+ *             when -U is passed); nil means no unmount
  *
  * Returns a heap-allocated AiState.  Does not start any procs.
  */
-AiState *aiinit(char *model, char *sockpath, char *tokpath);
+AiState *aiinit(char *model, char *sockpath, char *tokpath, char *mtpt);
 
 /*
  * aimain — post the 9P service and run the srv loop.

@@ -1413,6 +1413,8 @@ agentproc(void *v)
 		/* exec_maxout: ~20% of context window in bytes (3 bytes/token),
 		 * falling back to 0 (agent.c uses EXEC_MAXOUT_DEFAULT = 512 KB) */
 		cfg.exec_maxout = g->ctx_k > 0 ? g->ctx_k * 1000 * 3 / 5 : 0;
+		/* exec_unmount_mtpt: unmount 9ai FS from exec children if -U was given */
+		cfg.exec_unmount_mtpt = g->mtpt;
 		qunlock(&g->lk);
 
 		int rc;
@@ -1634,7 +1636,7 @@ authproc(void *v)
 /* ── aiinit / aimain ───────────────────────────────────────────────────── */
 
 AiState *
-aiinit(char *model, char *sockpath, char *tokpath)
+aiinit(char *model, char *sockpath, char *tokpath, char *mtpt)
 {
 	AiState *ai;
 
@@ -1645,6 +1647,7 @@ aiinit(char *model, char *sockpath, char *tokpath)
 	ai->model    = strdup(model);
 	ai->sockpath = sockpath ? strdup(sockpath) : nil;
 	ai->tokpath  = strdup(tokpath);
+	ai->mtpt     = mtpt ? strdup(mtpt) : nil;
 	ai->oaireq   = oaireqnew(model);
 	ai->antreq   = antreqnew(model);
 	ai->fmt      = Fmt_Oai;  /* default; switched when model changes */

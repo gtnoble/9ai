@@ -108,7 +108,7 @@ static int failures = 0;
 static ExecResult *
 run(const char *json)
 {
-	return execrun(json, strlen(json), 512*1024);
+	return execrun(json, strlen(json), 512*1024, nil);
 }
 
 /* ── Part 1: execparse ──────────────────────────────────────────────── */
@@ -404,7 +404,7 @@ run_cat_stdin_n(long nbytes)
 	p += nbytes;
 	p += sprint(p, "\"}");
 	*p = '\0';
-	r = execrun(json, (int)(p - json), TEST_CAP);
+	r = execrun(json, (int)(p - json), TEST_CAP, nil);
 	free(json);
 	return r;
 }

@@ -527,7 +527,79 @@ test_delta_tool_fixture(void)
 	resp_free(resp);
 }
 
-/* ── Part 1.5: oaireqctxtokens and oaireqtrim ────────────────────────── */
+/* ── Part 1.5: Delta parser — thinking fixture ────────────────────────── */
+
+/*
+ * Minimal SSE stream with reasoning_content deltas followed by a text delta,
+ * matching the DeepSeek / llama.cpp wire format.
+ */
+static const char oai_thinking_sse[] =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+    "\"reasoning_content\":\"let me think\",\"content\":null}}],"
+    "\"id\":\"cmpl-think1\",\"model\":\"deepseek-r1\"}\n\n"
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":"
+    "\" about this\",\"content\":null}}],\"id\":\"cmpl-think1\","
+    "\"model\":\"deepseek-r1\"}\n\n"
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":"
+    "null,\"content\":\"answer\"}}],\"id\":\"cmpl-think1\","
+    "\"model\":\"deepseek-r1\"}\n\n"
+    "data: {\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,"
+    "\"delta\":{\"content\":null}}],\"id\":\"cmpl-think1\","
+    "\"model\":\"deepseek-r1\"}\n\ndata: [DONE]\n\n"
+    ;
+
+static void
+test_delta_thinking_fixture(void)
+{
+	HTTPResp *resp;
+	OAIParser p;
+	OAIDelta  d;
+	int       rc;
+	char      thinking[256];
+	char      text[256];
+	int       nthinking = 0, ntext = 0, nstop = 0;
+
+	print("\n-- 1.5a delta parser: OAI thinking fixture\n");
+
+	resp = resp_from_fixture(oai_thinking_sse, strlen(oai_thinking_sse));
+	oaiinit(&p, resp);
+
+	thinking[0] = '\0';
+	text[0]     = '\0';
+
+	while((rc = oaidelta(&p, &d)) == OAI_OK) {
+		switch(d.type) {
+		case OAIDThinking:
+			nthinking++;
+			strncat(thinking, d.text, sizeof thinking - strlen(thinking) - 1);
+			break;
+		case OAIDText:
+			ntext++;
+			strncat(text, d.text, sizeof text - strlen(text) - 1);
+			break;
+		case OAIDStop:
+			nstop++;
+			break;
+		case OAIDTool:
+		case OAIDToolArg:
+			CHECK(0, "no tool deltas expected in thinking fixture");
+			break;
+		}
+	}
+
+	CHECKEQ(rc, OAI_DONE, "thinking fixture ends with OAI_DONE");
+	CHECKEQ(nthinking, 2,  "exactly 2 thinking deltas");
+	CHECKEQ(ntext,     1,  "exactly 1 text delta");
+	CHECKEQ(nstop,     1,  "exactly 1 stop delta");
+	CHECKCONTAINS(thinking, "let me think", "thinking contains first chunk");
+	CHECKCONTAINS(thinking, " about this",  "thinking contains second chunk");
+	CHECKCONTAINS(text,     "answer",        "text contains answer");
+
+	oaiterm(&p);
+	resp_free(resp);
+}
+
+/* ── Part 1.6: oaireqctxtokens and oaireqtrim ────────────────────────── */
 
 static void
 test_ctxtokens_empty(void)
@@ -968,8 +1040,9 @@ threadmain(int argc, char *argv[])
 	test_hdrs_agent_initiator();
 	test_delta_text_fixture();
 	test_delta_tool_fixture();
+	test_delta_thinking_fixture();
 
-	print("\n=== Part 1.5: oaireqctxtokens and oaireqtrim ===\n");
+	print("\n=== Part 1.6: oaireqctxtokens and oaireqtrim ===\n");
 	test_ctxtokens_empty();
 	test_ctxtokens_counts_text();
 	test_ctxtokens_counts_tool_args();

@@ -1,0 +1,143 @@
+.TH 9AI-ACME 1
+.SH NAME
+9ai-acme, 9ai-sessions \- acme interface to 9ai
+.SH SYNOPSIS
+.B 9ai-acme
+.PP
+.B 9ai-sessions
+[
+.I dir
+]
+.SH DESCRIPTION
+.I 9ai-acme
+is an acme(1) client for the
+.I 9ai
+AI assistant service.
+It creates a window named
+.B +9ai
+in the current directory, connects to the
+.I 9ai
+9P service (posted as
+.B 9ai
+in the namespace), and provides an interactive chat interface.
+.PP
+The following commands appear in the window tag and
+may be executed with button 2:
+.TP
+.B Send
+Send the current selection as a prompt.
+If nothing is selected, the last paragraph of the window body is used.
+The prompt is displayed in the window prefixed with
+.LR ▶ ,
+followed by the streamed response.
+.TP
+.B Stop
+Abort the current AI turn by writing
+.B abort
+to
+.BR 9ai/ctl .
+.TP
+.B Steer
+Redirect the running turn.
+Uses the selection (or last paragraph) as the steering message,
+writing it to
+.BR 9ai/steer .
+.TP
+.B New
+Start a fresh conversation session by writing to
+.BR 9ai/session/new .
+.TP
+.B Clear
+Erase conversation history and clear the window body.
+Writes
+.B clear
+to
+.BR 9ai/ctl .
+.TP
+.B Models
+Open a
+.B +models
+picker window listing available models, one per line.
+Button-2 on a model identifier to switch to that model.
+.TP
+.B Sessions
+Open a
+.B +sessions
+picker window listing saved sessions, newest first.
+Each line contains a session UUID, model, date, and a snippet
+of the first prompt, separated by tabs.
+Button-2 on a UUID to load that session.
+.TP
+.B Login
+Initiate the GitHub Copilot device-code authentication flow.
+The verification URL and user code are displayed in the window.
+.PP
+The window body displays:
+.IP \(bu
+A status line of the form
+.B "● <state> [<model>] <uuid8>"
+updated at each turn boundary.
+.IP \(bu
+Each prompt prefixed with
+.LR ▶ .
+.IP \(bu
+Streamed response text followed by a separator line when the turn ends.
+.IP \(bu
+Tool invocations (if any) prefixed with
+.LR ⚙ .
+.IP \(bu
+Extended thinking output (reasoning models) in a distinct prefix.
+.PP
+.I 9ai-sessions
+lists session files from
+.I dir
+(default
+.BR $home/lib/9ai/sessions/ )
+on standard output, newest first.
+Each line is tab-separated:
+.EX
+    <uuid>  <model>  <date>  <first-prompt-snippet>
+.EE
+The output format matches the Sessions picker produced by
+.IR 9ai-acme .
+.SH "ARCHITECTURE"
+.I 9ai-acme
+runs three concurrent procs:
+.TP
+.B eventproc
+Reads acme's event file to dispatch tag commands.
+.TP
+.B outproc
+Reads
+.B 9ai/output
+and appends streamed text to the window.
+Writes a separator line on each turn boundary.
+.TP
+.B aiproc
+Reads
+.B 9ai/event
+(RS-delimited records) and appends formatted annotations
+for turn state, tool calls, thinking, model changes,
+session changes, and errors.
+.PP
+All window writes are serialised through a lock so that
+the three procs do not interleave partial output.
+.SH FILES
+.B $home/lib/9ai/sessions/
+.SH SOURCE
+.B /sys/src/cmd/9ai
+.SH "SEE ALSO"
+.MR acme 1 ,
+.MR 9ai 1
+.SH DIAGNOSTICS
+If
+.I 9ai
+is not running,
+.I 9ai-acme
+exits with an error on startup.
+Start
+.I 9ai
+first:
+.EX
+    9ai -m /mnt/9ai
+.EE

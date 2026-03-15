@@ -1049,6 +1049,17 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				        d.stop_reason ? d.stop_reason : "stop");
 				stop_reason_is_tool = (strcmp(stop_reason, "tool_calls") == 0);
 				break;
+
+			case OAIDThinking:
+				/*
+				 * Reasoning/thinking delta from OAI-compat providers
+				 * (DeepSeek, llama.cpp, etc.).  Save to session and event
+				 * stream for display, but do NOT deliver to ontext and do
+				 * NOT accumulate into the assistant message — thinking is
+				 * not sent back to the API on subsequent turns.
+				 */
+				emitandsave(cfg, "thinking", d.text, nil);
+				break;
 			}
 		}
 
@@ -1166,6 +1177,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			int         is_error;
 			int         tool_aborted = 0;
 			long        maxout;
+			ExecOpts    eopts;
 
 			maxout = cfg->exec_maxout > 0 ? cfg->exec_maxout : EXEC_MAXOUT_DEFAULT;
 
@@ -1187,7 +1199,8 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			 * The watcher is RFNOWAIT so we never need to collect
 			 * its exit status.
 			 */
-			er = execrun(argsbuf, argslen, maxout);
+			eopts.unmount_mtpt = cfg->exec_unmount_mtpt;
+			er = execrun(argsbuf, argslen, maxout, &eopts);
 
 			/* check for abort that arrived during exec */
 			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
@@ -1603,6 +1616,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			int         is_error;
 			int         tool_aborted = 0;
 			long        maxout;
+			ExecOpts    eopts;
 
 			maxout = cfg->exec_maxout > 0 ? cfg->exec_maxout : EXEC_MAXOUT_DEFAULT;
 
@@ -1614,7 +1628,8 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				return -1;
 			}
 
-			er = execrun(argsbuf, argslen, maxout);
+			eopts.unmount_mtpt = cfg->exec_unmount_mtpt;
+			er = execrun(argsbuf, argslen, maxout, &eopts);
 
 			/* check for abort that arrived during exec */
 			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {

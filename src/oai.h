@@ -172,10 +172,11 @@ enum {
 };
 
 enum {
-	OAIDText    = 0,  /* content delta: d.text                  */
-	OAIDTool    = 1,  /* new tool call: d.tool_id, d.tool_name  */
-	OAIDToolArg = 2,  /* tool argument chunk: d.text            */
-	OAIDStop    = 3,  /* finish_reason: d.stop_reason           */
+	OAIDText     = 0,  /* content delta: d.text                  */
+	OAIDTool     = 1,  /* new tool call: d.tool_id, d.tool_name  */
+	OAIDToolArg  = 2,  /* tool argument chunk: d.text            */
+	OAIDStop     = 3,  /* finish_reason: d.stop_reason           */
+	OAIDThinking = 4,  /* reasoning delta: d.text                */
 };
 
 typedef struct OAIParser OAIParser;
@@ -183,10 +184,10 @@ typedef struct OAIDelta  OAIDelta;
 
 struct OAIDelta {
 	int   type;        /* OAID* constant */
-	char *text;        /* OAIDText, OAIDToolArg: delta text */
-	char *tool_id;     /* OAIDTool: new tool call id        */
-	char *tool_name;   /* OAIDTool: function name           */
-	char *stop_reason; /* OAIDStop: "stop" | "tool_calls"   */
+	char *text;        /* OAIDText, OAIDToolArg, OAIDThinking: delta text */
+	char *tool_id;     /* OAIDTool: new tool call id                      */
+	char *tool_name;   /* OAIDTool: function name                         */
+	char *stop_reason; /* OAIDStop: "stop" | "tool_calls"                 */
 };
 
 struct OAIParser {

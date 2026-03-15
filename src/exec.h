@@ -51,6 +51,25 @@ enum {
 	EXEC_MAXARG  = 4096,        /* max single argument length  */
 };
 
+/*
+ * ExecOpts — optional per-call settings for execrun().
+ *
+ * unmount_mtpt: if non-nil, unmount this path from the child's namespace
+ *               before exec.  On 9front this uses rfork(RFNAMEG) to give
+ *               the child a private namespace copy, then unmount(nil, path).
+ *               On plan9port/Linux this uses unshare(CLONE_NEWNS) followed
+ *               by umount2(path, MNT_DETACH) so the parent's namespace is
+ *               unaffected.
+ *               Use this to remove the 9ai file system from the exec
+ *               child's view for security — prevents the tool from accessing
+ *               /message, /ctl, etc.
+ */
+typedef struct ExecOpts ExecOpts;
+
+struct ExecOpts {
+	char *unmount_mtpt;   /* nil → no unmount; non-nil → path to unmount */
+};
+
 typedef struct ExecResult ExecResult;
 
 struct ExecResult {
@@ -80,6 +99,9 @@ int execparse(const char *args_json, int args_len,
  * execrun — parse args_json and run the program.
  *
  * maxout: output cap in bytes; the tail of output is kept on overflow.
+ * opts:   optional settings (may be nil for defaults).
+ *         opts->unmount_mtpt: if non-nil, unmount this path from the
+ *         child's namespace before exec.  See ExecOpts above.
  *
  * Returns a heap-allocated ExecResult on success or failure (even if
  * the program exits non-zero).  Returns nil only on internal error
@@ -89,7 +111,8 @@ int execparse(const char *args_json, int args_len,
  *
  * Caller must free with execresultfree().
  */
-ExecResult *execrun(const char *args_json, int args_len, long maxout);
+ExecResult *execrun(const char *args_json, int args_len, long maxout,
+                    ExecOpts *opts);
 
 /*
  * execabort — terminate a running exec child.

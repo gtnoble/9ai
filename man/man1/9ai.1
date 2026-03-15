@@ -1,0 +1,301 @@
+.TH 9AI 1
+.SH NAME
+9ai \- AI assistant 9P service
+.SH SYNOPSIS
+.B 9ai
+.B -m
+.I mtpt
+[
+.B -s
+.I srvname
+]
+[
+.B -S
+.I sockpath
+]
+[
+.B -t
+.I tokpath
+]
+[
+.B -M
+.I model
+]
+[
+.B -L
+]
+[
+.B -U
+]
+.SH DESCRIPTION
+.I 9ai
+is a 9P file server that exposes a GitHub Copilot AI assistant
+as a synthetic file hierarchy.
+It handles authentication, conversation history, model selection,
+session persistence, and tool execution.
+Clients interact entirely through the file interface.
+.PP
+The options are:
+.TP
+.BI -m " mtpt"
+Mount the service at
+.IR mtpt
+after posting it.
+This argument is required.
+.TP
+.BI -s " srvname"
+Post the 9P service under the name
+.I srvname
+in the namespace directory.
+Defaults to
+.BR 9ai .
+.TP
+.BI -S " sockpath"
+Path to the
+.I 9aitls
+TLS proxy socket.
+If omitted, no TLS proxy is used; the service dials the
+Copilot API directly via TLS.
+.TP
+.BI -t " tokpath"
+Path to the file holding the GitHub OAuth refresh token.
+Defaults to
+.B $home/lib/9ai/token
+on Plan 9.
+.TP
+.BI -M " model"
+Initial model identifier.
+Defaults to
+.BR gpt-4o .
+The model can be changed at runtime by writing to
+.BR /model .
+.TP
+.B -L
+Force re-authentication even if a valid token already exists.
+.TP
+.B -U
+Unmount the 9ai file system from exec children's namespaces before
+running each tool.
+When this flag is set, every process spawned by the exec tool
+receives a private copy of the namespace with
+.I mtpt
+removed, so the tool cannot read from or write to
+.BR /message ,
+.BR /ctl ,
+or any other file in the 9ai hierarchy.
+On Plan 9 this uses
+.B rfork(RFNAMEG)
+followed by
+.BR unmount (2).
+On Linux (plan9port) it uses
+.B unshare(CLONE_NEWNS)
+followed by
+.BR umount2 (2)
+with
+.BR MNT_DETACH .
+.SS "File System"
+The 9P namespace served at
+.I mtpt
+contains the following files.
+.TP
+.B ctl
+Read to obtain current state; returns lines of the form:
+.EX
+    model <id>
+    status <state>
+    session <uuid>
+.EE
+Write
+.B abort
+to cancel the running turn,
+.B clear
+to erase conversation history.
+.TP
+.B message
+Write-only.
+Write a prompt string to start a new AI turn.
+The file is clunked by the client to trigger execution.
+.TP
+.B steer
+Write-only.
+Write text to redirect the current running turn mid-stream.
+If no turn is in progress the text is queued as the next prompt.
+.TP
+.B output
+Read-only.
+Streams the AI's plain-text response for the current turn.
+Returns EOF (zero-length read) when the turn finishes.
+Reopen to wait for the next turn.
+.TP
+.B event
+Read-only.
+Streams structured event records for the current turn.
+Records are separated by RS (0x1E); fields within a record
+by FS (0x1F).
+The first field of each record is the event type:
+.RS
+.TF turn_start
+.TP
+.B turn_start
+Turn beginning.
+Fields: type, uuid, model.
+.TP
+.B thinking
+Extended thinking chunk (reasoning models only).
+Fields: type, text.
+.TP
+.B tool_start
+Tool invocation begun.
+Fields: type, tool-name, input-json.
+.TP
+.B tool_end
+Tool invocation finished.
+Fields: type, tool-name, result.
+.TP
+.B turn_end
+Turn complete.
+Fields: type, reason
+.RB ( end_turn ,
+.BR aborted ,
+or
+.BR error ).
+.TP
+.B model
+Model changed.
+Fields: type, model-id.
+.TP
+.B session_new
+New session started.
+Fields: type, uuid.
+.TP
+.B error
+Error during turn.
+Fields: type, message.
+.TP
+.B auth_ok
+Authentication succeeded.
+.TP
+.B auth_err
+Authentication failed.
+Fields: type, message.
+.RE
+.TP
+.B status
+Read-only.
+A single line summarising the current state:
+.BR ready ,
+.BR running ,
+.BR aborting ,
+or
+.BR error .
+.TP
+.B model
+Read to get the current model identifier.
+Write a model id to switch models.
+A trailing newline is optional.
+.TP
+.B models
+Read-only.
+Tab-separated list of available models, one per line:
+.EX
+    id  fmt  ctx  maxout  tools  name
+.EE
+.TP
+.B context
+Read-only.
+Estimates of context usage for the current conversation:
+.EX
+    tokens ~<n>
+    limit <k>k
+    usage <pct>%
+    messages <n>
+.EE
+.TP
+.B session/
+Directory containing session management files.
+.TP
+.B session/id
+Read-only.
+Current session UUID, or empty if no session is active.
+.TP
+.B session/new
+Write-only.
+Write any string to start a fresh session.
+The old session is saved to disk automatically.
+.TP
+.B session/load
+Write-only.
+Write the path of a session file to restore it.
+.TP
+.B session/save
+Write-only.
+Write any string to flush the current session to disk immediately.
+.TP
+.B auth/status
+Read-only.
+Current authentication state:
+.BR logged_out ,
+.BR pending ,
+or
+.BR logged_in .
+.TP
+.B auth/poll
+Write-only.
+Write
+.B start
+to initiate the GitHub device-code OAuth flow.
+.TP
+.B auth/device
+Read-only (blocks).
+After writing
+.B start
+to
+.BR auth/poll ,
+reading this file blocks until the device code is available,
+then returns two newline-terminated lines: the verification URI
+and the user code.
+.SS Skills
+Skills are plain-text files in
+.BR $home/lib/9ai/skills/ .
+Each skill file has the following structure:
+.IP
+Line 1: a one-line description shown to the model in the system prompt.
+.br
+Lines 2+: the skill body, loaded on demand.
+.PP
+At startup,
+.I 9ai
+reads the skills directory and appends a
+.B Skills
+section to the system prompt listing each skill by name and description.
+The model is told that the full text of any skill is available at
+.BI $home/lib/9ai/skills/ name
+and can be read on demand by running
+.B cat
+via the exec tool.
+.PP
+Skills are never loaded automatically; the model decides when to read
+a skill based on the description in the system prompt.
+Placing task-specific instructions in a skill file keeps the base
+system prompt short and allows the model to selectively load only
+the knowledge it needs.
+.SH FILES
+.B $home/lib/9ai/token
+.br
+.B $home/lib/9ai/sessions/
+.br
+.B $home/lib/9ai/skills/
+.SH SOURCE
+.B /sys/src/cmd/9ai
+.SH "SEE ALSO"
+.MR 9ai-acme 1 ,
+.MR 9ai-sessions 1
+.SH DIAGNOSTICS
+Errors are reported on standard error.
+If authentication fails, write
+.B start
+to
+.B auth/poll
+and follow the device-code flow described above,
+or restart with
+.BR -L .

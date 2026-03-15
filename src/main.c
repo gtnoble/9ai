@@ -28,7 +28,7 @@
 static void
 usage(void)
 {
-	fprint(2, "usage: 9ai -m mtpt [-s srvname] [-S sockpath] [-t tokpath] [-M model] [-L]\n");
+	fprint(2, "usage: 9ai -m mtpt [-s srvname] [-S sockpath] [-t tokpath] [-M model] [-L] [-U]\n");
 	threadexitsall("usage");
 }
 
@@ -41,6 +41,7 @@ threadmain(int argc, char *argv[])
 	char *tokpath  = nil;
 	char *model    = "gpt-4o";
 	int   forcelogin = 0;
+	int   unmount_fs = 0;
 
 	ARGBEGIN{
 	case 'm':
@@ -60,6 +61,9 @@ threadmain(int argc, char *argv[])
 		break;
 	case 'L':
 		forcelogin = 1;
+		break;
+	case 'U':
+		unmount_fs = 1;
 		break;
 	default:
 		usage();
@@ -84,7 +88,13 @@ threadmain(int argc, char *argv[])
 #endif
 	}
 
-	AiState *ai = aiinit(model, sockpath, tokpath);
+	/*
+	 * Pass the mount point to aiinit only when -U is given.
+	 * This is stored in AiState.mtpt and forwarded to AgentCfg.exec_unmount_mtpt,
+	 * causing each exec child to unmount the 9ai FS from its namespace
+	 * before running the tool.
+	 */
+	AiState *ai = aiinit(model, sockpath, tokpath, unmount_fs ? mtpt : nil);
 
 	/* -L flag: force re-login even if a token exists */
 	if(forcelogin)

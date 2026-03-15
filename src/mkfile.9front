@@ -40,7 +40,13 @@ HFILES=\
 
 </sys/src/cmd/mkone
 
-install: $BIN/$TARG $BIN/9ai-acme $BIN/9ai-sessions
+MAN=../man
+
+install: $BIN/$TARG $BIN/9ai-acme $BIN/9ai-sessions maninstall
+
+maninstall:V:
+	cp $MAN/man1/9ai.1 /sys/man/1/9ai
+	cp $MAN/man1/9ai-acme.1 /sys/man/1/9ai-acme
 
 # ── offline unit tests (no network required) ──────────────────────────────
 
