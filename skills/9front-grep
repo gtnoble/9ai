@@ -1,0 +1,143 @@
+Reference for 9front grep(1): search files for Plan 9 regexp patterns; flags -bchiLlnsvef; g(1) recursive source search wrapper.
+
+# 9front grep(1) — pattern search
+
+## Synopsis
+
+    grep [-bchiLlnsv] [-e] pattern | -f patternfile [file ...]
+    g [flags] pattern [file ...]
+
+## Description
+
+grep searches input files (stdin by default) for lines matching a Plan 9
+regular expression (see regexp(6)).  A newline in the pattern acts as an
+alternation operator (lowest precedence, same as |).
+
+## Options
+
+    -b    Don't buffer output; write each line as it is found.
+    -c    Print only a count of matching lines per file.
+    -e    Treat the next argument as the pattern (useful for patterns
+          beginning with -).
+    -f    Read patterns from a file, one per line.
+    -h    Suppress file name headers on output lines.
+    -i    Case-insensitive match (folds both pattern and input to lower case;
+          prints original-case lines).
+    -L    Print only names of files with NO matching lines (converse of -l).
+    -l    Print only names of files that have at least one matching line.
+    -n    Prefix each matching line with its line number in the file.
+    -s    Silent: produce no output; use exit status only.
+    -v    Invert: print lines that do NOT match.
+
+## Output
+
+When more than one file is given, each output line is prefixed with the
+file name.  To force this tagging with a single file, add /dev/null as an
+extra argument.
+
+## Exit status
+
+Null (success) if any lines were selected; non-null if no lines matched or
+an error occurred.
+
+## g wrapper
+
+g invokes grep -n and forces file-name tagging.  With no file arguments it
+recursively searches the current directory for common source file extensions
+(*.c *.h *.rc *.go *.py *.awk *.sh *.txt and many others).  Passing -n to
+g suppresses the recursive search and reads stdin or the named files only.
+
+## Regular expressions (Plan 9 regexp(6))
+
+Metacharacters: . * + ? [] () | ^ $
+  .       any character except newline
+  ^       beginning of line
+  $       end of line
+  [abc]   character class
+  [^abc]  negated class (never matches newline)
+  a-z     range inside []
+  e*      zero or more
+  e+      one or more
+  e?      zero or one
+  e1e2    concatenation
+  e1|e2   alternation
+  (e)     grouping
+
+Backslash escapes a metacharacter or the delimiter.  No POSIX named
+classes; no \d \w etc.
+
+## Examples
+
+Search for 'foo' in all .c files:
+    grep foo *.c
+
+Case-insensitive search, show line numbers:
+    grep -in 'error' log
+
+Print only file names containing 'TODO':
+    grep -l TODO *.c *.h
+
+Invert: lines not matching blank:
+    grep -v '^$' file
+
+Count matches per file:
+    grep -c pattern *.txt
+
+Use -e for a pattern that looks like a flag:
+    grep -e -v file
+
+Read patterns from a file:
+    grep -f patterns.txt corpus.txt
+
+Recursive source search with g:
+    g 'malloc' 
+
+Force file-name tags on a single file:
+    grep pattern file /dev/null
+
+## Differences from POSIX grep
+
+**Regexp engine:** Uses Plan 9 regexp(6), not ERE or BRE.  There are no
+POSIX character classes ([[:alpha:]] etc.), no \d \w \s \b shorthand, no
+backreferences in patterns, and no look-ahead/look-behind.  Alternation is
+| (as in ERE), not the BRE \|.  Parentheses for grouping are ( ) not \( \).
+
+**Newline as alternation:** A literal newline inside the pattern string is
+treated as | with lowest precedence.  POSIX does not define this behavior.
+
+**No -E / -G / -P flags:** There is no -E (extended regexp), -G (basic
+regexp), or -P (Perl regexp) option.  The single regexp dialect is always
+Plan 9 ERE-like.
+
+**No -r / --recursive flag:** grep itself has no recursive directory search.
+Use the g(1) wrapper for recursive searches over source trees.
+
+**No -w / -x flags:** Word-boundary (-w) and full-line (-x) matching flags
+are absent.  Approximate them with regexp anchors: \b is unavailable; use
+patterns like '(^|[^a-zA-Z0-9_])word([^a-zA-Z0-9_]|$)' or the ^ $ anchors.
+
+**No -A / -B / -C context flags:** There is no way to print N lines of
+context before or after a match.
+
+**No -o flag:** Cannot print only the matching portion of each line.
+
+**-i case folding:** Implemented by folding to lower case in the ASCII range
+only (a byte loop: c >= 'A' && c <= 'Z').  Non-ASCII case folding is not
+performed.
+
+**-b flag:** On POSIX, -b prints the byte offset of each match.  On 9front,
+-b means don't buffer output (write each result line immediately).  These
+are completely different behaviors.
+
+**Exit status:** Exits with the string "no matches" (non-null) when no lines
+match, null on success — consistent with POSIX but expressed as a Plan 9
+exit string rather than a numeric code.
+
+## Source
+
+/sys/src/cmd/grep
+/rc/bin/g
+
+## See also
+
+ed(1), awk(1), sed(1), sam(1), regexp(6)

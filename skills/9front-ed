@@ -1,0 +1,242 @@
+Reference for 9front ed(1): interactive line editor; address syntax; all commands a b c d e E f g i j k l m n p P q Q r s t u v w W x =; regexp(6).
+
+# 9front ed(1) — text editor
+
+## Synopsis
+
+    ed [-] [-o] [file]
+
+## Description
+
+ed is the standard Plan 9 text editor.  It operates on an in-memory
+buffer.  Changes have no effect on the original file until a w command is
+given.  If a file argument is given, ed reads it into the buffer first.
+
+## Options
+
+    -     Suppress printing of character counts by e, r, w commands and
+          the confirming ! by ! commands.
+    -o    Write all output to stderr instead of stdout (for use in pipelines).
+          With no file, /fd/1 becomes the remembered file name.
+
+## Addressing
+
+The current line (dot, written as .) is the last line affected by a command.
+Addresses are constructed as follows:
+
+    .           current line
+    $           last line of the buffer
+    n           line number n (1-based)
+    'x          line marked with name x (lower-case letter, set by k)
+    /regexp/    search forward from . for next line matching regexp
+                (wraps around to start of buffer if needed)
+    ?regexp?    search backward from . (wraps around to end)
+    addr+n      address plus n lines
+    addr-n      address minus n lines
+    addr+/re/   first line after addr matching re
+    addr-/re/   first line before addr matching re
+    addr+       addr + 1 (trailing + adds 1)
+    addr-       addr - 1 (trailing - subtracts 1)
+    +n          shorthand for .+n
+    -n          shorthand for .-n
+    ^           synonym for -
+
+Addresses are separated by , (resets . between them) or ; (; sets . to
+first address before evaluating second).  With no leading address before ,
+or ;, line 1 is assumed; with no trailing address, $ is assumed.
+
+## Commands
+
+Each command takes zero, one, or two addresses.  Default addresses shown
+in parentheses.
+
+### Input/output
+    (.)a        Append text after addressed line. Enter input mode; end
+                with . on a line by itself. Address 0 is valid (prepend).
+    (.)i        Insert text before addressed line (same as a but before).
+    (.,.)c      Change: delete addressed lines, then accept new text.
+    (.,.)d      Delete addressed lines.
+    e filename  Edit: clear buffer, read named file, set remembered name.
+    E filename  Like e but does not check for unsaved changes.
+    f [filename] Print (and optionally change) the remembered file name.
+    (.)r filename  Read file after addressed line. Dot left at last line read.
+    (1,$)w [filename]  Write addressed lines to file. Creates if absent (mode 666).
+    (1,$)W [filename]  Like w but appends to existing file.
+    q           Quit. Error if buffer modified since last w/q/e.
+    Q           Quit unconditionally.
+
+### Display
+    (.,.)p      Print addressed lines. Dot left at last printed line.
+    (.,.)P      Synonym for p.
+    (.,.)l      List in unambiguous form: tabs as \t, backspaces as \b,
+                non-printing as \xXXXX. Long lines are folded.
+    (.,.)n      Number: print with line numbers and tab prefix.
+    (.,.)b[+-][pagesize][pln]
+                Browse: print a page (default 20 lines). + or - for
+                next/previous page. p/n/l selects print format.
+    ($)=        Print the line number of the addressed line.
+
+### Substitution
+    (.,.)sn/regexp/replacement/
+    (.,.)sn/regexp/replacement/g
+    (.,.)sn/regexp/replacement   (third form implies trailing p)
+        Substitute. Replace the nth match (default 1) of regexp with
+        replacement on each addressed line. With g, replace all matches.
+        & in replacement: matched string. \1..\9: nth subexpression.
+        Literal & / \ or newline in replacement: prefix with \.
+        The / delimiter may be any non-space, non-newline character.
+
+### Move and copy
+    (.,.)m a    Move addressed lines after line a.
+    (.,.)t a    Transfer (copy) addressed lines after line a.
+    (.,.)j      Join addressed lines into one line (remove intermediate newlines).
+
+### Global commands
+    (1,$)g/regexp/command-list   Execute command-list for every line matching regexp.
+    (1,$)v/regexp/command-list   Execute command-list for every line NOT matching regexp.
+        In command-list: multiple commands separated by \-continued lines.
+        Trailing . for a/i/c input may be omitted on the last line.
+        g and v are not permitted inside command-list.
+        Any non-space non-newline character may delimit regexp.
+        Bare g/regexp/ or g/regexp means g/regexp/p.
+
+### Miscellaneous
+    (.)k x      Mark addressed line with lower-case letter x.
+    (.,.)u      Undo: restore the previous contents of the last substituted line.
+    ! command   Run command in rc(1). Dot is unchanged.
+    <newline>   An address alone is treated as a p command.
+                A blank line alone is equivalent to .+1p (step through file).
+
+## Regular expressions (Plan 9 regexp(6))
+
+Metacharacters: . * + ? [] () | ^ $
+  .       any character (not newline)
+  ^       start of line
+  $       end of line
+  [abc]   character class; [^abc] negated (never matches newline)
+  a-z     range inside []
+  e*      zero or more
+  e+      one or more
+  e?      zero or one
+  e1|e2   alternation
+  (e)     grouping / subexpression (referenced by \1..\9 in s)
+
+Backslash before a metacharacter or delimiter treats it as literal.
+
+## Examples
+
+Open a file and append a line after line 3:
+    ed file
+    3a
+    new line
+    .
+    w
+
+Substitute first occurrence of 'foo' with 'bar' on current line:
+    s/foo/bar/
+
+Substitute all occurrences globally across all lines:
+    1,$s/foo/bar/g
+
+Print all lines containing 'error':
+    g/error/p
+
+Delete all blank lines:
+    g/^$/d
+
+Print lines 5 through 10:
+    5,10p
+
+Move lines 3-5 to after line 10:
+    3,5m10
+
+Copy lines 1-3 to end of file:
+    1,3t$
+
+Mark current line as 'a', move elsewhere, return:
+    ka
+    ... (navigate) ...
+    'a
+
+Search forward for next line containing 'TODO':
+    /TODO/
+
+Non-interactive batch edit via heredoc (rc):
+    ed file << '!'
+    1,$s/old/new/g
+    w
+    q
+    !
+
+## Differences from POSIX ed
+
+**Regexp engine:** Uses Plan 9 regexp(6), not BRE.  No POSIX character
+classes ([[:alpha:]] etc.), no \n \t escape sequences in regexps (though \
+before a metacharacter escapes it), no \( \) for grouping — use ( ) instead.
+Alternation is | not \|.  Backreferences in regexps (\1 etc. in the pattern)
+are not supported; \1..\9 work only in s replacement strings.
+
+**b command is Browse, not BRE:** POSIX ed has no b command.  9front ed uses
+b for the Browse command (paged display).  Any script that tries to use b as
+a no-op or expects POSIX behavior will find Browse instead.
+
+**P (prompt) command absent:** POSIX ed defines P to toggle a command prompt.
+9front ed defines P as a synonym for p (print).  There is no prompt toggle.
+
+**u command is limited Undo:** The u command restores only the previously
+substituted line (not a general undo stack).  This is much more limited than
+the full undo history some ed implementations provide.
+
+**W (append write) command:** W wfile appends to an existing file rather than
+overwriting it.  This is not in POSIX ed.
+
+**sn/re/repl/ nth-match substitution:** The s command accepts an optional
+decimal n before the delimiter to replace the nth occurrence on each line
+(e.g. s2/foo/bar/ replaces the second foo).  POSIX ed does not specify this.
+
+**; semicolon address separator:** The ; separator (which sets dot to the
+first address before evaluating the second) is a 9front extension; POSIX ed
+only defines , as an address separator.
+
+**+ and - trailing address arithmetic:** Trailing + and - on addresses
+(cumulative increment/decrement) and the bare - / + shorthand for .-1 / .+1
+are 9front extensions.  POSIX requires the full form .+n.
+
+**^ as synonym for -:** The ^ character as an address operator (equivalent
+to -) is a compatibility extension; POSIX does not define it.
+
+**l command escape format:** Non-printing characters are shown as \xXXXX
+(backslash, x, four hex digits).  POSIX specifies a different visual
+representation (octal or C-style escapes depending on implementation).
+
+**! command uses rc(1), not sh:** Shell commands dispatched by ! are run
+via /bin/rc, not /bin/sh.  Scripts using sh-specific syntax (e.g. [[, arrays,
+$(( )) arithmetic) will fail.
+
+**-o flag:** The -o flag (write all output to stderr, set remembered file to
+/fd/1) is a 9front-specific option for pipeline use.  POSIX ed does not
+define -o.
+
+**File creation mode:** New files created by w are mode 666 (before umask).
+POSIX leaves the mode implementation-defined.
+
+**NUL and post-newline characters discarded:** When reading a file, ed
+discards NUL bytes and all characters after the last newline.  POSIX behavior
+for NUL bytes is unspecified.
+
+**Buffer file in /tmp:** The temporary buffer file is created in /tmp as
+/tmp/eXXXXX.  On hangup, unsaved work is written to ed.hup in the current
+directory.
+
+## Files
+
+/tmp/e*     temporary buffer file
+ed.hup      work is saved here on terminal hangup
+
+## Source
+
+/sys/src/cmd/ed.c
+
+## See also
+
+sam(1), sed(1), regexp(6)

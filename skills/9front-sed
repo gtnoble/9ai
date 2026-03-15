@@ -1,0 +1,203 @@
+Reference for 9front sed(1): stream editor; address/command script language; pattern and hold space; flags -ngue; Plan 9 regexp(6).
+
+# 9front sed(1) — stream editor
+
+## Synopsis
+
+    sed [-n] [-g] [-u] [-e script] [-f sfile] [file ...]
+
+## Description
+
+sed copies named files (stdin by default) to stdout, applying a script of
+editing commands.  Multiple -e and -f options accumulate into a single
+script.  If there is exactly one -e and no -f, the -e may be omitted.
+
+## Flags
+
+    -n    Suppress default output (lines are not printed unless explicitly
+          commanded with p or P).
+    -g    Make all substitutions global (as if every s command had the g flag).
+    -u    Flush output buffers before reading more input.
+    -e script   Add script commands inline.
+    -f sfile    Read script commands from file sfile.
+
+## Processing model
+
+For each input line sed:
+  1. Reads the line into the pattern space.
+  2. Applies all commands whose addresses select the pattern space.
+  3. Prints the pattern space to stdout (unless -n).
+  4. Deletes the pattern space and repeats.
+
+The hold space is a second buffer, initially empty, available for
+temporary storage between cycles.
+
+## Addresses
+
+A command may be preceded by zero, one, or two addresses:
+
+  N           decimal line number (counts across all input files)
+  $           last line of input
+  /regexp/    lines matching regexp (Plan 9 regexp(6); \n matches embedded newline)
+  addr,addr   inclusive range: from first match of addr1 through next match
+              of addr2; range repeats after addr2 is found.
+
+No address: command applies to every line.
+One address: command applies to each line matching that address.
+Two addresses: command applies to lines in the inclusive range.
+
+## Commands
+
+### Text modification
+    s/regexp/replacement/[flags]
+        Substitute. Replace matched text. Any character may be used as
+        delimiter instead of /.
+        Flags: g (global, all occurrences), p (print if substituted),
+               w wfile (append pattern space to wfile if substituted).
+        & in replacement: the entire matched string.
+        \1..\9 in replacement: nth parenthesized subexpression.
+
+    y/string1/string2/
+        Transliterate. Replace each character in string1 with the
+        corresponding character in string2. Lengths must be equal.
+
+### Branching
+    b label     Branch to :label. If label is empty, branch to end of script.
+    t label     Branch to :label if any substitution was made since the last
+                input line was read or since the last t.
+    : label     Define a branch label.
+
+### Print and delete
+    p           Print the pattern space.
+    P           Print up to the first newline in the pattern space.
+    d           Delete the pattern space; start the next cycle.
+    D           Delete up to the first newline; start next cycle.
+    q           Quit after printing the pattern space (unless -n).
+
+### Input/output
+    n           Print pattern space; replace it with the next input line.
+    N           Append the next input line to the pattern space (with \n).
+    r rfile     Read rfile and append its contents before reading the next input line.
+    w wfile     Write the pattern space to wfile.
+
+### Hold space
+    g           Replace pattern space with hold space.
+    G           Append hold space to pattern space (with \n).
+    h           Replace hold space with pattern space.
+    H           Append pattern space to hold space (with \n).
+    x           Exchange pattern and hold spaces.
+
+### Miscellaneous
+    a\<newline>text   Append text after the current cycle's output.
+    i\<newline>text   Insert text before current output.
+    c\<newline>text   Delete pattern space; at end of range, output text.
+    =           Print the current line number.
+    #           Comment to end of line.
+    { ... }     Group commands (apply all to matching lines).
+    !function   Apply function only to lines NOT selected by the address(es).
+
+## Regular expressions (Plan 9 regexp(6))
+
+Same as grep: . * + ? [] () | ^ $; \n matches embedded newline inside the
+pattern space (after N appends a line).  No \d \w \s etc.
+
+## Examples
+
+Print first 10 lines:
+    sed 10q file
+
+Delete blank lines:
+    sed '/^$/d'
+
+Replace all occurrences of FOO with BAR:
+    sed 's/FOO/BAR/g'
+
+Number non-blank lines:
+    sed '/./=' file | sed '/./N; s/\n/\t/'
+
+Strip trailing whitespace:
+    sed 's/ *$//'
+
+In-place edit (9front idiom — no -i flag; use a temp file):
+    sed 's/old/new/g' file > file.tmp && mv file.tmp file
+
+Double-space a file:
+    sed 'G'
+
+Remove duplicate blank lines:
+    sed '/^$/{ N; /^\n$/d }'
+
+Print lines 5 through 10:
+    sed -n '5,10p'
+
+Delete lines matching a pattern:
+    sed '/pattern/d'
+
+## Differences from POSIX sed
+
+**Regexp engine:** Uses Plan 9 regexp(6), not BRE/ERE.  No POSIX character
+classes ([[:alpha:]] etc.), no \d \w \s shorthand, no \1..\9 backreferences
+in the regexp itself (only in the replacement string of s).  Alternation is
+| (ERE-like) not \|; grouping is () not \(\).
+
+**-E / -r flags accepted but silently ignored:** The source accepts -E and
+-r for Unix compatibility (they are no-ops).  Patterns are always Plan 9
+regexp regardless.
+
+**-g global flag:** The -g command-line flag (make all substitutions global)
+is a 9front extension not present in POSIX sed.
+
+**-u unbuffered flag:** The -u flag (flush output before each read) is not
+in POSIX sed.
+
+**No -i in-place flag:** There is no -i option for in-place editing.  The
+9front idiom is: sed '...' file > file.tmp && mv file.tmp file.
+
+**No e command (execute pattern space):** GNU sed supports an e command that
+executes the pattern space as a shell command.  9front sed does not.
+
+**No F command (print filename):** GNU sed's F command (print current input
+filename) is absent.
+
+**No R command (read one line):** GNU sed's R rfile (read one line from
+rfile) is absent; only r (read whole file) exists.
+
+**No T command (branch if no substitution):** GNU sed adds T as the inverse
+of t.  9front sed has only t.
+
+**No W command (write first line):** GNU sed's W wfile (write first line of
+pattern space) is absent; only w (write all) exists.
+
+**No addr~step addressing:** GNU sed's first~step (every Nth line starting at
+first) address form is absent.
+
+**No 0,/re/ open range:** GNU sed allows 0 as a first address with a regexp
+second address so the range can match from line 1.  9front sed line numbers
+start at 1.
+
+**s command P flag:** The s command in 9front sed supports both p (print
+pattern space) and P (print up to first newline) as substitution flags.
+POSIX only specifies p.
+
+**l command formatting:** The l command folds long lines and shows
+non-printing characters in an unambiguous form.  The exact folding width and
+escape format may differ from GNU sed.
+
+**Shell is rc(1), not sh:** No shell commands are directly invoked by sed
+itself (unlike GNU sed's e command), but any tool invocations in the
+surrounding script use rc(1).
+
+**Line buffer limits:** The internal line buffer is 32768 runes.  Lines
+longer than this will be truncated.  GNU sed handles arbitrarily long lines.
+
+**Buffering caveat:** When reading from a pipe and q is executed, buffering
+may consume characters beyond the quitting line (documented in the man page).
+POSIX leaves q pipeline behavior unspecified.
+
+## Source
+
+/sys/src/cmd/sed.c
+
+## See also
+
+ed(1), grep(1), awk(1), sam(1), regexp(6)

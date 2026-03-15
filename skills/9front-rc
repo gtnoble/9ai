@@ -1,0 +1,379 @@
+Reference for 9front rc(1): Plan 9 shell; syntax, variables, lists, I/O redirection, pipelines, built-in commands, functions, signal handlers, environment, invocation flags.
+
+# 9front rc(1) — command language
+
+## Synopsis
+
+    rc [-srdiIlxebpvVr] [-c command] [-m initial] [file [arg ...]]
+
+## Description
+
+`rc` is the Plan 9 shell.  It executes commands read from a terminal, a file,
+or (with `-c`) from the argument string.  Commands are separated by `;` or `&`
+and terminated by a newline.  A command followed by `&` runs asynchronously;
+its pid is stored in `$apid`.  After each foreground command finishes, `$status`
+is set to its wait message (empty string means success).
+
+A long command line may be continued on subsequent lines with a trailing `\`
+followed by a newline; this sequence is treated as whitespace.  `\` is not
+otherwise special in rc.
+
+`#` begins a comment to end-of-line (except inside quotes).
+
+## Simple commands
+
+The first word of a simple command is looked up as:
+1. An `rc` function or built-in command — executed by rc.
+2. A name starting with `/` — used directly as the program path.
+3. Anything else — searched in each directory in `$path`.
+
+A script file is executable if it begins with `#!/bin/rc` (or another shell
+path).  The first word of a simple command cannot be a keyword unless quoted.
+
+**Keywords:** `for in while if not switch fn ~ ! @`
+
+## Arguments and variables
+
+**Unquoted word:** Any sequence of characters not including blank, tab,
+newline, or `# ; & | ^ $ = \` ' { } ( ) < >`.
+
+**Glob patterns:** An unquoted word containing `*`, `?`, or `[...]` is a
+filename pattern.  `*` matches any sequence; `?` matches any single character;
+`[class]` matches any character in the class (use `~` as first character to
+complement).  Ranges `a-z` are supported.  `/` must appear explicitly; `.` and
+`..` must appear at the start of a path component.  An unmatched pattern
+stands for itself rather than expanding to empty.
+
+**Quoted word:** Characters surrounded by single quotes `'...'`.  A literal
+single quote inside is written as two consecutive single quotes `''`.
+
+**List:** `(a b c)` — a list of arguments.  Variable values are lists.  Lists
+have no recursive structure; `(a (b c))` is the same as `(a b c)`.
+
+**Variable substitution:** `$name` — value of variable `name`.  `$$name`
+gives multiple levels of indirection.  `$n` (a number) gives the nth element
+of `$*`.  `$name(i)`, `$name(m-n)`, `$name(m-)` give subscripts (origin 1).
+
+**`$#name`:** Number of elements in variable `name`.  An unset variable has
+zero elements.
+
+**`$"name`:** All components of `name` joined with spaces as a single string.
+A zero-element variable yields the empty string.
+
+**Command substitution:** `` `{command} `` — rc runs the command and splits its
+standard output on characters in `$ifs` into a list.  `` `split{command} ``
+uses `split` as the separator string instead of `$ifs`.
+
+**Process substitution:** `<{command}` — runs command asynchronously with its
+stdout connected to a pipe; the value is a filename referring to the read end.
+`>{command}` — connects stdin to a pipe; value is the write-end filename.
+Used for non-linear pipelines, e.g. `cmp <{old} <{new}`.
+
+**Concatenation:** `a^b` — concatenates two operands.  If both have the same
+number of components they are concatenated pairwise; otherwise one must have
+exactly one component (distributed concatenation).
+
+**Free carets:** rc automatically inserts `^` between adjacent words when `$`,
+`'`, or `` ` `` immediately follows a word with no space, or when an unquoted
+word immediately follows a quoted word.  So `cc -$flags $stem.c` is equivalent
+to `cc -^$flags $stem^.c`.
+
+## I/O redirections
+
+    >file         redirect stdout to file (create/truncate)
+    >>file        append stdout to file
+    <file         redirect stdin from file
+    <>file        open file once for reading and writing (stdin)
+    <<eof         here document; variable substitution unless eof is quoted
+    >[2]file      redirect fd 2 to file
+    >[2=1]        dup fd 1 to fd 2
+    >[2=]         close fd 2
+    <[3]file      redirect fd 3 from file
+    |[fd]         pipe using fd instead of stdout as output end
+    |[fd0=fd1]    pipe from fd1 to fd0
+
+Redirections are executed left to right.
+
+## Pipelines and compound commands
+
+    cmd1 | cmd2           stdout of cmd1 → stdin of cmd2
+    cmd1 && cmd2          execute cmd2 only if cmd1 exits with null status
+    cmd1 || cmd2          execute cmd2 only if cmd1 exits with non-null status
+    ! cmd                 invert exit status (null↔non-null)
+    @ cmd                 run cmd in a subshell
+
+`|` binds most tightly, then `!` and `@`, then `&&` and `||` (both same
+lowest precedence).
+
+## Control structures
+
+**if:**
+
+    if (list) command
+    if not command        # else-branch of immediately preceding if(...)command
+
+**for:**
+
+    for(name in arguments) command
+    for(name) command     # iterates over $*
+
+**while:**
+
+    while(list) command   # list re-evaluated each iteration; empty list = null status
+
+**switch:**
+
+    switch(argument) {
+        case pattern ...
+            commands
+        case pattern ...
+            commands
+    }
+    # Matches argument against each case's pattern(s) using glob matching.
+    # / and first chars of . and .. need not be explicitly matched.
+
+**Braces:**
+
+    { list }             # group commands; alters precedence
+
+**Functions:**
+
+    fn name { list }     # define function; $* set to call arguments
+    fn name              # remove function definition
+
+**Note handlers (signal-like):**
+
+    fn sighup  { list }   # called on hangup note
+    fn sigint  { list }   # called on interrupt note
+    fn sigalrm { list }   # called on alarm note
+    fn sigfpe  { list }   # called on floating-point trap note
+    fn sigexit { list }   # called when rc is about to exit
+    fn sighup             # restore default behavior for sighup
+
+**Prefix assignments:**
+
+    name=value command    # assignment in effect only for the command's duration
+                          # (or permanently if command is empty)
+
+## Built-in commands
+
+    .  [-biq] file ...    Execute commands from file. $* is set to remaining
+                          args for the duration. -b: compile before running;
+                          -i: run interactively; -q: suppress errors.
+    builtin cmd ...       Execute cmd using its built-in meaning, ignoring
+                          any function of the same name.
+    cd [dir]              Change directory to dir (default $home). Searches $cdpath.
+    eval [arg ...]        Concatenate args with spaces, read and execute as rc input.
+    exec [command ...]    Replace this rc with command (no return).
+    exit [status]         Exit with status (default: current $status).
+    flag f [+-]           Set (+), clear (-), or test (neither) flag f.
+                          f is a single letter matching a command-line flag.
+    rfork [nNeEsfFmF]     Become new process group via rfork(2).
+                          Default flags: ens.
+                            n = RFNAMEG   (copy name space)
+                            N = RFCNAMEG  (new clean name space)
+                            e = RFENVG    (copy env)
+                            E = RFCENVG   (new empty env)
+                            s = RFNOTEG   (new note group)
+                            f = RFFDG     (copy fd table)
+                            F = RFCFDG    (new empty fd table)
+                            m = RFNOMNT   (disallow mounts)
+    shift [n]             Delete first n (default 1) elements of $*.
+    wait [pid]            Wait for pid (or all outstanding) to exit.
+    whatis name ...       Print value of name: assignment for variables,
+                          definition for functions, 'builtin' for built-ins,
+                          full path for executables.
+    ~ subject pattern ... Match subject against patterns (glob rules).
+                          Sets $status to 0 if any match, 1 otherwise.
+                          Patterns are not subject to filename expansion.
+
+## Special variables
+
+    $*       Argument list; saved/restored around . and function calls.
+    $apid    PID of most recently started background command.
+    $home    Default directory for cd.
+    $ifs     Input field separators for `` ` `` substitution (default: space, tab, newline).
+    $path    Search path for commands and . command (default: `. /bin`).
+    $pid     rc's own process id (set at startup).
+    $prompt  Two-element list: interactive prompt and continuation prompt
+             (default: `'% ' '	'`).
+    $status  Wait message of the last foreground command (empty = success).
+             Used by &&, ||, if, while; also the exit status of rc itself.
+
+## Environment
+
+Each non-empty variable is exported as an environment file `/env/varname`.
+Multi-value variables use NUL bytes (`\000`) as separators.  Functions are
+exported as files named `fn#functionname` containing the rc source.
+
+When rc starts it reads variable and function definitions from the environment.
+
+## Invocation flags
+
+    -c string  Read commands from string instead of a file.
+    -s         Print non-null exit status after each simple command.
+    -e         Exit if $status is non-null after a simple command.
+    -i         Run interactively (prompt, handle interrupts gracefully).
+    -I         Force non-interactive mode.
+    -l         Read $home/lib/profile on startup (also triggered by argv0
+               beginning with -).
+    -m initial Read rc's initialization from initial instead of /rc/lib/rcmain.
+    -v         Echo input on fd 2 as it is read.
+    -x         Print each simple command before executing it (trace).
+    -r         Print internal parse tree form of commands as executed (debug).
+    -b         Compile whole script before executing (enables full syntax check).
+    -p         (no-op)
+    -d         (no-op)
+
+## Startup
+
+rc reads `/rc/lib/rcmain` (or the file given with `-m`) for initialization.
+With `-l`, `/rc/lib/rcmain.local` and `$home/lib/profile` are sourced first.
+
+## Examples
+
+Simple pipeline:
+    ls | grep '\.c$' | wc -l
+
+List variables and for loop:
+    files=(a.c b.c c.c)
+    for(f in $files) echo $f
+
+If/else:
+    if(test -f /tmp/lock) {
+        echo locked
+    }
+    if not
+        echo not locked
+
+Function definition and call:
+    fn greet {
+        echo hello $1
+    }
+    greet world
+
+Switch:
+    switch($1){
+    case *.c
+        echo C source
+    case *.h
+        echo header
+    case *
+        echo unknown
+    }
+
+Background job with pid check:
+    sleep 10 &
+    echo started $apid
+
+Non-linear pipeline (compare outputs of two commands):
+    cmp <{old args} <{new args}
+
+Redirect stderr to stdout:
+    cmd >[2=1]
+
+Here document (variable substitution active):
+    cat << END
+    Hello $user
+    END
+
+Here document (no substitution — quoted marker):
+    cat << 'END'
+    Literal $dollar
+    END
+
+Capture command output into a variable:
+    now=`{date}
+
+Check if a variable matches a pattern (avoiding changing $status via ~):
+    if(~ $os plan9) echo 'on plan 9'
+
+Temporary variable for a single command:
+    HOME=/tmp cmd
+
+rfork to get a private namespace:
+    rfork n
+    bind /tmp /bin
+
+## Differences from POSIX sh / bash
+
+**No backslash escaping:** `\` is not a general escape character in rc.
+Use single quotes for literal strings.  `\<newline>` is only a line
+continuation (treated as whitespace).
+
+**Single quotes, not double:** rc has no double-quoted strings.  `'...'`
+is the quoting mechanism; embed a literal `'` as `''`.
+
+**No `$( )` command substitution:** Use `` `{cmd} `` (backtick-brace)
+instead of `$(cmd)`.
+
+**Lists, not word splitting:** Variables hold lists of strings natively.
+`x=(a b c); echo $x` passes three arguments to echo.  There is no IFS-based
+word splitting on substitution; `$ifs` is only used for `` ` `` substitution.
+
+**`^` for concatenation:** Use `a^b` or free-caret insertion instead of
+`${a}b` juxtaposition.  `$stem.c` automatically becomes `$stem^.c`.
+
+**`$#var` for list length:** Use `$#var` instead of `${#var}`.  Use `$"var`
+to join a list into a space-separated string.
+
+**`if not` instead of `else`:** Chained if-else uses `if not` rather than
+`else`.  The `if not` command must immediately follow the corresponding
+`if (list) command` — no intervening commands.
+
+**`fn` keyword, not `function`/`()`:** Functions are defined with `fn name {
+list }`.  There are no local variables; extra parameters serve as locals.
+
+**`~` for pattern matching:** The `~` built-in matches against glob patterns
+(not regexps) without triggering filename expansion.  It sets `$status` to 0
+on match.  Note: testing `$status` via `~` changes `$status`.
+
+**`rfork` as a built-in:** Process resource sharing is controlled via `rfork`
+with Plan 9 flags, not via POSIX `unshare` or `clone`.  `rfork e` (private
+environment) is a common idiom at the top of scripts to avoid polluting the
+caller's environment.
+
+**Notes, not signals:** rc handles notes (Plan 9's signal-like mechanism)
+via `fn sighup`, `fn sigint`, etc.  The note names and mechanism differ from
+POSIX signal names and `trap`.
+
+**`$status` is a string, not a number:** Exit status is a wait message string.
+An empty string means success; any non-empty string means failure.  Numeric
+exit codes from execed programs are converted to strings like `"status: 1"`.
+
+**No arithmetic:** rc has no arithmetic operators.  Use `awk` or `dc` for
+arithmetic.
+
+**No arrays with `[]`:** Lists are the only collection type.  Subscript with
+`$name(i)` (1-based origin).
+
+**No `export` built-in:** Variables are automatically exported to the
+environment when non-empty.
+
+**No `read` built-in:** Read from a file using `line=\`{sed 1q}` or similar.
+
+**Shell scripts use `/bin/rc`:** The shebang for rc scripts is `#!/bin/rc`,
+not `#!/bin/sh`.  `/bin/sh` does not exist on 9front.
+
+**`$path` not `$PATH`:** The search path variable is `$path` (lowercase), a
+list.  There is no colon-separated `$PATH`.
+
+**Process substitution syntax:** Uses `<{cmd}` and `>{cmd}` (not `<(cmd)` as
+in bash).
+
+**`@` for subshell:** `@ { ... }` runs a subshell; bash uses `( ... )`.
+
+## Files
+
+    /rc/lib/rcmain          System rc initialization script
+    /rc/lib/rcmain.local    Site-specific initialization (optional)
+    $home/lib/profile       User profile (sourced with -l)
+
+## Source
+
+/sys/src/cmd/rc
+
+## See also
+
+intro(1), bind(1), fork(2), notify(2), env(3), regexp(6)
+Tom Duff, "Rc — The Plan 9 Shell"

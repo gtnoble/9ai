@@ -109,6 +109,12 @@ static const char basesystem[] =
 	"- exec runs programs directly — no shell, no pipes, no redirection. "
 	"Pass stdin text for input; chain operations by running programs "
 	"sequentially and passing prior output as stdin.\n"
+	"- When several operations can be done together — building, grepping, "
+	"moving files, patching and then verifying — batch them into a single "
+	"rc(1) script and exec rc with the script as stdin. This avoids "
+	"multiple round-trips and is faster for the user. Use rc for any "
+	"sequence of two or more related commands that do not depend on "
+	"intermediate decisions.\n"
 	"- Read files before editing. Use cat or head to examine content, "
 	"then ed or patch for precise changes.\n"
 	"- For surgical edits, use ed(1): write an ed script to stdin "
@@ -129,7 +135,8 @@ static const char basesystem[] =
  * Appends a skills section to basesystem if any skills are present in
  * ~/lib/9ai/skills/.  Each skill is a plain text file; the first line
  * is the description shown here.  The full body is available at
- * ~/lib/9ai/skills/<name> and can be loaded on demand with exec cat.
+ * ~/lib/9ai/skills/<name>.  The prompt instructs the agent to read
+ * the full file before attempting any task matching a skill description.
  *
  * Returns a malloc'd string.  Caller must free.
  */
@@ -150,11 +157,24 @@ buildsystem(void)
 	out  = smprint(
 	    "%s"
 	    "\nSkills:\n"
-	    "Available skills are listed below as name<TAB>description.\n"
-	    "Full skill text is at %s<name> — load on demand with exec cat.\n"
+	    "Skills are reference documents that provide critical details "
+	    "needed to complete certain tasks correctly. Each skill below "
+	    "is listed as name<TAB>description.\n"
 	    "\n"
+	    "IMPORTANT: Before attempting any task whose topic matches a "
+	    "skill description, you MUST read the full skill file first "
+	    "using exec cat. The description is only a summary — the file "
+	    "contains the actual syntax, flags, examples, and caveats you "
+	    "need. Do not rely on general knowledge when a skill is "
+	    "available; it may document behaviour specific to this "
+	    "environment that differs from what you expect.\n"
+	    "\n"
+	    "Skill files are at: %s<name>\n"
+	    "To read a skill: exec cat %s<name>\n"
+	    "\n"
+	    "Available skills:\n"
 	    "%s",
-	    basesystem, sdir, skills);
+	    basesystem, sdir, sdir, skills);
 
 	free(sdir);
 	free(skills);

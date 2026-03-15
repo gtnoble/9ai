@@ -1,0 +1,281 @@
+Reference for 9front awk(1): pattern-action language; fields $1..$NF; built-in variables FS NR NF etc; all built-in functions; BEGIN/END; -F -v -f -safe flags.
+
+# 9front awk(1) — pattern-directed scanning and processing language
+
+## Synopsis
+
+    awk [-F fs] [-d] [-safe] [-v var=value] [-f progfile | prog] [file ...]
+
+## Description
+
+awk scans each input file line by line, matching each line against the
+pattern of every pattern-action statement, and executing the action for
+each match.  The filename - means stdin.  A file argument of the form
+var=value is treated as a variable assignment executed when that file
+would have been opened.
+
+## Flags
+
+    -F fs       Set the input field separator to regexp fs.
+    -v var=val  Set variable var before program execution. Repeatable.
+    -f progfile Read the awk program from progfile instead of prog.
+    -safe       Safe mode: no shell commands, no file opens, no ENVIRON.
+    -d          (debug) dump parsing information.
+
+## Program structure
+
+A program is a sequence of pattern-action statements:
+
+    pattern { action }
+
+A missing action defaults to { print }.  A missing pattern always matches.
+Statements are separated by newlines or semicolons.
+
+Special patterns:
+    BEGIN   { ... }   executed before any input is read
+    END     { ... }   executed after all input is exhausted
+
+Range pattern:
+    pat1, pat2  { ... }   action applied to all lines from the first line
+                          matching pat1 through the next line matching pat2.
+
+## Fields and records
+
+Each input line is a record.  Fields are split by FS (default: whitespace).
+    $0      entire record
+    $1..$NF individual fields (NF is the number of fields)
+    $(NF)   last field
+    $0 = "..." reassigning $0 re-splits into fields
+
+If FS is empty (""), each character becomes a separate field.
+
+## Built-in variables
+
+    FS        input field separator regexp (default whitespace)
+    RS        input record separator (default newline)
+    OFS       output field separator (default space)
+    ORS       output record separator (default newline)
+    NR        current record number (cumulative across files)
+    FNR       current record number within the current file
+    NF        number of fields in current record
+    FILENAME  name of current input file
+    OFMT      output format for numbers (default "%.6g")
+    CONVFMT   format for internal number-to-string conversion (default "%.6g")
+    SUBSEP    multi-subscript separator (default \034)
+    ARGC      argument count (assignable)
+    ARGV      argument array (assignable; non-null members used as file names)
+    ENVIRON   array of environment variables (not in -safe mode)
+
+## Statements
+
+    if (expr) stmt [else stmt]
+    while (expr) stmt
+    for (init; cond; incr) stmt
+    for (var in array) stmt
+    do stmt while (expr)
+    break
+    continue
+    { stmt ... }
+    expression          (assignment is a common expression statement)
+    print [list] [> file | >> file | | cmd]
+    printf format [, list] [> file | >> file | | cmd]
+    return [expr]
+    next              skip remaining patterns on this line; read next input
+    nextfile          skip rest of current file; open next; restart at top
+    delete array[expr]
+    delete array
+    exit [expr]       exit immediately; status is expr
+
+## Operators
+
+Arithmetic: + - * / % ^ (exponentiation)
+String:     concatenation (whitespace between expressions)
+Assignment: = += -= *= /= %= ^=
+Comparison: == != < <= > >=
+Logical:    && || !
+Ternary:    expr ? expr : expr
+Increment:  ++ --
+Match:      ~ (matches regexp)  !~ (does not match regexp)
+Array test: (i) in array
+
+## Regular expressions
+
+Used as patterns and in ~ / !~ operators.  Plan 9 regexp(6) syntax.
+/re/ is a constant regexp; a string variable may also be used as a regexp
+except in bare pattern position.
+
+## Built-in functions
+
+### String functions
+    length(s)           length of string s (or array s = number of elements;
+                        no arg = length of $0)
+    substr(s, m)        substring of s starting at position m (1-based)
+    substr(s, m, n)     n-character substring starting at m
+    index(s, t)         position of string t in s, or 0
+    match(s, r)         position of regexp r in s, or 0; sets RSTART and RLENGTH
+    split(s, a, fs)     split s into array a using fs; return count
+                        (fs defaults to FS; empty fs splits per character)
+    sub(r, t [, s])     replace first match of regexp r with t in s (default $0)
+                        & in t = matched text; returns number of replacements
+    gsub(r, t [, s])    replace all matches of r with t; return count
+    sprintf(fmt, ...)   format string (same as printf format)
+    tolower(str)        convert to lower case
+    toupper(str)        convert to upper case
+
+### I/O functions
+    print [list]        print to stdout (OFS between items, ORS at end)
+    printf fmt [, list] formatted print (C printf-style, see fprintf(2))
+    getline             read next record from input into $0; return 1/0/-1
+    getline < file      read next record from file into $0
+    getline x           read next record from input into variable x
+    getline x < file    read from file into x
+    cmd | getline       pipe cmd output; each call returns next line
+    close(expr)         close file or pipe expr
+    fflush([expr])      flush file/pipe expr (or all if omitted/empty)
+    system(cmd)         execute cmd; return its exit status
+
+### Math functions
+    atan2(y, x)
+    cos(x)
+    sin(x)
+    exp(x)
+    log(x)
+    sqrt(x)
+    int(x)              truncate to integer
+    rand()              random number in (0,1)
+    srand([seed])       set rand seed; return previous seed
+
+### Plan 9 specific
+    utf(n)              convert character number n to a UTF string
+
+## User-defined functions
+
+    function name(p1, p2, ...) { ...; return expr }
+
+Parameters are passed by value for scalars, by reference for arrays.
+All other variables are global.  Extra parameters serve as local variables.
+Functions may be recursive.
+
+## Arrays
+
+Associative arrays with string subscripts:
+    a["key"] = val
+    a[i,j]             multi-subscript: indices joined with SUBSEP
+    delete a[key]
+    delete a            delete all elements
+    for (k in a)        iterate over all keys
+    (k) in a            test membership
+
+## Examples
+
+Print lines longer than 72 characters:
+    awk 'length($0) > 72'
+
+Print first two fields in reversed order:
+    awk '{ print $2, $1 }'
+
+Use comma-or-whitespace field separator:
+    awk 'BEGIN { FS = ",[ \t]*|[ \t]+" } { print $2, $1 }'
+
+Sum first column and print total and average:
+    awk '{ s += $1 } END { print "sum", s, "avg", s/NR }'
+
+Print all lines between /start/ and /stop/:
+    awk '/start/,/stop/'
+
+Count occurrences of each word:
+    awk '{ for (i=1; i<=NF; i++) count[$i]++ } END { for (w in count) print count[w], w }' | sort -rn
+
+Simulate echo:
+    awk 'BEGIN { for (i=1; i<ARGC; i++) printf "%s ", ARGV[i]; printf "\n"; exit }' a b c
+
+Print lines where field 3 > 100:
+    awk '$3 > 100'
+
+Strip comments (lines beginning with #):
+    awk '!/^#/'
+
+In-place substitution (no -i on 9front; use a temp file):
+    awk '{ gsub(/old/, "new"); print }' file > file.tmp && mv file.tmp file
+
+## Differences from POSIX awk (and GNU gawk)
+
+**Regexp engine:** Uses Plan 9 regexp(6), not POSIX ERE.  No POSIX character
+classes ([[:alpha:]], [[:digit:]] etc.), no interval expressions ({m,n}), no
+\b \d \w \s shorthand, no backreferences.  Alternation | and grouping () work
+as in ERE.
+
+**-safe flag:** The -safe flag (disable file I/O, shell commands, and
+ENVIRON) is a 9front/Plan 9 extension not in POSIX or gawk.
+
+**-d flag:** The -d flag enables parser debug output.  Not in POSIX.
+
+**-F t tab wart:** -Ft and -F t (the letter t alone) are silently rewritten
+to a literal tab character.  POSIX requires using -F '\t' or a C escape;
+this wart preserves Plan 9 convention.
+
+**utf() function:** The utf(n) built-in (convert a Unicode code point to a
+UTF-8 string) is a Plan 9 extension with no POSIX equivalent.
+
+**nextfile statement:** The nextfile statement (skip remaining records of the
+current file and proceed to the next) is a common extension; it was not in
+the original POSIX spec (added later in POSIX 2008 as an optional extension).
+
+**delete array:** delete array (delete all elements of an array at once) is a
+common extension not in original POSIX awk.
+
+**Pipes to getline:** The cmd | getline form (pipe a shell command's output
+into getline) is a common extension; POSIX added it in later revisions.
+
+**Shell commands use rc(1):** system(cmd) and all pipe operations ( | cmd,
+cmd | getline) run commands via /bin/rc, not /bin/sh.  Scripts using
+sh-specific syntax will fail silently or produce wrong results.
+
+**No gensub():** The gensub(re, repl, how [, str]) function (GNU awk
+extension for capturing groups in replacements via \1..\9) is absent.
+Use multiple sub/gsub calls instead.
+
+**No OFMT/printf %* width:** printf format widths from variables (%*d) may
+or may not be supported; test before relying on them.
+
+**No BEGINFILE / ENDFILE:** GNU awk's BEGINFILE and ENDFILE special patterns
+are absent.
+
+**No @include / @load:** GNU awk's @include and @load directives are absent.
+
+**No -M arbitrary precision:** GNU awk's -M (MPFR arbitrary precision) flag
+is absent; all arithmetic is double-precision floating point.
+
+**No multiple -f files sharing state:** Multiple -f progfiles are concatenated
+into a single program, which matches gawk behavior, but POSIX only requires
+one -f.  On 9front the limit is 20 -f files (pfile[20] in the source).
+
+**Number formatting:** OFMT and CONVFMT default to "%.6g", same as POSIX.
+Output format for integers printed via print is plain decimal (no %.6g
+applied to exact integers).
+
+**RS multi-character:** RS is only honoured as a single character (the first
+character of the string).  GNU awk treats RS as a regexp when it is more
+than one character.
+
+**Associative array iteration order:** for (k in a) iterates in an
+unspecified (hash-table-dependent) order, same as POSIX — but programs that
+assume sorted or insertion order will behave differently from gawk with
+PROCINFO["sorted_in"].
+
+**ENVIRON unavailable in -safe mode:** POSIX does not define -safe; scripts
+that rely on ENVIRON and are run under -safe will see an empty array.
+
+**UTF-8 handling:** The source notes that UTF is not always handled correctly,
+though an attempt is made.  split() with an empty FS copes with UTF in the
+string being split.  Byte-level patterns on multi-byte characters may give
+unexpected results.
+
+## Source
+
+/sys/src/cmd/awk
+
+## See also
+
+sed(1), regexp(6)
+A. V. Aho, B. W. Kernighan, P. J. Weinberger, The AWK Programming Language, Addison-Wesley, 1988.

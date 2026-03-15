@@ -1,0 +1,197 @@
+Reference for 9front hget(1), hpost(1), webpaste(1), urlencode(1): HTTP retrieval and posting via webfs(4); all flags; form scraping; URL encoding.
+
+# 9front hget(1) — retrieve or post to a URL
+
+## Synopsis
+
+    hget [-l | -o file] [-e file] [-p body | -P] [-r header] [-m method] [-b baseurl] url
+    hpost [-l] [-g action | -p action | -m action] [-r header] [-u] url [name:value | name@file] ...
+    webpaste [file]
+    urlencode [-d] [file]
+
+## Description
+
+`hget`, `hpost`, `webpaste`, and `urlencode` are rc(1) scripts (except
+`urlencode`, which is a compiled C program) for working with HTTP from the
+Plan 9 command line.  They all require `webfs(4)` to be running and mounted
+at `/mnt/web`.
+
+### hget
+
+`hget` fetches the resource at `url` and writes its body to stdout.
+
+**Flags:**
+
+    -l           Print the Location URL from the response instead of
+                 the body.  Useful after a POST that redirects to a
+                 result URL (avoids re-fetching uploaded data).
+
+    -o file      Keep file in sync with the remote URL.  If the remote
+                 has been modified more recently than file, overwrite it.
+                 If file exists but is incomplete, fetch only the missing
+                 bytes (Range: request).
+
+    -e file      Write the server's error response body to file instead
+                 of discarding it (by default error bodies are ignored).
+
+    -p body      POST the string body to the URL (performs HTTP POST
+                 instead of GET).
+
+    -P           POST data read from stdin (instead of a string argument).
+
+    -r header    Add an arbitrary HTTP request header.  May be repeated
+                 for multiple headers.  Example: `-r 'Authorization: Bearer tok'`.
+
+    -m method    Override the HTTP method (default GET, or POST when -p/-P
+                 is given).  Example: `-m DELETE`.
+
+    -b baseurl   Interpret url as relative to baseurl.
+
+**How it works:** hget opens `/mnt/web/clone`, reads a connection number,
+then writes the URL (and optional baseurl, headers, POST body, method) to
+the connection's `ctl` file via the webfs(4) interface.  The response body
+is read from `body`; content-encoding is handled automatically
+(`gzip` → gunzip, `bzip2` → bunzip2, `compress` → uncompress).
+
+### hpost
+
+`hpost` has two operating modes:
+
+**Form scraping mode** (no `-g`/`-p`/`-m` given): fetches `url`, parses
+its HTML forms, and prints rc(1) commands to stdout that would submit those
+forms with their default field values.  The user can then edit and run the
+printed commands.
+
+**Form submission mode** (with `-g`, `-p`, or `-m`): fetches `url`, parses
+its forms, then immediately invokes `hget` to submit the form to `action`.
+
+**Flags:**
+
+    -l              Pass -l to hget (print Location instead of body).
+
+    -u              Treat the next argument as the target URL when it does
+                    not immediately follow the last option.  Usually omitted.
+
+    -r header       Pass an extra HTTP header to hget.
+
+    -g action       Set form method to GET; use action as the relative
+                    form action URL.
+
+    -p action       Set form method to POST (url-encoded body); use action
+                    as the relative form action URL.
+
+    -m action       Set form method to POST with Content-Type
+                    multipart/form-data; use action as the relative form
+                    action URL.  Required for file uploads; files must be
+                    seekable (file(1) is invoked to determine MIME type).
+
+**Field arguments** (after the URL):
+
+    name:value      Provide a text field value; overrides the form's default.
+    name@file       Provide a file for a file-upload field.
+
+### webpaste
+
+`webpaste` uploads content to `http://okturing.com` and prints the URL where
+it can be retrieved.  Input is stdin if no file argument is given.
+
+    ns | webpaste            # paste output of ns(1)
+    webpaste /tmp/notes.txt  # paste a file
+
+### urlencode
+
+`urlencode` percent-encodes or decodes data according to RFC 3986 rules.
+Reads from file (or stdin if no file is given); writes to stdout.
+
+    urlencode file      # encode
+    urlencode -d file   # decode
+
+Characters left unencoded: letters, digits, and `/ $ - _ @ . ! * ' ( ) ,`.
+Spaces are encoded as `+`.  All other bytes are encoded as `%XX`.
+
+## webfs(4) connection model
+
+`hget` is built directly on top of webfs(4).  Understanding the model helps
+when scripting HTTP directly:
+
+1. Open `/mnt/web/clone` for reading to get a connection number `n`.
+2. The clone file is now equivalent to `/mnt/web/n/ctl`.
+3. Write configuration to `/mnt/web/n/ctl`:
+   - `url URL`
+   - `baseurl URL`
+   - `headers Header-Line`
+   - `request METHOD` (default GET; writing to postbody implies POST)
+4. Write POST body to `/mnt/web/n/postbody` if needed (this initiates the
+   request and must complete before body is opened).
+5. Open `/mnt/web/n/body` to initiate the request and stream the response.
+6. Read response metadata from `/mnt/web/n/contenttype`,
+   `/mnt/web/n/contentlength`, `/mnt/web/n/contentencoding`,
+   `/mnt/web/n/contentrange`, `/mnt/web/n/parsed/url`, etc.
+7. On error, open `/mnt/web/n/errorbody` for the server's error payload.
+
+## Examples
+
+Download a file:
+    hget http://9front.org/img/nix-on.jpg > /tmp/nix-on.jpg
+
+Fetch and unpack a tarball (content-encoding handled automatically):
+    hget http://example.com/src.tar.gz | tar xzf -
+
+POST data:
+    hget -p 'q=plan9' http://example.com/search
+
+POST from stdin:
+    echo 'some data' | hget -P http://example.com/upload
+
+HEAD request only:
+    hget -m HEAD http://example.com/
+
+Send a custom header:
+    hget -r 'Accept: application/json' http://api.example.com/data
+
+Relative URL from a base:
+    hget -b http://example.com/subdir/ ../other/page.html
+
+Sync a local file with a remote URL (only fetch if newer):
+    hget -o /tmp/index.html http://example.com/
+
+Retrieve the Location after a POST redirect:
+    hget -l -p 'data=x' http://example.com/submit
+
+Scrape a form and view the submission command:
+    hpost http://p.intma.in
+
+Submit a form directly:
+    hpost -u http://p.intma.in -p paste.cgi text:'test post'
+
+Upload a file and print the resulting URL:
+    hpost -l http://i.intma.in file@/tmp/screen.png | rc
+
+Upload the output of ns(1) to a pastebin:
+    ns | webpaste
+
+URL encode a string (using a temporary file or pipe via hget scripting):
+    echo 'hello world' | urlencode
+
+URL decode:
+    echo 'hello+world%21' | urlencode -d
+
+## Diagnostics
+
+`hget`, `hpost`, and `webpaste` require `webfs(4)` to be running and
+mounted at `/mnt/web`.  If it is not, they will fail with an error opening
+`/mnt/web/clone`.
+
+To start webfs manually:
+    webfs
+
+## Source
+
+    /rc/bin/hget
+    /rc/bin/hpost
+    /rc/bin/webpaste
+    /sys/src/cmd/urlencode.c
+
+## See also
+
+webfs(4), ftpfs(4), file(1), rc(1)

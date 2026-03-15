@@ -1,0 +1,507 @@
+Reference for Plan 9 (9front) concepts and idioms vs. UNIX: name spaces, 9P, bind/mount, /proc /srv /net /env, notes vs signals, file permissions, the shell (rc), file servers, distributed model.
+
+# Plan 9 / 9front — Key Differences from UNIX
+
+This skill covers the concepts and idioms that differ most sharply between
+Plan 9 (specifically 9front) and POSIX/Linux UNIX, to aid in writing correct
+Plan 9 code and scripts.
+
+---
+
+## Philosophy: Everything is a File
+
+Plan 9 takes "everything is a file" further than UNIX.  Network connections,
+process state, environment variables, hardware devices, authentication
+agents, and UI windows are all accessed by opening, reading, and writing
+files.  There is no `ioctl`; configuration and control happen via writes to
+control files.
+
+---
+
+## Name Spaces
+
+Each process group has its own private **name space** — a mapping from file
+names to objects (files, devices, remote file trees).  Unlike UNIX where all
+processes share the same global filesystem root, Plan 9 processes can have
+completely different views of the filesystem.
+
+**bind(1):** Binds one part of the namespace over another.
+
+    bind new old          # make old an alias for new
+    bind -a new old       # append new to the union at old (search old first)
+    bind -b new old       # prepend new to the union at old (search new first)
+    bind -c new old       # same as default but allow file creation here
+
+**mount(1):** Mounts a 9P file server service onto the namespace.
+
+    mount /srv/service /mnt/point   # mount a service from /srv
+    mount -n /srv/service /mnt/point  # skip authentication
+
+**Union directories:** Multiple directories can be bound to the same path.
+Lookup searches them in list order.  Creation goes into the first
+`-c`-flagged member.  This replaces the UNIX `PATH`-style search; instead of
+having a search path, you bind all your bin directories together under `/bin`.
+
+**rfork(2) and namespace isolation:** `rfork(RFNAMEG)` gives a child process a
+copy of the parent's namespace; `rfork(RFCNAMEG)` gives it a blank namespace.
+`rfork(RFNOMNT)` disallows mounts into that namespace.  In rc(1): `rfork n`
+(copy), `rfork N` (clean).
+
+**UNIX equivalent:** Linux's `mount --bind`, `chroot`, and namespaces
+(`CLONE_NEWNS`) are rough analogues, but in Plan 9 every program can use this
+routinely via normal system calls.
+
+---
+
+## The 9P Protocol
+
+**9P** is the network protocol that glues Plan 9 together.  Every file server
+— including kernel devices — speaks 9P.  File operations (`open`, `read`,
+`write`, `stat`) are translated into 9P messages (`Topen`/`Ropen`, etc.).
+
+Because all servers speak the same protocol, a user program can implement
+a file server that is indistinguishable from a kernel device or a remote
+file server.  Tools like `webfs(4)`, `acme(1)`, `plumber(4)`, and `factotum(4)`
+are user-space programs that serve file trees over 9P.
+
+**Connection:** A 9P connection is a bidirectional byte stream (pipe,
+network connection, etc.).  The server is posted in `/srv`; clients mount it.
+
+**UNIX equivalent:** There is no direct equivalent.  FUSE is a rough analogy.
+
+---
+
+## /srv — Service Registry
+
+`/srv` (bound to `#s`) is a flat directory where processes post open file
+descriptors to make them available to others.  Any process can create a file
+in `/srv` and write a file descriptor number into it; any other process can
+then open that file to get its own reference to the same open file (typically
+the 9P connection end of a pipe to a file server).
+
+    # Start a file server and post it
+    ramfs -s myfs    # posts /srv/myfs
+    mount /srv/myfs /mnt/ram
+
+    # Create a pipe-based service manually
+    {ramfs; ...} | mount -c /fd/0 /mnt/x &
+
+**UNIX equivalent:** Roughly analogous to Unix domain sockets or systemd
+socket activation, but simpler and integrated with the filesystem.
+
+---
+
+## /proc — Process Filesystem
+
+`/proc` (bound to `#p`) is a directory with numbered subdirectories, one per
+running process.  Each contains:
+
+    /proc/n/args        command name and arguments
+    /proc/n/ctl         write control commands: kill, hang, stop, start, ...
+    /proc/n/fd          list of open file descriptors
+    /proc/n/mem         process memory image
+    /proc/n/note        write a note (signal-like) to the process
+    /proc/n/notepg      write a note to the process group
+    /proc/n/ns          namespace listing
+    /proc/n/status      process status line
+    /proc/n/wait        wait message when child exits
+
+**Sending signals:** There is no `kill` syscall.  To kill a process write
+`kill` to `/proc/n/ctl`.  `kill(1)` is an rc script that prints the write
+commands; you pipe its output to rc:
+
+    kill processname | rc
+    slay processname | rc    # unconditional kill (no grace period)
+
+**UNIX equivalent:** Similar to Linux `/proc`, but older and the model Linux
+was partly inspired by.  Key differences: no `/proc/n/maps` style memory
+maps; memory access is via `/proc/n/mem`; control is via text writes to
+`/proc/n/ctl` rather than signals.
+
+---
+
+## /env — Environment Variables
+
+Environment variables are files in `/env` (bound to `#e`).  The name of the
+file is the variable name; the content is the value.  Multi-value rc(1) list
+variables use NUL bytes (`\000`) as element separators.
+
+    cat /env/user          # print $user
+    echo -n glenda > /env/user   # set $user (in this process's env)
+
+`rfork(RFENVG)` copies the environment to a new group (changes isolated).
+`rfork(RFCENVG)` starts with a clean empty environment.
+
+In rc(1): `rfork e` is a common idiom at the top of scripts to prevent
+variable pollution of the caller's environment.
+
+**UNIX equivalent:** The environment is similar, but in UNIX it is a block
+of strings passed at `execve`.  In Plan 9 it is a kernel-managed file
+device, making it live and accessible from any process in the group.
+
+---
+
+## /net — Network as Files
+
+Network protocols are accessed through the `/net` directory (bound to `#Ispec`).
+Each protocol (tcp, udp, etc.) has:
+
+    /net/tcp/clone      open to allocate a new connection n
+    /net/tcp/n/ctl      write control: connect, announce, bind, ...
+    /net/tcp/n/data     read/write actual data
+    /net/tcp/n/local    local address
+    /net/tcp/n/remote   remote address
+    /net/tcp/n/status   connection status
+    /net/tcp/n/listen   accept incoming connections
+
+**Network address syntax:** `network!host!service`, e.g. `tcp!example.com!80`.
+The special network name `net` means "any network in common with the host."
+
+**dial(2):** The standard library `dial()` function wraps the `/net` interface:
+
+    fd = dial("tcp!example.com!80", nil, dir, &cfd);
+
+**UNIX equivalent:** BSD sockets are replaced by the file-based `/net`
+interface.  There is no `socket()`, `connect()`, `bind()`, `listen()`,
+`accept()` syscall API; all of that is accomplished via file operations on
+`/net`.
+
+---
+
+## Notes — Plan 9's Signal Mechanism
+
+Plan 9 uses **notes** instead of POSIX signals.  A note is a short text
+string (up to `ERRLEN` characters).  Notes are delivered by writing to
+`/proc/n/note` or `/proc/n/notepg`.
+
+**Common notes:**
+
+    interrupt        Ctrl-C (analogous to SIGINT)
+    hangup           terminal hangup (analogous to SIGHUP)
+    alarm            timer expiry (analogous to SIGALRM)
+    kill             forced termination (analogous to SIGKILL)
+    sys: fp: ...     floating point trap
+
+**Note handling in C:** `notify(handler)` registers a handler function
+`void handler(void *ureg, char *note)`.  The handler calls `noted(NCONT)`
+to resume or `noted(NDFLT)` to take the default action.
+
+**Note handling in rc(1):** Use `fn sigint { ... }`, `fn sighup { ... }`, etc.
+`fn sigexit { ... }` is called when rc exits.
+
+**Key difference from POSIX signals:**
+- Notes are arbitrary strings, not fixed integer codes.
+- `kill` is just a note name, not a number.
+- No `SIGKILL` that cannot be caught — `kill` can be handled, but the system
+  may use `slay` for unconditional termination.
+- Signal handlers cannot perform floating point operations (same restriction).
+
+**UNIX equivalent:** POSIX signals, but text-based and more flexible.
+
+---
+
+## File Permissions
+
+Plan 9 file permissions are similar to UNIX but with important differences:
+
+**Mode bits:**
+
+    0400  read by owner
+    0200  write by owner
+    0100  execute/search by owner
+    0070  read, write, execute by group
+    0007  read, write, execute by others
+
+**No setuid/setgid bits:** There is no `setuid` or `setgid` bit.  Plan 9
+uses a different security model based on the `factotum(4)` authentication
+agent and user identities in the 9P protocol.
+
+**No sticky bit:** The sticky bit does not exist.
+
+**Owner and group are strings:** `uid` and `gid` in a `Dir` struct are
+string names, not integer IDs.  There is no `/etc/passwd` mapping; user
+identity is established when attaching to a file server.
+
+**`muid`:** A third name field, `muid`, records who last modified the file.
+
+**File server enforces permissions:** Permission checking is done by the file
+server, not the kernel.  Each 9P attach identifies the user; the server
+checks against uid/gid strings.
+
+**chmod(1):** Works the same as UNIX chmod with octal modes or symbolic
+`[ugo][+-=][rwx]`.  No `+s`, `+t` bits.
+
+---
+
+## The Shell: rc(1) not sh
+
+There is no `/bin/sh` on 9front.  The shell is **rc(1)** (`/bin/rc`).
+
+Key differences from sh/bash (see `9front-rc` skill for full detail):
+
+- Single-quoted strings only; `\` is not a general escape.
+- Lists are native; no word splitting on `$var`.
+- `$#var` for list length; `$"var` to join list.
+- `` `{cmd} `` for command substitution (not `$(cmd)`).
+- `if not` for else (not `else`).
+- `fn name { ... }` for functions.
+- `rfork` as a built-in for namespace/environment manipulation.
+- `$status` is a string, not an integer.
+- No arithmetic; use `awk` or `dc`.
+- `~` for glob pattern matching (not `[[ ]]` or `case`).
+- `fn sigint/sighup/...` for signal-like note handlers.
+
+Scripts begin with `#!/bin/rc`.
+
+---
+
+## Standard I/O and /fd
+
+File descriptors are visible as files in `/fd` (bound to `#d`):
+
+    /fd/0    stdin
+    /fd/1    stdout
+    /fd/2    stderr
+    /fd/n    file descriptor n
+
+Opening `/fd/n` gives you another reference to that file descriptor (like
+`dup`).  This allows rc scripts to pass file descriptors to programs:
+
+    prog /fd/3   # pass fd 3 as a file path argument
+
+Redirections like `<>/dev/null` open a single file for both reading and
+writing onto a single fd.
+
+---
+
+## /dev Devices
+
+`/dev` (bound to `#c`) contains console and clock devices:
+
+    /dev/cons         console (terminal I/O)
+    /dev/consctl      raw/cooked console mode control
+    /dev/null         bit bucket (like UNIX /dev/null)
+    /dev/zero         source of zero bytes
+    /dev/random       random bytes
+    /dev/time         time of day (nanoseconds since epoch)
+    /dev/pid          this process's pid
+    /dev/ppid         parent pid
+    /dev/user         current user name
+    /dev/sysname      system name (hostname)
+
+Note: there is no `/dev/stdin`, `/dev/stdout`, `/dev/stderr`; use `/fd/0`,
+`/fd/1`, `/fd/2` instead.
+
+---
+
+## Kernel "Devices" (#letter notation)
+
+Kernel services are named `#X` where `X` is a letter.  They are bound into
+the name space, not accessed directly.  Common ones:
+
+    #c   cons device → /dev
+    #d   dup device → /fd
+    #e   env device → /env
+    #p   proc device → /proc
+    #s   srv device → /srv
+    #I   IP device → /net (spec is an integer, e.g. #I0)
+    #P   pipe device (used internally)
+    #|   pipe device (unnamed pipes)
+
+---
+
+## Process Model
+
+**rfork(2)** is the only way to create new processes (like UNIX `fork`, but
+with fine-grained resource sharing flags).
+
+**Resources that can be shared or copied per-fork:**
+
+    RFPROC    create a new process (without this, changes affect current process)
+    RFNAMEG   copy name space (vs. share)
+    RFCNAMEG  start with empty name space
+    RFENVG    copy environment (vs. share)
+    RFCENVG   start with empty environment
+    RFNOTEG   new note group (isolated from parent's note group)
+    RFFDG     copy file descriptor table (vs. share)
+    RFCFDG    start with empty fd table
+    RFNOMNT   disallow mounts in child's name space
+    RFNOWAIT  child won't leave a wait message (daemonize)
+
+**No exec-without-fork:** `exec(2)` replaces the current process (like POSIX
+`execve`).  `rc` built-in `exec` does the same: `exec prog args`.
+
+**Wait messages:** When a child exits, the parent calls `wait(2)` to get a
+`Waitmsg` struct containing pid, time, and a message string.  The message
+is the `$status` string from rc.  An empty message = success.
+
+---
+
+## Distributed Model: Terminals, CPU Servers, File Servers
+
+Plan 9 is designed as a three-tier distributed system:
+
+- **File server:** Stores files; speaks 9P over the network.
+- **CPU server:** Runs computationally intensive processes; imports the
+  terminal's screen/input and exports its computation.
+- **Terminal:** Runs the window system (rio); user-facing.
+
+This means:
+- Your home directory is on a remote file server.
+- `cpu(1)` connects to a CPU server and runs a shell there while your
+  local terminal provides I/O.
+- Programs run on the CPU server but read/write your local `/dev/cons` etc.
+  by importing the terminal's namespace.
+
+**UNIX equivalent:** Similar to a thin client / SSH workflow, but integrated
+deeply — the terminal's devices are literally namespace-mounted on the
+CPU server, so programs transparently access the local screen and keyboard.
+
+---
+
+## Text Processing Tools
+
+Tools differ from GNU/POSIX counterparts (see tool-specific skills):
+
+- **awk(1):** Plan 9 regexp engine; `-safe` flag; `utf()` built-in; no gawk
+  extensions; uses rc(1) not sh for subcommands.
+- **sed(1):** Plan 9 regexp; no `-i`; `-g` global flag; uses rc(1).
+- **grep(1):** Plan 9 regexp; `-b` means unbuffered (not byte offset);
+  `-l`/`-L`/`-c`/`-n`/`-v`/`-i`/`-h`/`-s`; no `-A`/`-B`/`-C`/`-r`/`-o`.
+- **ed(1):** Plan 9 regexp; `b` is Browse not label; `P` is print not prompt.
+- **sam(1):** Structural regular expressions; client-server model.
+
+**Regular expressions (regexp(6)):** Plan 9 uses its own regexp library
+(see `plan9-regexp` skill).  No `\d`, `\w`, `\s`, `\b`, no POSIX character
+classes `[[:alpha:]]`, no lookahead/lookbehind, no backreferences in patterns.
+Alternation is `|`; grouping is `()`.
+
+---
+
+## C Library and System Call Differences
+
+- **Headers:** `#include <u.h>` must come first (defines types like `u32int`,
+  `uchar`, etc.); then `#include <libc.h>`.
+- **No `errno`:** Errors are communicated as strings.  `errstr(buf, nbuf)`
+  retrieves the last error string.  `%r` in `print` formats the error string.
+- **String functions:** `strecpy`, `utflen`, `runetochar`, `chartorune` for
+  UTF-8.  Standard C string functions work but are byte-oriented.
+- **No `malloc.h`:** `malloc`, `free`, `realloc` are in `<libc.h>`.
+- **Formatted I/O:** `print`, `fprint`, `sprint` (not `printf`, `fprintf`,
+  `sprintf`) are preferred, but the C standard forms also exist.
+  `%r` is the error string format verb (Plan 9 extension).
+- **Exits:** `exits("reason")` instead of `exit(int)`.  Empty string = success.
+- **`sysfatal`:** `sysfatal("message %r")` prints to stderr and exits.
+- **No `pthread`:** Threads are created via `rfork(RFPROC|...)` or via
+  `threadcreate` from `<thread.h>` (which uses `rfork` internally).
+
+---
+
+## File Path Conventions
+
+    /bin         executable binaries (union of several sources)
+    /rc/bin      rc scripts (often part of /bin union)
+    /lib         libraries, fonts, locale data
+    /sys/src     system source code
+    /sys/man     manual pages
+    /usr/username  user home directories
+    /tmp         temporary files
+    /net         network protocols
+    /srv         service file descriptors
+    /proc        process information
+    /dev         devices
+    /env         environment variables
+    /fd          open file descriptors
+    /mnt         mount points for applications
+    /n           mount points for remote file trees
+
+**No `/etc`:** Configuration is typically done via plan9.ini (kernel config),
+ndb (network database), or factotum (authentication).  There is no
+`/etc/passwd`, `/etc/shadow`, `/etc/hosts`, `/etc/resolv.conf`.
+
+**No `/home`:** User home directories are typically `/usr/$user`.
+
+**No `/usr/local`:** Software is generally built into `/bin`, `/lib`, etc.
+
+---
+
+## Plumber
+
+The **plumber(4)** is a message-routing daemon.  It receives "plumb messages"
+(with fields: source, destination, working directory, type, attribute list,
+data) and routes them to the appropriate handler based on rules in
+`$home/lib/plumbing`.
+
+- Right-clicking (button-3) in acme sends a plumb message.
+- The plumber can open files in editors, launch browsers, etc.
+- Programs write to `/mnt/plumb/send` to dispatch messages.
+- Programs read from `/mnt/plumb/portname` to receive messages.
+
+**UNIX equivalent:** Roughly analogous to `xdg-open` or D-Bus activation,
+but programmable via text rules.
+
+---
+
+## Window System: rio
+
+**rio(1)** is the Plan 9 window system.  It is minimalist:
+
+- Windows are resized/moved by right-click dragging.
+- No title bars with close buttons; all commands via the menu.
+- Each window has an associated `/dev/cons` file.
+- Text is selected with button-1; middle-click (button-2) executes a command;
+  right-click (button-3) searches/navigates.
+
+**acme(1)** is the integrated text editor and shell environment (see
+`acme-vfs` and `acme` skills).
+
+---
+
+## Authentication: factotum
+
+**factotum(4)** is the authentication agent.  It holds secrets and performs
+authentication on behalf of processes.  It is a file server mounted at
+`/mnt/factotum`.
+
+- Replaces PAM, `~/.ssh/authorized_keys`, Kerberos tickets with a single agent.
+- Speaks various protocols: password, p9sk1 (Plan 9 native auth), secstore,
+  etc.
+- UNIX equivalent: roughly `ssh-agent` + PAM + Kerberos KDC client, combined.
+
+---
+
+## Quick Reference: UNIX → Plan 9 Mapping
+
+| UNIX concept            | Plan 9 equivalent                              |
+|-------------------------|------------------------------------------------|
+| `/bin/sh`               | `/bin/rc` (rc shell)                           |
+| `$PATH`                 | `$path` (list variable); use `bind -a` for /bin|
+| `fork()` + `execve()`   | `rfork(RFPROC|RFFDG|...)` + `exec()`           |
+| `kill -SIGNAL pid`      | write `kill` to `/proc/pid/ctl`                |
+| POSIX signals           | Notes (text strings) via `/proc/pid/note`      |
+| `/etc/passwd`           | factotum + file server user lists              |
+| BSD sockets             | `/net/tcp`, `/net/udp` file interface          |
+| `errno`                 | `errstr()` / `%r` format verb                  |
+| `exit(n)`               | `exits("reason")` (string, not int)            |
+| FUSE                    | 9P user-space file servers                     |
+| `setuid` bit            | Not present; use auth agent                    |
+| `/dev/stdin`            | `/fd/0`                                        |
+| `~/.profile`            | `$home/lib/profile`                            |
+| `$HOME`                 | `$home`                                        |
+| `$USER` / `whoami`      | `$user` / `cat /dev/user`                      |
+| `hostname`              | `cat /dev/sysname`                             |
+| `ps`                    | `ps(1)` (different flags; shows wait state)    |
+| `strace`                | `acid(1)` debugger + `/proc/n/mem`             |
+| `crontab`               | `cron(8)` (present but simpler)                |
+| `sudo`                  | No equivalent; CPU server/auth model instead   |
+| `ln -s`                 | No symbolic links on native file servers; use `bind` |
+| GNU sed `-i`            | `sed '...' f > f.tmp && mv f.tmp f`           |
+| `grep -r`               | `grep -r` absent; use `g` wrapper or `du -a | xargs grep` |
+
+---
+
+## See also
+
+rc(1), bind(1), mount(1), rfork(2), fork(2), notify(2), dial(2), stat(2),
+intro(3), cons(3), env(3), proc(3), srv(3), ip(3), intro(5), namespace(4),
+webfs(4), plumber(4), factotum(4), regexp(6), intro(1)
