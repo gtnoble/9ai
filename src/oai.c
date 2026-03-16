@@ -65,7 +65,10 @@ static const char exec_tool_json[] =
     "\"description\":\"Program and arguments, e.g. [\\\"grep\\\",\\\"-r\\\","
     "\\\"foo\\\",\\\"src\\\"]\"},"
     "\"stdin\":{\"type\":\"string\","
-    "\"description\":\"Optional text to supply as stdin.\"}"
+    "\"description\":\"Optional text to supply as stdin.\"},"
+    "\"timeout\":{\"type\":\"integer\","
+    "\"description\":\"Timeout in seconds before the process is killed. "
+    "Defaults to 30. Increase for long-running builds or tests.\"}"
     "},"
     "\"required\":[\"argv\"]"
     "}}}";

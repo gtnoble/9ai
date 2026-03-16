@@ -297,13 +297,13 @@ waitpolled(void)
 
 int
 execparse(const char *args_json, int args_len,
-          char *argv[], int maxargv, char **stdin_out)
+          char *argv[], int maxargv, char **stdin_out, int *timeout_s_out)
 {
 	enum { MAXTOK = 512 };
 	jsmn_parser  p;
 	jsmntok_t   *toks;
 	int          ntoks;
-	int          argv_i, stdin_i;
+	int          argv_i, stdin_i, timeout_i;
 	int          argc, elem, i;
 	char        *buf;
 
@@ -398,6 +398,21 @@ execparse(const char *args_json, int args_len,
 		*stdin_out = sinbuf;
 	} else {
 		*stdin_out = strdup("");
+	}
+
+	/* find optional "timeout" integer (seconds) */
+	if(timeout_s_out != nil)
+		*timeout_s_out = 0;
+	timeout_i = jsonget(args_json, toks, ntoks, 0, "timeout");
+	if(timeout_i >= 0 && toks[timeout_i].type == JSMN_PRIMITIVE
+	   && timeout_s_out != nil) {
+		char tbuf[32];
+		int tlen = toks[timeout_i].end - toks[timeout_i].start;
+		if(tlen > 0 && tlen < (int)sizeof tbuf) {
+			memmove(tbuf, args_json + toks[timeout_i].start, tlen);
+			tbuf[tlen] = '\0';
+			*timeout_s_out = atoi(tbuf);
+		}
 	}
 
 	free(toks);
@@ -510,11 +525,16 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 	Waitmsg    *w;
 	int         i;
 	const char *unmount_mtpt;
+	long        timeout_ms;
+	vlong       startns;
 
 	unmount_mtpt = (opts != nil) ? opts->unmount_mtpt : nil;
+	timeout_ms   = (opts != nil && opts->timeout_ms > 0)
+	               ? opts->timeout_ms
+	               : (long)EXEC_DEFAULT_TIMEOUT_S * 1000;
 
 	/* parse tool args JSON */
-	argc = execparse(args_json, args_len, argv, EXEC_MAXARGV, &stdin_str);
+	argc = execparse(args_json, args_len, argv, EXEC_MAXARGV, &stdin_str, nil);
 	if(argc < 0)
 		return nil;
 
@@ -629,6 +649,45 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 	}
 	r->pid = pid;
 
+	/*
+	 * Timeout watcher: spawn a proc that sleeps for timeout_ms and then
+	 * sends a kill note to the child if it is still running.  We use the
+	 * same RFNOWAIT pattern as the stdin writer so we never need to wait
+	 * for it.  The watcher sends "kill" via postnote; execabort() would
+	 * also work but watcher only needs one signal — the child has already
+	 * started collecting output so it will get EOF soon after the kill.
+	 *
+	 * The watcher is shared-address-space (RFMEM) free: it only uses the
+	 * stack-local 'pid' and 'timeout_ms' values captured at spawn time.
+	 * On plan9port/Linux we use fork() directly so it inherits these by
+	 * value across the fork.  On 9front we use rfork(RFPROC|RFFDG|RFNOWAIT).
+	 *
+	 * After postnote the watcher exits immediately — it does not call
+	 * execabort (which polls for exit) because that would race with the
+	 * parent's waitchild().
+	 */
+	startns = nsec();
+#ifdef PLAN9PORT
+	{
+		int wpid = fork();
+		if(wpid == 0) {
+			/* watcher child */
+			sleep((int)timeout_ms);
+			postnote(PNPROC, pid, "kill");
+			_exit(0);
+		}
+		/* parent: if fork failed just skip the watcher */
+		USED(wpid);
+	}
+#else
+	if(rfork(RFPROC|RFFDG|RFNOWAIT) == 0) {
+		/* watcher child */
+		sleep((int)timeout_ms);
+		postnote(PNPROC, pid, "kill");
+		_exits("");
+	}
+#endif
+
 	/* collect combined output */
 	r->output = collectoutput(out_pipe[0], maxout, &r->outputlen, &r->truncated);
 	close(out_pipe[0]);
@@ -677,6 +736,18 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 			}
 		}
 		free(w);
+	}
+
+	/*
+	 * Detect timeout: if the elapsed wall time is >= timeout_ms the
+	 * watcher fired and killed the child.  We compare against
+	 * (timeout_ms - 500) to give 500 ms of slop for scheduling jitter —
+	 * a legitimate fast process won't be anywhere near the deadline.
+	 */
+	{
+		vlong elapsedms = (nsec() - startns) / 1000000LL;
+		if(elapsedms >= timeout_ms - 500)
+			r->timed_out = 1;
 	}
 
 	for(i = 0; i < argc; i++)
@@ -747,7 +818,9 @@ execresultstr(ExecResult *r, char *buf, long n)
 		memmove(buf, r->output, outlen);
 	buf[outlen] = '\0';
 
-	if(r->exitcode != 0)
+	if(r->timed_out)
+		snprint(buf + outlen, n - outlen, "\n[timed out]");
+	else if(r->exitcode != 0)
 		snprint(buf + outlen, n - outlen, "\nexited %d", r->exitcode);
 
 	return buf;

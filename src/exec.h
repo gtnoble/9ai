@@ -8,9 +8,11 @@
  *
  * ── Tool input format ─────────────────────────────────────────────────
  *
- *   {"argv":["program","arg1","arg2"],"stdin":"optional text"}
+ *   {"argv":["program","arg1","arg2"],"stdin":"optional text","timeout":30}
  *
- * "argv" is required; "stdin" is optional (empty string if absent).
+ * "argv" is required; "stdin" and "timeout" are optional.
+ * "timeout" is an integer number of seconds; defaults to
+ * EXEC_DEFAULT_TIMEOUT_S (30) when absent or zero.
  * Arguments must be complete strings — no shell expansion, no glob.
  *
  * ── Usage ─────────────────────────────────────────────────────────────
@@ -47,8 +49,9 @@
  */
 
 enum {
-	EXEC_MAXARGV = 256,         /* max argv elements           */
-	EXEC_MAXARG  = 4096,        /* max single argument length  */
+	EXEC_MAXARGV            = 256,  /* max argv elements           */
+	EXEC_MAXARG             = 4096, /* max single argument length  */
+	EXEC_DEFAULT_TIMEOUT_S  = 30,   /* default tool timeout (seconds) */
 };
 
 /*
@@ -63,11 +66,17 @@ enum {
  *               Use this to remove the 9ai file system from the exec
  *               child's view for security — prevents the tool from accessing
  *               /message, /ctl, etc.
+ *
+ * timeout_ms:   wall-clock timeout in milliseconds.  0 means use the default
+ *               (EXEC_DEFAULT_TIMEOUT_S * 1000).  If the child has not exited
+ *               within this window, execabort() is called automatically and
+ *               ExecResult.timed_out is set to 1.
  */
 typedef struct ExecOpts ExecOpts;
 
 struct ExecOpts {
 	char *unmount_mtpt;   /* nil → no unmount; non-nil → path to unmount */
+	long  timeout_ms;     /* 0 → use default (EXEC_DEFAULT_TIMEOUT_S*1000) */
 };
 
 typedef struct ExecResult ExecResult;
@@ -78,22 +87,24 @@ struct ExecResult {
 	char  *output;     /* combined stdout+stderr, nil-terminated      */
 	long   outputlen;  /* length of output in bytes                   */
 	int    truncated;  /* 1 if output was capped at maxout            */
+	int    timed_out;  /* 1 if the child was killed by the timeout    */
 };
 
 /*
- * execparse — parse tool-call JSON into argv[] and stdin string.
+ * execparse — parse tool-call JSON into argv[], stdin string, and timeout.
  *
  * args_json: accumulated input_json_delta string (the full JSON object).
  * args_len:  byte length of args_json.
  *
  * On success: argv[] is populated (nil-terminated), *stdin_out points
- * to a malloc'd copy of the stdin string (may be empty), returns the
+ * to a malloc'd copy of the stdin string (may be empty), *timeout_s_out
+ * is set to the "timeout" integer from JSON (0 if absent), returns the
  * argc count.  Caller must free argv[0..argc-1] and *stdin_out.
  *
  * On error: returns -1, sets errstr.
  */
 int execparse(const char *args_json, int args_len,
-              char *argv[], int maxargv, char **stdin_out);
+              char *argv[], int maxargv, char **stdin_out, int *timeout_s_out);
 
 /*
  * execrun — parse args_json and run the program.

@@ -994,38 +994,49 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			char *tsstdin = nil;
 			int   tsargc;
 
-			tsargc = execparse(argsbuf, argslen, tsargv, EXEC_MAXARGV, &tsstdin);
+			{
+				int tstimeout_s = 0;
+				tsargc = execparse(argsbuf, argslen, tsargv, EXEC_MAXARGV, &tsstdin, &tstimeout_s);
 
-			if(tsargc > 0) {
-				/* build nil-terminated field list on the stack */
-				char *fields[EXEC_MAXARGV + 8];
-				int   fi = 0, i;
-				fields[fi++] = "tool_start";
-				fields[fi++] = tool_name;
-				fields[fi++] = tool_id;
-				for(i = 0; i < tsargc; i++)
-					fields[fi++] = tsargv[i];
-				fields[fi++] = tsstdin ? tsstdin : "";
-
-				{
-					char *buf;
-					long  len;
-
-					buf = fmtrecfields(fields, fi, &len);
-					if(buf != nil) {
-						if(cfg->onevent != nil)
-							cfg->onevent(buf, len, cfg->aux);
-						if(cfg->sess_bio != nil)
-							Bwrite(cfg->sess_bio, buf, len);
-						free(buf);
+				if(tsargc > 0) {
+					/* build nil-terminated field list on the stack */
+					char  tsbuf[32];
+					char *fields[EXEC_MAXARGV + 8];
+					int   fi = 0, i;
+					fields[fi++] = "tool_start";
+					fields[fi++] = tool_name;
+					fields[fi++] = tool_id;
+					for(i = 0; i < tsargc; i++)
+						fields[fi++] = tsargv[i];
+					fields[fi++] = tsstdin ? tsstdin : "";
+					/* append timeout_s as a decimal string; empty = default */
+					if(tstimeout_s > 0) {
+						snprint(tsbuf, sizeof tsbuf, "%d", tstimeout_s);
+						fields[fi++] = tsbuf;
+					} else {
+						fields[fi++] = "";
 					}
-				}
 
-				for(i = 0; i < tsargc; i++)
-					free(tsargv[i]);
-			} else {
-				/* fallback: no argv fields */
-				emitandsave(cfg, "tool_start", tool_name, tool_id, nil);
+					{
+						char *buf;
+						long  len;
+
+						buf = fmtrecfields(fields, fi, &len);
+						if(buf != nil) {
+							if(cfg->onevent != nil)
+								cfg->onevent(buf, len, cfg->aux);
+							if(cfg->sess_bio != nil)
+								Bwrite(cfg->sess_bio, buf, len);
+							free(buf);
+						}
+					}
+
+					for(i = 0; i < tsargc; i++)
+						free(tsargv[i]);
+				} else {
+					/* fallback: no argv fields */
+					emitandsave(cfg, "tool_start", tool_name, tool_id, nil);
+				}
 			}
 			free(tsstdin);
 		}
@@ -1060,6 +1071,15 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			 * its exit status.
 			 */
 			eopts.unmount_mtpt = cfg->exec_unmount_mtpt;
+			{
+				int tool_timeout_s = 0;
+				char *dummy_argv[2]; char *dummy_stdin = nil;
+				execparse(argsbuf, argslen, dummy_argv, 1, &dummy_stdin, &tool_timeout_s);
+				free(dummy_stdin);
+				eopts.timeout_ms = tool_timeout_s > 0
+				    ? (long)tool_timeout_s * 1000
+				    : 0;  /* 0 → execrun uses EXEC_DEFAULT_TIMEOUT_S */
+			}
 			er = execrun(argsbuf, argslen, maxout, &eopts);
 
 			/* check for abort that arrived during exec */
@@ -1434,17 +1454,19 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			char *tsargv[EXEC_MAXARGV + 1];
 			char *tsstdin = nil;
 			int   tsargc;
+			int   tstimeout_s = 0;
 
-			tsargc = execparse(argsbuf, argslen, tsargv, EXEC_MAXARGV, &tsstdin);
+			tsargc = execparse(argsbuf, argslen, tsargv, EXEC_MAXARGV, &tsstdin, &tstimeout_s);
 
 			if(tsargc > 0) {
+				char   tsbuf[32];
 				char  *buf;
 				char  **flds;
 				long  len;
 				int   j;
 
-				/* +4: tool_start, name, id, stdin */
-				flds = malloc((tsargc + 4) * sizeof(char*));
+				/* +5: tool_start, name, id, stdin, timeout */
+				flds = malloc((tsargc + 5) * sizeof(char*));
 				if(flds == nil) {
 					for(j = 0; j < tsargc; j++) free(tsargv[j]);
 					free(tsstdin);
@@ -1456,8 +1478,15 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				for(j = 0; j < tsargc; j++)
 					flds[3 + j] = tsargv[j];
 				flds[3 + tsargc] = tsstdin ? tsstdin : "";
+				/* append timeout_s as decimal; empty = default */
+				if(tstimeout_s > 0) {
+					snprint(tsbuf, sizeof tsbuf, "%d", tstimeout_s);
+					flds[4 + tsargc] = tsbuf;
+				} else {
+					flds[4 + tsargc] = "";
+				}
 
-				buf = fmtrecfields(flds, tsargc + 4, &len);
+				buf = fmtrecfields(flds, tsargc + 5, &len);
 				if(buf != nil) {
 					if(cfg->onevent != nil) cfg->onevent(buf, len, cfg->aux);
 					if(cfg->sess_bio != nil) Bwrite(cfg->sess_bio, buf, len);
@@ -1492,6 +1521,15 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			}
 
 			eopts.unmount_mtpt = cfg->exec_unmount_mtpt;
+			{
+				int tool_timeout_s = 0;
+				char *dummy_argv[2]; char *dummy_stdin = nil;
+				execparse(argsbuf, argslen, dummy_argv, 1, &dummy_stdin, &tool_timeout_s);
+				free(dummy_stdin);
+				eopts.timeout_ms = tool_timeout_s > 0
+				    ? (long)tool_timeout_s * 1000
+				    : 0;  /* 0 → execrun uses EXEC_DEFAULT_TIMEOUT_S */
+			}
 			er = execrun(argsbuf, argslen, maxout, &eopts);
 
 			/* check for abort that arrived during exec */

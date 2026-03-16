@@ -122,7 +122,7 @@ test_parse_basic(void)
 	const char *js = "{\"argv\":[\"echo\",\"hello\"]}";
 
 	print("\n-- 1.1 execparse: basic argv\n");
-	argc = execparse(js, strlen(js), argv, 16, &sin);
+	argc = execparse(js, strlen(js), argv, 16, &sin, nil);
 	CHECKEQ(argc, 2, "argc == 2");
 	CHECKSTR(argv[0], "echo",  "argv[0] == echo");
 	CHECKSTR(argv[1], "hello", "argv[1] == hello");
@@ -140,7 +140,7 @@ test_parse_with_stdin(void)
 	const char *js = "{\"argv\":[\"cat\"],\"stdin\":\"hello\\n\"}";
 
 	print("\n-- 1.2 execparse: argv + stdin\n");
-	argc = execparse(js, strlen(js), argv, 16, &sin);
+	argc = execparse(js, strlen(js), argv, 16, &sin, nil);
 	CHECKEQ(argc, 1,     "argc == 1");
 	CHECKSTR(argv[0], "cat", "argv[0] == cat");
 	CHECKSTR(sin, "hello\n", "stdin == hello\\n");
@@ -156,7 +156,7 @@ test_parse_multiarg(void)
 	const char *js = "{\"argv\":[\"printf\",\"%s %s\",\"foo\",\"bar\"]}";
 
 	print("\n-- 1.3 execparse: multi-arg\n");
-	argc = execparse(js, strlen(js), argv, 16, &sin);
+	argc = execparse(js, strlen(js), argv, 16, &sin, nil);
 	CHECKEQ(argc, 4,         "argc == 4");
 	CHECKSTR(argv[0], "printf", "argv[0]");
 	CHECKSTR(argv[1], "%s %s",  "argv[1]");
@@ -175,7 +175,7 @@ test_parse_empty_argv(void)
 	const char *js = "{\"argv\":[]}";
 
 	print("\n-- 1.4 execparse: empty argv → error\n");
-	argc = execparse(js, strlen(js), argv, 16, &sin);
+	argc = execparse(js, strlen(js), argv, 16, &sin, nil);
 	CHECKEQ(argc, -1, "empty argv returns -1");
 	CHECKNIL(sin,     "stdin not allocated on error");
 	{
@@ -196,7 +196,7 @@ test_parse_missing_argv(void)
 	const char *js = "{\"stdin\":\"foo\"}";
 
 	print("\n-- 1.5 execparse: missing argv → error\n");
-	argc = execparse(js, strlen(js), argv, 16, &sin);
+	argc = execparse(js, strlen(js), argv, 16, &sin, nil);
 	CHECKEQ(argc, -1, "missing argv returns -1");
 	CHECKNIL(sin,     "stdin not allocated on error");
 	{
@@ -217,7 +217,7 @@ test_parse_nonstring_argv(void)
 	const char *js = "{\"argv\":[42]}";
 
 	print("\n-- 1.6 execparse: non-string argv element → error\n");
-	argc = execparse(js, strlen(js), argv, 16, &sin);
+	argc = execparse(js, strlen(js), argv, 16, &sin, nil);
 	CHECKEQ(argc, -1, "non-string argv[0] returns -1");
 	CHECKNIL(sin,     "stdin not allocated on error");
 }
@@ -231,10 +231,35 @@ test_parse_absent_stdin(void)
 	const char *js = "{\"argv\":[\"ls\"]}";
 
 	print("\n-- 1.7 execparse: absent stdin → empty string\n");
-	argc = execparse(js, strlen(js), argv, 16, &sin);
+	argc = execparse(js, strlen(js), argv, 16, &sin, nil);
 	CHECKEQ(argc, 1,   "argc == 1");
 	CHECKSTR(sin, "",  "stdin is empty string when absent");
 	CHECK(sin != nil,  "sin is non-nil (empty string, not nil)");
+	free(argv[0]); free(sin);
+}
+
+static void
+test_parse_timeout(void)
+{
+	char *argv[16];
+	char *sin;
+	int   argc, tout;
+	const char *js;
+
+	print("\n-- 1.8 execparse: timeout field parsed\n");
+	js = "{\"argv\":[\"sleep\",\"1\"],\"timeout\":60}";
+	tout = -1;
+	argc = execparse(js, strlen(js), argv, 16, &sin, &tout);
+	CHECKEQ(argc, 2,    "argc == 2");
+	CHECKEQ(tout, 60,   "timeout == 60");
+	free(argv[0]); free(argv[1]); free(sin);
+
+	print("\n-- 1.9 execparse: absent timeout → 0\n");
+	js = "{\"argv\":[\"ls\"]}";
+	tout = -1;
+	argc = execparse(js, strlen(js), argv, 16, &sin, &tout);
+	CHECKEQ(argc, 1,   "argc == 1");
+	CHECKEQ(tout, 0,   "absent timeout → 0");
 	free(argv[0]); free(sin);
 }
 
@@ -477,6 +502,7 @@ threadmain(int argc, char *argv[])
 	test_parse_missing_argv();
 	test_parse_nonstring_argv();
 	test_parse_absent_stdin();
+	test_parse_timeout();
 
 	print("\n=== Part 2: execrun ===\n");
 	test_run_echo();

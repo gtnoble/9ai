@@ -4,6 +4,7 @@
 
 #include <u.h>
 #include <libc.h>
+#include "exec.h"
 #include "render.h"
 
 /* ── tool_start ── */
@@ -15,13 +16,23 @@
  *   fields[0] = "tool_start"
  *   fields[1] = tool name
  *   fields[2] = tool id (unused in display)
- *   fields[3..nf-2] = argv elements
- *   fields[nf-1] = stdin (empty string if none; absent in old records)
+ *   fields[3..nf-3] = argv elements          (new records with timeout)
+ *   fields[nf-2]    = stdin                  (new records with timeout)
+ *   fields[nf-1]    = timeout_s decimal str  (new records with timeout)
  *
- * Output format:
+ * Backwards compatibility:
+ *   nf >= 5  → has argv, stdin AND timeout field
+ *   nf == 4  → has argv and stdin, no timeout
+ *   nf <  4  → no argv, no stdin, no timeout (old/fallback record)
+ *
+ * Output format (timeout non-default, no stdin):
+ *
+ *   ┌ ⚙ cmd arg1 arg2 … [60s]
+ *
+ * Output format (default timeout, with stdin):
  *
  *   ┌ ⚙ cmd arg1 arg2 …
- *   │ stdin line 1        ← only when stdin is non-empty
+ *   │ stdin line 1
  *   │ stdin line 2
  *
  * The trailing newline after the last stdin line is the separator before
@@ -30,30 +41,30 @@
 char *
 render_tool_start(char **fields, int nf)
 {
-	/*
-	 * Determine the argv range and whether a stdin field is present.
-	 *
-	 * New records: fields[3..nf-2] = argv, fields[nf-1] = stdin.
-	 * Old records (no stdin field): fields[3..nf-1] = argv.
-	 *
-	 * We treat nf >= 4 as "new" (has stdin) and nf < 4 as "old"
-	 * (no argv at all, so certainly no stdin field either).
-	 * When nf == 3 there is no argv and no stdin; nf >= 4 means the
-	 * last field is stdin and fields[3..nf-2] are argv.
-	 */
 	int   argv_first = 3;
 	int   argv_last;   /* inclusive */
 	char *stdin_str;
 	int   has_stdin;
+	int   timeout_s;   /* 0 = default (don't annotate) */
 
-	if(nf >= 4) {
-		argv_last  = nf - 2;   /* fields[3..nf-2] */
+	if(nf >= 5) {
+		/* new record: argv in [3..nf-3], stdin at nf-2, timeout at nf-1 */
+		argv_last  = nf - 3;
+		stdin_str  = fields[nf - 2];
+		has_stdin  = (stdin_str != nil && stdin_str[0] != '\0');
+		timeout_s  = (fields[nf - 1] != nil && fields[nf - 1][0] != '\0')
+		             ? atoi(fields[nf - 1]) : 0;
+	} else if(nf == 4) {
+		/* old record without timeout: argv in [3..nf-2], stdin at nf-1 */
+		argv_last  = nf - 2;
 		stdin_str  = fields[nf - 1];
 		has_stdin  = (stdin_str != nil && stdin_str[0] != '\0');
+		timeout_s  = 0;
 	} else {
-		argv_last  = nf - 1;   /* fields[3..nf-1] (may be < argv_first) */
+		argv_last  = nf - 1;   /* may be < argv_first → empty argv */
 		stdin_str  = nil;
 		has_stdin  = 0;
+		timeout_s  = 0;
 	}
 
 	/* ── build "cmd arg1 arg2 …" string ── */
@@ -82,10 +93,17 @@ render_tool_start(char **fields, int nf)
 		}
 		*p = '\0';
 
+		/* ── build optional timeout annotation "[Xs]" ── */
+		char tannot[32];
+		if(timeout_s > 0 && timeout_s != EXEC_DEFAULT_TIMEOUT_S)
+			snprint(tannot, sizeof tannot, " [%ds]", timeout_s);
+		else
+			tannot[0] = '\0';
+
 		/* ── no stdin: single header line ── */
 		if(!has_stdin) {
-			char *out = smprint("\n\xe2\x94\x8c \xe2\x9a\x99 %s %s\n",
-			                    nf > 1 ? fields[1] : "?", cmd);
+			char *out = smprint("\n\xe2\x94\x8c \xe2\x9a\x99 %s %s%s\n",
+			                    nf > 1 ? fields[1] : "?", cmd, tannot);
 			free(cmd);
 			return out;
 		}
@@ -108,7 +126,7 @@ render_tool_start(char **fields, int nf)
 			char *out;
 			int   olen, j;
 
-			hdr = smprint("\n\xe2\x94\x8c \xe2\x9a\x99 %s %s\n", tool, cmd);
+			hdr = smprint("\n\xe2\x94\x8c \xe2\x9a\x99 %s %s%s\n", tool, cmd, tannot);
 			free(cmd);
 			if(hdr == nil)
 				return nil;

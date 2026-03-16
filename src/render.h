@@ -8,10 +8,15 @@
  * fields[0] = "tool_start"
  * fields[1] = tool name
  * fields[2] = tool id (unused in display)
- * fields[3..nf-2] = argv
- * fields[nf-1] = stdin (empty string if none)
+ * fields[3..nf-3] = argv
+ * fields[nf-2] = stdin (empty string if none)
+ * fields[nf-1] = timeout in seconds as a decimal string, or "" for default
  *
- * Displays the full command followed by stdin (if non-empty).
+ * Old records without the timeout field (nf <= original layout) are
+ * handled gracefully — the timeout annotation is simply omitted.
+ *
+ * Displays the full command (with timeout annotation when non-default),
+ * followed by stdin (if non-empty).
  * Returns a malloc'd string, or nil on error.
  */
 char *render_tool_start(char **fields, int nf);
