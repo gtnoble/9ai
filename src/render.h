@@ -8,8 +8,10 @@
  * fields[0] = "tool_start"
  * fields[1] = tool name
  * fields[2] = tool id (unused in display)
- * fields[3..nf-1] = argv
+ * fields[3..nf-2] = argv
+ * fields[nf-1] = stdin (empty string if none)
  *
+ * Displays the full command followed by stdin (if non-empty).
  * Returns a malloc'd string, or nil on error.
  */
 char *render_tool_start(char **fields, int nf);

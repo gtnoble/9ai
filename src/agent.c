@@ -983,10 +983,11 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 		{
 			/*
 			 * Parse argv from argsbuf to get individual fields.
-			 * For the event record, each argv element is its own field:
-			 *   tool_start FS name FS id FS argv[0] FS argv[1] ...
+			 * For the event record, each argv element is its own field,
+			 * followed by stdin as the final field:
+			 *   tool_start FS name FS id FS argv[0] FS argv[1] ... FS stdin
 			 *
-			 * We parse here just enough to get argv elements as strings.
+			 * We parse here just enough to get argv elements and stdin.
 			 * If parsing fails, emit with just name+id (no argv fields).
 			 */
 			char *tsargv[EXEC_MAXARGV + 1];
@@ -994,7 +995,6 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			int   tsargc;
 
 			tsargc = execparse(argsbuf, argslen, tsargv, EXEC_MAXARGV, &tsstdin);
-			free(tsstdin);
 
 			if(tsargc > 0) {
 				/* build nil-terminated field list on the stack */
@@ -1005,6 +1005,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				fields[fi++] = tool_id;
 				for(i = 0; i < tsargc; i++)
 					fields[fi++] = tsargv[i];
+				fields[fi++] = tsstdin ? tsstdin : "";
 
 				{
 					char *buf;
@@ -1026,6 +1027,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				/* fallback: no argv fields */
 				emitandsave(cfg, "tool_start", tool_name, tool_id, nil);
 			}
+			free(tsstdin);
 		}
 
 		/* execute the tool */
@@ -1434,7 +1436,6 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			int   tsargc;
 
 			tsargc = execparse(argsbuf, argslen, tsargv, EXEC_MAXARGV, &tsstdin);
-			free(tsstdin);
 
 			if(tsargc > 0) {
 				char  *buf;
@@ -1442,9 +1443,11 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				long  len;
 				int   j;
 
-				flds = malloc((tsargc + 3) * sizeof(char*));
+				/* +4: tool_start, name, id, stdin */
+				flds = malloc((tsargc + 4) * sizeof(char*));
 				if(flds == nil) {
 					for(j = 0; j < tsargc; j++) free(tsargv[j]);
+					free(tsstdin);
 					break;
 				}
 				flds[0] = "tool_start";
@@ -1452,8 +1455,9 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 				flds[2] = tool_id;
 				for(j = 0; j < tsargc; j++)
 					flds[3 + j] = tsargv[j];
+				flds[3 + tsargc] = tsstdin ? tsstdin : "";
 
-				buf = fmtrecfields(flds, tsargc + 3, &len);
+				buf = fmtrecfields(flds, tsargc + 4, &len);
 				if(buf != nil) {
 					if(cfg->onevent != nil) cfg->onevent(buf, len, cfg->aux);
 					if(cfg->sess_bio != nil) Bwrite(cfg->sess_bio, buf, len);
@@ -1465,6 +1469,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			} else {
 				emitandsave(cfg, "tool_start", tool_name, tool_id, nil);
 			}
+			free(tsstdin);
 		}
 
 		/* execute the tool */
