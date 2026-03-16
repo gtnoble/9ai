@@ -185,23 +185,23 @@ static int
 buildrec(char *buf, int bufsz, ...)
 {
 	va_list ap;
-	char   *f;
+	char   *tmp[64];
 	int     n = 0;
-	int     flen;
+	char   *f;
+	char   *rec;
+	long    len;
 
 	va_start(ap, bufsz);
-	while((f = va_arg(ap, char*)) != nil) {
-		flen = strlen(f);
-		if(n + flen + 2 >= bufsz) break;
-		memmove(buf + n, f, flen);
-		n += flen;
-		buf[n++] = FS;
-	}
+	while((f = va_arg(ap, char*)) != nil && n < 64)
+		tmp[n++] = f;
 	va_end(ap);
-	/* replace last FS with RS */
-	if(n > 0) buf[n-1] = RS;
-	buf[n] = '\0';
-	return n;
+
+	rec = fmtrecfields(tmp, n, &len);
+	if(rec == nil) return 0;
+	if(len >= bufsz) { free(rec); return 0; }
+	memmove(buf, rec, len + 1);  /* include NUL */
+	free(rec);
+	return (int)len;
 }
 
 static void
@@ -245,10 +245,11 @@ test_splitrec(void)
 	nf = splitrec(buf, n, fields, 3);
 	check("maxfields truncates", nf == 3);
 
-	/* empty record (just RS) — RS stripped leaves no content → nf==0 */
+	/* empty record (just RS) — single empty field */
 	buf[0] = RS; buf[1] = '\0';
 	nf = splitrec(buf, 1, fields, 16);
-	check("empty record (RS only) nf==0", nf == 0);
+	check("empty record (RS only) nf==1", nf == 1);
+	checkstr("empty record field is empty string", fields[0], "");
 
 	/* no RS terminator (bare string) */
 	strcpy(buf, "bare");

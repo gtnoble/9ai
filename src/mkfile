@@ -16,6 +16,7 @@ OFILES=\
 	ant.$O\
 	exec.$O\
 	agent.$O\
+	record.$O\
 	skill.$O\
 	fs.$O\
 
@@ -96,14 +97,14 @@ test-exec:V: $O.exectest
 	./$O.exectest
 
 # Stage 9: agent loop (OAI format) — tool loop, emit_event, write_session
-$O.agenttest: agenttest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O ant.$O exec.$O agent.$O
+$O.agenttest: agenttest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O ant.$O exec.$O agent.$O record.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-agent:V: $O.agenttest
 	./$O.agenttest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
 
 # Stage 11: 9P server
-$O.fstest: fstest.$O port.$O http.$O json.$O oauth.$O models.$O sse.$O oai.$O ant.$O exec.$O agent.$O skill.$O fs.$O
+$O.fstest: fstest.$O port.$O http.$O json.$O oauth.$O models.$O sse.$O oai.$O ant.$O exec.$O agent.$O record.$O skill.$O fs.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-fs:V: $O.fstest
@@ -131,7 +132,7 @@ test-acme:V: $O.acmetest
 	./$O.acmetest
 
 # Stage 16: 9ai-sessions — session listing companion
-$O.9ai-sessions: 9ai-sessions.$O port.$O http.$O
+$O.9ai-sessions: 9ai-sessions.$O port.$O http.$O record.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-sessions:V: $O.9ai-sessions

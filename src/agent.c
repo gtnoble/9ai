@@ -60,6 +60,7 @@
 #include "oai.h"
 #include "ant.h"
 #include "exec.h"
+#include "record.h"
 #include "agent.h"
 
 /* ── genuuid ──────────────────────────────────────────────────────────── */
@@ -218,113 +219,6 @@ agentsessclose(AgentCfg *cfg)
 }
 
 /* ── agentsessload — session file replay ─────────────────────────────── */
-
-/*
- * splitrec — split a RS-terminated record into fields separated by FS.
- *
- * rec:    the record bytes (may contain embedded NULs in theory, but
- *         our fields are text so we treat them as C strings)
- * reclen: length in bytes including the trailing RS (0x1E)
- * fields: output array of malloc'd strings; caller must free each
- * maxfields: capacity of fields[]
- *
- * Returns the number of fields extracted (>= 1 if record is non-empty).
- * The trailing RS is not included in any field.
- *
- * Handles doubled FS (0x1F 0x1F → literal 0x1F) and RS (0x1E 0x1E →
- * literal 0x1E) per the design doc, though these are vanishingly rare.
- */
-static int
-splitrec(char *rec, long reclen, char **fields, int maxfields)
-{
-	char *p, *end, *fbuf;
-	int   nf;
-	long  flen;
-
-	/* strip trailing RS if present */
-	end = rec + reclen;
-	if(end > rec && (uchar)*(end-1) == 0x1e)
-		end--;
-
-	nf  = 0;
-	p   = rec;
-
-	while(p < end && nf < maxfields) {
-		/* find next FS or end-of-record */
-		char *fs = p;
-		long  cap = 256;
-		long  wlen = 0;
-
-		fbuf = malloc(cap);
-		if(fbuf == nil)
-			break;
-
-		while(fs < end) {
-			uchar c = (uchar)*fs;
-			if(c == 0x1f) {
-				/* doubled FS → literal 0x1F; single FS → field separator */
-				if(fs+1 < end && (uchar)*(fs+1) == 0x1f) {
-					/* literal FS */
-					if(wlen + 1 >= cap) {
-						cap *= 2;
-						char *tmp = realloc(fbuf, cap);
-						if(tmp == nil) { free(fbuf); fbuf = nil; break; }
-						fbuf = tmp;
-					}
-					fbuf[wlen++] = 0x1f;
-					fs += 2;
-				} else {
-					/* field separator */
-					fs++;
-					break;
-				}
-			} else if(c == 0x1e) {
-				/* doubled RS → literal 0x1E */
-				if(fs+1 < end && (uchar)*(fs+1) == 0x1e) {
-					if(wlen + 1 >= cap) {
-						cap *= 2;
-						char *tmp = realloc(fbuf, cap);
-						if(tmp == nil) { free(fbuf); fbuf = nil; break; }
-						fbuf = tmp;
-					}
-					fbuf[wlen++] = 0x1e;
-					fs += 2;
-				} else {
-					/* should not happen after stripping trailing RS */
-					fs++;
-					break;
-				}
-			} else {
-				if(wlen + 1 >= cap) {
-					cap *= 2;
-					char *tmp = realloc(fbuf, cap);
-					if(tmp == nil) { free(fbuf); fbuf = nil; break; }
-					fbuf = tmp;
-				}
-				fbuf[wlen++] = c;
-				fs++;
-			}
-		}
-		if(fbuf == nil)
-			break;
-		fbuf[wlen] = '\0';
-		fields[nf++] = fbuf;
-		p = fs;
-		USED(flen);
-	}
-	return nf;
-}
-
-/*
- * freesplit — free an array of fields returned by splitrec.
- */
-static void
-freesplit(char **fields, int nf)
-{
-	int i;
-	for(i = 0; i < nf; i++)
-		free(fields[i]);
-}
 
 /*
  * argv2json — convert an argv array into a JSON object string:
@@ -593,8 +487,7 @@ agentsessload(char *path, OAIReq *req, AgentCfg *cfg)
 		}
 		/* steer, thinking: ignored for API history reconstruction */
 
-nextrecord:
-		freesplit(fields, nf);
+nextrecord:;
 	}
 
 	Bterm(&bio);
@@ -636,66 +529,10 @@ nextrecord:
 }
 
 /* ── Record formatting ────────────────────────────────────────────────── */
-
 /*
- * fmtrecfields — format a char*[] field list into a heap-allocated buffer.
- *
- * Format: field₀ FS field₁ FS … FS fieldₙ RS NUL
- *
- * Returns a malloc'd buffer sized exactly for the record (including the
- * trailing RS and NUL), with *lenp set to the number of bytes before the
- * NUL.  Returns nil on allocation failure.
+ * fmtrecfields, splitrec, and fmtrec live in record.c / record.h.
+ * The helpers below are thin wrappers that collect varargs and delegate.
  */
-static char *
-fmtrecfields(char **fields, int nfields, long *lenp)
-{
-	long  total = 0;
-	long  wpos  = 0;
-	int   i;
-	char *buf;
-
-	/* measure */
-	for(i = 0; i < nfields; i++) {
-		if(i > 0) total++;          /* FS separator */
-		total += strlen(fields[i]);
-	}
-	total++;  /* RS terminator */
-
-	buf = malloc(total + 1);
-	if(buf == nil)
-		return nil;
-
-	/* write */
-	for(i = 0; i < nfields; i++) {
-		long flen = strlen(fields[i]);
-		if(i > 0) buf[wpos++] = '\x1f';
-		memmove(buf + wpos, fields[i], flen);
-		wpos += flen;
-	}
-	buf[wpos++] = '\x1e';
-	buf[wpos]   = '\0';
-
-	*lenp = total;
-	return buf;
-}
-
-/*
- * fmtrecva — collect varargs into a fields array, then call fmtrecfields.
- *
- * Takes a nil-terminated va_list of char *.
- * Returns a malloc'd record buffer, or nil on failure.
- */
-static char *
-fmtrecva(va_list ap, long *lenp)
-{
-	char  *tmp[64];
-	int    n = 0;
-	char  *f;
-
-	while((f = va_arg(ap, char *)) != nil && n < 64)
-		tmp[n++] = f;
-	return fmtrecfields(tmp, n, lenp);
-}
 
 void
 emitevent(AgentCfg *cfg, ...)
@@ -708,7 +545,14 @@ emitevent(AgentCfg *cfg, ...)
 		return;
 
 	va_start(ap, cfg);
-	buf = fmtrecva(ap, &len);
+	{
+		char *tmp[64];
+		int   n = 0;
+		char *f;
+		while((f = va_arg(ap, char *)) != nil && n < 64)
+			tmp[n++] = f;
+		buf = fmtrecfields(tmp, n, &len);
+	}
 	va_end(ap);
 
 	if(buf == nil)
@@ -728,7 +572,14 @@ writesession(AgentCfg *cfg, ...)
 		return;
 
 	va_start(ap, cfg);
-	buf = fmtrecva(ap, &len);
+	{
+		char *tmp[64];
+		int   n = 0;
+		char *f;
+		while((f = va_arg(ap, char *)) != nil && n < 64)
+			tmp[n++] = f;
+		buf = fmtrecfields(tmp, n, &len);
+	}
 	va_end(ap);
 
 	if(buf == nil)
@@ -753,7 +604,14 @@ emitandsave(AgentCfg *cfg, ...)
 	va_list ap;
 
 	va_start(ap, cfg);
-	buf = fmtrecva(ap, &len);
+	{
+		char *tmp[64];
+		int   n = 0;
+		char *f;
+		while((f = va_arg(ap, char *)) != nil && n < 64)
+			tmp[n++] = f;
+		buf = fmtrecfields(tmp, n, &len);
+	}
 	va_end(ap);
 
 	if(buf == nil)

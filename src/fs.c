@@ -77,6 +77,7 @@
 #include "ant.h"
 #include "exec.h"
 #include "agent.h"
+#include "record.h"
 #include "skill.h"
 #include "fs.h"
 
@@ -864,6 +865,7 @@ fswrite(Req *r)
 			else
 				removed = oaireqtrim(g->oaireq, (int)n);
 			/* record the trim in the session file for replay */
+			/* "trim" and the decimal integer contain no ESC/FS/RS bytes */
 			if(removed > 0 && g->sess_bio != nil) {
 				Bprint(g->sess_bio, "trim\x1f%d\x1e", (int)n);
 				Bflush(g->sess_bio);
@@ -940,16 +942,19 @@ fsdestroyfid(Fid *fid)
 			g->oaireq = oaireqnew(g->model);
 			antreqfree(g->antreq);
 			g->antreq = antreqnew(g->model);
+			char *sess_new_ev = nil;
 			if(agentsessopen(&tmpcfg) == 0) {
 				memmove(g->uuid, tmpcfg.uuid, 37);
 				g->sess_bio = tmpcfg.sess_bio;
-				/* emit session_new event */
+				/* snapshot the event string before releasing the lock */
 				char evbuf[64];
 				snprint(evbuf, sizeof evbuf, "session_new\x1f%s\x1e", g->uuid);
-				char *evcopy = strdup(evbuf);
-				chansendp(g->eventchan, evcopy);
+				sess_new_ev = strdup(evbuf);
 			}
 			qunlock(&g->lk);
+			/* send outside the lock so we cannot block with lk held */
+			if(sess_new_ev != nil)
+				chansendp(g->eventchan, sess_new_ev);
 			wbuffree(w);
 			fid->aux = nil;
 		}
@@ -1033,12 +1038,13 @@ fsdestroyfid(Fid *fid)
 						g->antreq = antreqnew(g->model);
 						memmove(g->uuid, tmpcfg.uuid, 37);
 						g->sess_bio = tmpcfg.sess_bio;
-						/* emit session_new event with loaded uuid */
+						/* snapshot event string before releasing the lock */
 						char evbuf2[64];
 						snprint(evbuf2, sizeof evbuf2, "session_new\x1f%s\x1e", g->uuid);
 						char *evcopy2 = strdup(evbuf2);
-						chansendp(g->eventchan, evcopy2);
 						qunlock(&g->lk);
+						/* send outside the lock so we cannot block with lk held */
+						chansendp(g->eventchan, evcopy2);
 					} else {
 						/* load failed — restore a fresh state */
 						oaireqfree(newreq);
@@ -1568,7 +1574,9 @@ authproc(void *v)
 			qunlock(&g->lk);
 			/* emit error event */
 			{
-				char *ev = smprint("auth_err\x1f%s\x1e", errbuf);
+				char *fields[2] = {"auth_err", errbuf};
+				long  len;
+				char *ev = fmtrecfields(fields, 2, &len);
 				chansendp(g->eventchan, ev);
 			}
 			/* EOF for any parked /auth/device reader */
@@ -1605,7 +1613,9 @@ authproc(void *v)
 			snprint(g->autherr, sizeof g->autherr, "%s", errbuf);
 			qunlock(&g->lk);
 			{
-				char *ev = smprint("auth_err\x1f%s\x1e", errbuf);
+				char *fields[2] = {"auth_err", errbuf};
+				long  len;
+				char *ev = fmtrecfields(fields, 2, &len);
 				chansendp(g->eventchan, ev);
 			}
 			chansendp(g->devchan, nil);

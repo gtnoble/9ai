@@ -15,8 +15,13 @@
  *   FS = 0x1F  (INFORMATION SEPARATOR ONE — field separator)
  *   RS = 0x1E  (INFORMATION SEPARATOR TWO — record separator)
  *
- * Fields are raw bytes; no quoting.  Literal FS/RS within a field value
- * are doubled (0x1F 0x1F or 0x1E 0x1E) — vanishingly rare in practice.
+ * Fields use ESC-escaping for special bytes:
+ *   ESC ESC → literal 0x1B
+ *   ESC FS  → literal 0x1F within a field value
+ *   ESC RS  → literal 0x1E within a field value
+ * A bare FS always means field boundary; a bare RS always means record end.
+ * This allows empty fields (two consecutive bare FS bytes) and zero-length
+ * records (bare RS with no preceding content).
  *
  * ── Conversation history ─────────────────────────────────────────────
  *
@@ -52,9 +57,10 @@
  */
 
 /* ── Record separator constants ─────────────────────────────────────── */
-
-#define AIFS "\x1f"   /* field separator: 0x1F */
-#define AIRS "\x1e"   /* record separator: 0x1E */
+/*
+ * RS, FS, ESC, AIRS, AIFS, AESC are defined in record.h, which is
+ * included by agent.c and any file that needs the record codec.
+ */
 
 /* ── Agent configuration ─────────────────────────────────────────────── */
 
@@ -163,8 +169,8 @@ void agentsessclose(AgentCfg *cfg);
  * emitevent — format a record and deliver it to cfg->onevent.
  *
  * Fields are supplied as a nil-terminated vararg list of char *.
- * Each field is written verbatim (no escaping — literal FS/RS are not
- * doubled in this implementation; they're rare enough in practice).
+ * Each field is ESC-encoded by fmtrecfields(): 0x1B, 0x1E, and 0x1F
+ * within a field value are preceded by an ESC (0x1B) byte.
  *
  * Example:
  *   emitevent(cfg, "text", delta_text, nil);

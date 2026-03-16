@@ -406,7 +406,7 @@ test_overflow_context_length_exceeded(void)
 #define FS "\x1f"
 #define RS "\x1e"
 
-/* write one RS-terminated record; fields are separated by FS */
+/* write one RS-terminated record; fields are ESC-encoded and separated by FS */
 static void
 writerec(int fd, ...)
 {
@@ -417,7 +417,13 @@ writerec(int fd, ...)
 	va_start(ap, fd);
 	while((f = va_arg(ap, char*)) != nil) {
 		if(!first) write(fd, FS, 1);
-		write(fd, f, strlen(f));
+		/* ESC-encode the field */
+		for(; *f != '\0'; f++) {
+			uchar c = (uchar)*f;
+			if(c == 0x1b || c == 0x1f || c == 0x1e)
+				write(fd, "\x1b", 1);
+			write(fd, f, 1);
+		}
 		first = 0;
 	}
 	write(fd, RS, 1);

@@ -18,11 +18,12 @@
  * ── Record format ───────────────────────────────────────────────────
  *
  *   Each record: field₀ FS field₁ … FS fieldₙ RS
- *     FS = 0x1F (field separator)
- *     RS = 0x1E (record separator)
+ *     FS  = 0x1F (field separator)
+ *     RS  = 0x1E (record separator)
+ *     ESC = 0x1B (escape: next byte is literal within a field)
  *
- *   splitrec() NUL-patches FS bytes in place and fills a fields[]
- *   pointer array.  This avoids heap allocation for the field split.
+ *   splitrec() decodes ESC-encoding and NUL-patches FS bytes in place,
+ *   filling a fields[] pointer array.  Empty fields are supported.
  *
  * ── Session file structure ───────────────────────────────────────────
  *
@@ -49,47 +50,10 @@
 #include <bio.h>
 
 #include "9ai.h"
+#include "record.h"
 #define SNIPPET  80
 #define MAXFIELDS 16
 #define RECBUF   4096
-
-/*
- * splitrec — NUL-patch in place.
- *
- * rec:      writable buffer containing the record bytes
- * reclen:   length including the trailing RS (if present)
- * fields:   output pointer array
- * maxfields: capacity of fields[]
- *
- * Returns the number of fields found.
- * strips the trailing RS (0x1E) before scanning.
- */
-static int
-splitrec(char *rec, int reclen, char **fields, int maxfields)
-{
-	char *p, *end, *start;
-	int   nf = 0;
-
-	end = rec + reclen;
-	/* strip trailing RS */
-	if(end > rec && (uchar)*(end-1) == 0x1e)
-		end--;
-	/* NUL-terminate so string ops work */
-	*end = '\0';
-
-	p = rec;
-	while(p < end && nf < maxfields) {
-		start = p;
-		while(p < end && (uchar)*p != 0x1f)
-			p++;
-		if(p < end)
-			*p++ = '\0';
-		else
-			*p = '\0';
-		fields[nf++] = start;
-	}
-	return nf;
-}
 
 /*
  * parsesessfile — extract uuid, model, date-string, and prompt snippet
