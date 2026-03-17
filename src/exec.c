@@ -291,6 +291,28 @@ waitpolled(void)
 	return nbrecvp(threadwaitchan());
 }
 
+/*
+ * alarmkill — threadnotify callback for the exec timeout.
+ *
+ * Called by _threadnote when an "alarm" note arrives on this proc.
+ * Kills the exec child (whose pid is in _alarmkill_pid) so that its
+ * write end of out_pipe closes, unblocking collectoutput()'s read().
+ * Returns 1 to consume the note (noted(NCONT) path in _threadnote /
+ * delayednotes), allowing the interrupted read() to return with an
+ * error rather than terminating the process.
+ */
+static int _alarmkill_pid;
+
+static int
+alarmkill(void *v, char *s)
+{
+	USED(v);
+	if(strstr(s, "alarm") == nil)
+		return 0;
+	postnote(PNPROC, _alarmkill_pid, "kill");
+	return 1;
+}
+
 #endif
 
 /* ── execparse ──────────────────────────────────────────────────────── */
@@ -650,23 +672,27 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 	r->pid = pid;
 
 	/*
-	 * Timeout watcher: spawn a proc that sleeps for timeout_ms and then
-	 * sends a kill note to the child if it is still running.  We use the
-	 * same RFNOWAIT pattern as the stdin writer so we never need to wait
-	 * for it.  The watcher sends "kill" via postnote; execabort() would
-	 * also work but watcher only needs one signal — the child has already
-	 * started collecting output so it will get EOF soon after the kill.
+	 * Timeout: arrange to kill the child after timeout_ms milliseconds.
 	 *
-	 * The watcher is shared-address-space (RFMEM) free: it only uses the
-	 * stack-local 'pid' and 'timeout_ms' values captured at spawn time.
-	 * On plan9port/Linux we use fork() directly so it inherits these by
-	 * value across the fork.  On 9front we use rfork(RFPROC|RFFDG|RFNOWAIT).
+	 * plan9port/Linux: fork a watcher process that sleeps then postnotes
+	 * "kill" to the child.  fork() is used (not rfork) so the watcher is
+	 * a plain OS process with no libthread state.
 	 *
-	 * After postnote the watcher exits immediately — it does not call
-	 * execabort (which polls for exit) because that would race with the
-	 * parent's waitchild().
+	 * 9front: use alarm(timeout_ms) + threadnotify(alarmkill).  This is
+	 * the canonical Plan 9 idiom.  alarm() delivers an "alarm" note to
+	 * this proc after the delay, which _threadnote routes to alarmkill()
+	 * via threadnotify.  alarmkill() postnotes "kill" to the child and
+	 * returns 1 (consume), so the interrupted read() in collectoutput()
+	 * returns with an error and the function unblocks.  alarm(0) cancels
+	 * the alarm if the child exits before the deadline.
+	 *
+	 * A raw rfork-based watcher is wrong on 9front: the rfork'd child
+	 * inherits libthread's _threadnote handler but has no Proc* (privalloc
+	 * TLS is nil), so any note it receives causes noted(NDFLT), killing
+	 * the entire process group.
 	 */
 	startns = nsec();
+
 #ifdef PLAN9PORT
 	{
 		int wpid = fork();
@@ -679,18 +705,37 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 		/* parent: if fork failed just skip the watcher */
 		USED(wpid);
 	}
-#else
-	if(rfork(RFPROC|RFFDG|RFNOWAIT) == 0) {
-		/* watcher child */
-		sleep((int)timeout_ms);
-		postnote(PNPROC, pid, "kill");
-		_exits("");
-	}
-#endif
 
 	/* collect combined output */
 	r->output = collectoutput(out_pipe[0], maxout, &r->outputlen, &r->truncated);
 	close(out_pipe[0]);
+#else
+	/*
+	 * On 9front the canonical timeout idiom is alarm(ms) + threadnotify.
+	 * alarm() sends an "alarm" note to this proc after timeout_ms ms,
+	 * which interrupts the blocking read() inside collectoutput(), causing
+	 * it to return with an error.  The threadnotify callback kills the
+	 * child so its write end of out_pipe closes and collectoutput returns.
+	 *
+	 * A raw rfork-based watcher is wrong here: the rfork'd child inherits
+	 * libthread's _threadnote handler but has no libthread Proc* (privalloc
+	 * TLS is unset), so any note delivered to it causes _threadnote to call
+	 * noted(NDFLT), killing the entire process group.
+	 *
+	 * execrun is not re-entrant, so a file-scope static is safe for
+	 * passing pid to the module-level alarmkill callback.
+	 */
+	_alarmkill_pid = pid;
+	threadnotify(alarmkill, 1);
+	alarm(timeout_ms);
+
+	/* collect combined output */
+	r->output = collectoutput(out_pipe[0], maxout, &r->outputlen, &r->truncated);
+	close(out_pipe[0]);
+
+	alarm(0);
+	threadnotify(alarmkill, 0);
+#endif
 
 	if(r->output == nil) {
 		werrstr("exec: collectoutput: %r");

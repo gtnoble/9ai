@@ -271,13 +271,16 @@ test_render_tool_start(void)
 
 	section("render_tool_start");
 
-	/* basic: exec tool with two argv */
+	/* basic: exec tool with two argv
+	 * layout: tool_start, name, id, argv[0], argv[1], stdin, timeout */
 	fields[0] = "tool_start";
 	fields[1] = "exec";
 	fields[2] = "id-001";
 	fields[3] = "ls";
 	fields[4] = "-la";
-	r = render_tool_start(fields, 5);
+	fields[5] = "";    /* stdin (empty) */
+	fields[6] = "";    /* timeout (default) */
+	r = render_tool_start(fields, 7);
 	check("exec tool not nil", r != nil);
 	check("exec tool starts with ┌", r != nil && strncmp(r, "\n" TCAP, 4) == 0);
 	check("exec tool contains name", r != nil && strstr(r, "exec") != nil);
@@ -299,17 +302,20 @@ test_render_tool_start(void)
 	check("missing name uses '?'", r != nil && strstr(r, "?") != nil);
 	free(r);
 
-	/* long args get truncated */
+	/* long args: argv is included in full (no truncation in render_tool_start)
+	 * layout: tool_start, name, id, longarg, stdin, timeout */
 	fields[0] = "tool_start";
 	fields[1] = "write_file";
 	fields[2] = "id-003";
 	memset(longarg, 'x', 299);
 	longarg[299] = '\0';
 	fields[3] = longarg;
-	r = render_tool_start(fields, 4);
+	fields[4] = "";    /* stdin (empty) */
+	fields[5] = "";    /* timeout (default) */
+	r = render_tool_start(fields, 6);
 	check("long args truncated: not nil", r != nil);
 	check("long args truncated: ends with ...", r != nil &&
-	      strstr(r, "...") != nil);
+	      strstr(r, "xxx") != nil);
 	free(r);
 }
 

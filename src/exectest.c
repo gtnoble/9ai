@@ -29,6 +29,11 @@
  *   4.1  Write exactly TEST_CAP bytes → not truncated, all present
  *   4.2  Write TEST_CAP+100 bytes → truncated, tail preserved,
  *        marker present
+ *
+ * Part 5: timeout
+ *   5.1  sleep 60 with 1s timeout → timed_out set, returns within ~3s
+ *   5.2  echo hello with 5s timeout → timed_out NOT set (completes fast)
+ *   5.3  execresultstr with timed_out → "[timed out]" suffix, no "exited N"
  */
 
 #include <u.h>
@@ -479,6 +484,72 @@ test_truncation_overflow(void)
 	execresultfree(r);
 }
 
+/* ── Part 5: timeout ────────────────────────────────────────────────── */
+
+static void
+test_timeout_fires(void)
+{
+	ExecResult *r;
+	ExecOpts    opts;
+	vlong       t0, elapsed_ms;
+	const char *js = "{\"argv\":[\"/bin/sleep\",\"60\"]}";
+
+	print("\n-- 5.1 timeout: sleep 60 with 1s timeout → timed_out set\n");
+	memset(&opts, 0, sizeof opts);
+	opts.timeout_ms = 1000;  /* 1 second */
+
+	t0 = nsec();
+	r  = execrun(js, strlen(js), 512*1024, &opts);
+	elapsed_ms = (nsec() - t0) / 1000000LL;
+
+	CHECKNONIL(r, "execrun returns non-nil on timeout");
+	if(r == nil) return;
+	CHECK(r->timed_out,     "timed_out flag is set");
+	/* should have returned well within 5 seconds */
+	CHECK(elapsed_ms < 5000, "returned within 5 seconds");
+	execresultfree(r);
+}
+
+static void
+test_timeout_no_false_positive(void)
+{
+	ExecResult *r;
+	ExecOpts    opts;
+	const char *js = "{\"argv\":[\"/bin/echo\",\"hello\"]}";
+
+	print("\n-- 5.2 timeout: echo with 5s timeout → timed_out NOT set\n");
+	memset(&opts, 0, sizeof opts);
+	opts.timeout_ms = 5000;  /* 5 seconds — echo finishes long before this */
+
+	r = execrun(js, strlen(js), 512*1024, &opts);
+	CHECKNONIL(r, "execrun returns non-nil");
+	if(r == nil) return;
+	CHECK(!r->timed_out,            "timed_out NOT set for fast command");
+	CHECKCONTAINS(r->output, "hello", "output still correct");
+	CHECKEQ(r->exitcode, 0,           "exitcode 0");
+	execresultfree(r);
+}
+
+static void
+test_timeout_resultstr(void)
+{
+	ExecResult r;
+	char buf[256];
+
+	print("\n-- 5.3 execresultstr: timed_out → \"[timed out]\" suffix, not \"exited N\"\n");
+	memset(&r, 0, sizeof r);
+	r.output    = strdup("partial output\n");
+	r.outputlen = strlen(r.output);
+	r.timed_out = 1;
+	r.exitcode  = 1;   /* non-zero exit, but timed_out takes precedence */
+
+	execresultstr(&r, buf, sizeof buf);
+	CHECKCONTAINS(buf, "partial output",  "output text present");
+	CHECKCONTAINS(buf, "[timed out]",     "[timed out] suffix present");
+	CHECK(strstr(buf, "exited") == nil,   "no 'exited N' suffix when timed_out");
+	free(r.output);
+}
+
 /* ── Main ────────────────────────────────────────────────────────────── */
 
 /*
@@ -520,6 +591,11 @@ threadmain(int argc, char *argv[])
 	print("\n=== Part 4: truncation ===\n");
 	test_truncation_exact();
 	test_truncation_overflow();
+
+	print("\n=== Part 5: timeout ===\n");
+	test_timeout_fires();
+	test_timeout_no_false_positive();
+	test_timeout_resultstr();
 
 	if(failures > 0) {
 		fprint(2, "\n%d test(s) FAILED\n", failures);
