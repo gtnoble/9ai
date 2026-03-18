@@ -37,8 +37,7 @@
  *
  * execabort(pid) sends SIGTERM to the process, then SIGKILL after 2s
  * if it has not exited.  Safe to call from any thread after execrun()
- * has returned the pid via r->pid.  (The agent loop calls execabort
- * when it receives an abort request on abortchan while a tool is running.)
+ * has returned the pid via r->pid.
  *
  * ── Tool result string ────────────────────────────────────────────────
  *

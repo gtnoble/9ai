@@ -313,6 +313,15 @@ alarmkill(void *v, char *s)
 	return 1;
 }
 
+/*
+ * _abortkill_pid — pid of the exec child currently running under
+ * collectoutput().  Set to the child pid before collectoutput() and
+ * cleared to 0 after.  Read by the abortkill note handler in fs.c.
+ * Safe without locking: execrun is not re-entrant and the note handler
+ * runs in the same proc (agentproc) that calls execrun.
+ */
+int _abortkill_pid;
+
 #endif
 
 /* ── execparse ──────────────────────────────────────────────────────── */
@@ -726,6 +735,7 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 	 * passing pid to the module-level alarmkill callback.
 	 */
 	_alarmkill_pid = pid;
+	_abortkill_pid = pid;
 	threadnotify(alarmkill, 1);
 	alarm(timeout_ms);
 
@@ -735,6 +745,7 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 
 	alarm(0);
 	threadnotify(alarmkill, 0);
+	_abortkill_pid = 0;
 #endif
 
 	if(r->output == nil) {

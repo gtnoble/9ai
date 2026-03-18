@@ -30,7 +30,6 @@
  *   reqchan   — main → agent: AgentReq (prompt or steer)
  *   outchan   — agent → main: text chunk strings (nil = turn done)
  *   eventchan — agent → main: RS-terminated event records
- *   abortchan — main → agent: abort signal (int)
  *
  * /output and /event reads park a Req* (pending_output, pending_event).
  * When the agent sends on outchan/eventchan, the srv loop responds to
@@ -80,7 +79,9 @@ struct AiState {
 	Channel *reqchan;    /* AgentReq* */
 	Channel *outchan;    /* char* (text chunks; nil = turn done) */
 	Channel *eventchan;  /* char* (RS records; nil = turn done) */
-	Channel *abortchan;  /* int */
+
+	/* agentproc OS pid — written once at agentproc startup; read by fswrite */
+	int agentprocpid;
 
 	/* pending 9P reads */
 	Req *pending_output;  /* parked /output read, or nil */

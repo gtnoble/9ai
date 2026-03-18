@@ -801,8 +801,10 @@ fswrite(Req *r)
 			cmd[--n] = '\0';
 
 		if(strcmp(cmd, "abort") == 0) {
-			int one = 1;
-			chansendp(g->abortchan, (void*)(uintptr)one);
+			qlock(&g->lk);
+			if(g->busy)
+				postnote(PNPROC, g->agentprocpid, "interrupt");
+			qunlock(&g->lk);
 			r->ofcall.count = r->ifcall.count;
 			respond(r, nil);
 		} else if(strcmp(cmd, "clear") == 0) {
@@ -1370,6 +1372,36 @@ agent_onevent(const char *rec, long len, void *aux)
  *
  * STEER: not yet wired (phase 14); accepted but ignored.
  */
+
+/*
+ * abortkill — permanent atnotify handler registered by agentproc.
+ *
+ * Fires when an "interrupt" note is delivered to agentproc's OS process.
+ * Sets g_aborted so agentrun/agentrunant know to clean up.  If an exec
+ * child is currently running (_abortkill_pid > 0), kills it so the
+ * pipe EOF unblocks collectoutput().  Always returns 1 (consume the
+ * note) so noted(NCONT) is called — this avoids process death whether
+ * the note arrives during a syscall, between turns, or at any other point.
+ */
+extern volatile int g_aborted;     /* agent.c */
+#ifndef PLAN9PORT
+extern int          _abortkill_pid; /* exec.c  */
+#endif
+
+static int
+abortkill(void *v, char *s)
+{
+	USED(v);
+	if(strstr(s, "interrupt") == nil)
+		return 0;
+	g_aborted = 1;
+#ifndef PLAN9PORT
+	if(_abortkill_pid > 0)
+		postnote(PNPROC, _abortkill_pid, "kill");
+#endif
+	return 1;
+}
+
 static void
 agentproc(void *v)
 {
@@ -1377,6 +1409,12 @@ agentproc(void *v)
 	AgentCfg  cfg;
 
 	USED(v);
+
+	/* record our OS pid so fswrite can postnote us */
+	g->agentprocpid = getpid();
+
+	/* permanent abort note handler — always consume "interrupt" notes */
+	atnotify(abortkill, 1);
 
 	for(;;) {
 		req = chanrecvp(g->reqchan);
@@ -1396,9 +1434,6 @@ agentproc(void *v)
 		g->busy = 1;
 		g->errmsg[0] = '\0';
 		qunlock(&g->lk);
-		/* drain any stale abort signals queued while agent was idle */
-		while(nbrecvp(g->abortchan) != nil)
-			;
 
 		/* open session if not already open */
 		qlock(&g->lk);
@@ -1437,7 +1472,6 @@ agentproc(void *v)
 		cfg.ontext    = agent_ontext;
 		cfg.onevent   = agent_onevent;
 		cfg.aux       = nil;
-		cfg.abortchan = g->abortchan;
 		/* exec_maxout: ~20% of context window in bytes (3 bytes/token),
 		 * falling back to 0 (agent.c uses EXEC_MAXOUT_DEFAULT = 512 KB) */
 		cfg.exec_maxout = g->ctx_k > 0 ? g->ctx_k * 1000 * 3 / 5 : 0;
@@ -1687,7 +1721,6 @@ aiinit(char *model, char *sockpath, char *tokpath, char *mtpt)
 	ai->reqchan      = chancreate(sizeof(void*), 8);  /* buffered: fsdestroyfid must not block srv */
 	ai->outchan      = chancreate(sizeof(void*), 16);
 	ai->eventchan    = chancreate(sizeof(void*), 16);
-	ai->abortchan    = chancreate(sizeof(void*), 4);
 	ai->loginreqchan = chancreate(sizeof(void*), 4);
 	ai->devchan      = chancreate(sizeof(void*), 4);
 	ai->modelschan   = chancreate(sizeof(void*), 4);

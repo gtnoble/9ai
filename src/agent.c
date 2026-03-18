@@ -692,6 +692,14 @@ isctxoverflow(const char *body)
 
 /* ── agentrun ─────────────────────────────────────────────────────────── */
 
+/*
+ * g_aborted — set to 1 by the abortkill note handler in fs.c when an
+ * "interrupt" note is delivered to agentproc.  Cleared at the start of
+ * each agentrun/agentrunant call.  Checked after each SSE delta and after
+ * execrun() returns to detect an in-flight abort.
+ */
+volatile int g_aborted;
+
 int
 agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 {
@@ -760,6 +768,8 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 	}
 	textbuf[0] = '\0';
 	textlen    = 0;
+
+	g_aborted = 0;
 
 	/* ── tool loop ── */
 	for(iteration = 0; ; iteration++) {
@@ -843,7 +853,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 
 		while((rc = oaidelta(&parser, &d)) == OAI_OK) {
 			/* check for abort signal between deltas */
-			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
+			if(g_aborted) {
 				aborted = 1;
 				break;
 			}
@@ -1060,16 +1070,6 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 				return -1;
 			}
 
-			/*
-			 * Spawn a watcher proc that blocks on abortchan and
-			 * kills the child if an abort arrives while execrun()
-			 * is blocking in collectoutput().  We pass the child
-			 * pid via a shared int written before the watcher is
-			 * spawned; the watcher polls until pid != 0.
-			 *
-			 * The watcher is RFNOWAIT so we never need to collect
-			 * its exit status.
-			 */
 			eopts.unmount_mtpt = cfg->exec_unmount_mtpt;
 			{
 				int tool_timeout_s = 0;
@@ -1083,7 +1083,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			er = execrun(argsbuf, argslen, maxout, &eopts);
 
 			/* check for abort that arrived during exec */
-			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
+			if(g_aborted) {
 				if(er != nil)
 					execabort(er->pid);
 				tool_aborted = 1;
@@ -1234,6 +1234,8 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 	textbuf[0] = '\0';
 	textlen    = 0;
 
+	g_aborted = 0;
+
 	/* ── tool loop ── */
 	for(iteration = 0; ; iteration++) {
 
@@ -1316,7 +1318,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 
 		while((rc = antdelta(&parser, &d)) == ANT_OK) {
 			/* check for abort signal between deltas */
-			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
+			if(g_aborted) {
 				aborted = 1;
 				break;
 			}
@@ -1533,7 +1535,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			er = execrun(argsbuf, argslen, maxout, &eopts);
 
 			/* check for abort that arrived during exec */
-			if(cfg->abortchan != nil && nbrecvp(cfg->abortchan) != nil) {
+			if(g_aborted) {
 				if(er != nil)
 					execabort(er->pid);
 				tool_aborted = 1;

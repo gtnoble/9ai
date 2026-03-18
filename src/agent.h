@@ -98,9 +98,6 @@ struct AgentCfg {
 	/* session I/O — may be nil to skip session recording */
 	Biobuf *sess_bio;
 	char    uuid[37];  /* current session UUID (set by agentsessopen) */
-
-	/* abort signal — nil to disable; nbrecvp'd each SSE iteration */
-	Channel *abortchan;
 };
 
 /* ── Session management ──────────────────────────────────────────────── */
