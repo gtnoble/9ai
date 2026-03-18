@@ -28,7 +28,7 @@
 static void
 usage(void)
 {
-	fprint(2, "usage: 9ai -m mtpt [-s srvname] [-S sockpath] [-t tokpath] [-M model] [-L] [-U]\n");
+	fprint(2, "usage: 9ai -m mtpt [-s srvname] [-t tokpath] [-M model] [-L] [-U]\n");
 	threadexitsall("usage");
 }
 
@@ -37,7 +37,6 @@ threadmain(int argc, char *argv[])
 {
 	char *mtpt    = nil;
 	char *srvname = nil;
-	char *sockpath = nil;
 	char *tokpath  = nil;
 	char *model    = "gpt-4o";
 	int   forcelogin = 0;
@@ -49,9 +48,6 @@ threadmain(int argc, char *argv[])
 		break;
 	case 's':
 		srvname = ARGF();
-		break;
-	case 'S':
-		sockpath = ARGF();
 		break;
 	case 't':
 		tokpath = ARGF();
@@ -69,24 +65,8 @@ threadmain(int argc, char *argv[])
 		usage();
 	}ARGEND
 
-	if(sockpath == nil) {
-#ifdef PLAN9PORT
-		char *h = homedir();
-		sockpath = smprint("%s/.cache/9ai/proxy.sock", h);
-		free(h);
-#else
-		sockpath = nil;  /* unused on 9front: TLS dialed directly */
-#endif
-	}
-	if(tokpath == nil) {
-#ifdef PLAN9PORT
-		char *h = homedir();
-		tokpath = smprint("%s/.cache/9ai/token", h);
-		free(h);
-#else
+	if(tokpath == nil)
 		tokpath = configpath("token");
-#endif
-	}
 
 	/*
 	 * Pass the mount point to aiinit only when -U is given.
@@ -94,7 +74,7 @@ threadmain(int argc, char *argv[])
 	 * causing each exec child to unmount the 9ai FS from its namespace
 	 * before running the tool.
 	 */
-	AiState *ai = aiinit(model, sockpath, tokpath, unmount_fs ? mtpt : nil);
+	AiState *ai = aiinit(model, tokpath, unmount_fs ? mtpt : nil);
 
 	/* -L flag: force re-login even if a token exists */
 	if(forcelogin)

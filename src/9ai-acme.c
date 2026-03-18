@@ -2,190 +2,189 @@
  * 9ai-acme — acme integration for 9ai
  *
  * Usage:
- *   9ai-acme [-a addr]
+ *   9ai-acme
  *
- * Creates a +9ai window in the current directory.  Connects to the 9ai
- * 9P service (posted in $NAMESPACE as "9ai") and to acme's 9P service.
+ * Creates a +9ai window in the current directory.  Requires:
+ *   - 9ai running with -m /mnt/9ai
+ *   - acme running (mounts itself at /mnt/acme)
  *
  * Tag commands:
  *   Send     — send the selection, or last paragraph if nothing is selected
- *   Stop     — abort the current turn (writes "abort" to 9ai/ctl)
+ *   Stop     — abort the current turn (writes "abort" to /mnt/9ai/ctl)
  *   Steer    — redirect the running turn with the selection, or last paragraph
- *   New      — start a fresh session (writes to 9ai/session/new)
- *   Clear    — clear the in-memory history (writes "clear" to 9ai/ctl)
- *   Models   — open a model picker window (button-3 to switch)
- *   Sessions — open a session picker window (button-3 to load)
+ *   New      — start a fresh session (writes to /mnt/9ai/session/new)
+ *   Clear    — clear the in-memory history (writes "clear" to /mnt/9ai/ctl)
+ *   Models   — open a model picker window
+ *   Sessions — open a session picker window
  *
  * ── Architecture ──────────────────────────────────────────────────────
  *
- * Three procs communicate via channels to a display proc:
+ * The acme file API on 9front:
+ *   /mnt/acme/new/ctl    — create a new window; read yields window id
+ *   /mnt/acme/<id>/ctl   — control file (name, cleartag, clean, delete, ...)
+ *   /mnt/acme/<id>/tag   — tag bar text
+ *   /mnt/acme/<id>/body  — body text (read/write)
+ *   /mnt/acme/<id>/addr  — address (set before data access)
+ *   /mnt/acme/<id>/data  — body bytes at current address
+ *   /mnt/acme/<id>/event — keyboard/mouse events (ORDWR)
  *
- *   eventproc   — reads acme's window event file; dispatches commands
- *   outproc     — reads 9ai /output per turn; appends text to window
- *   aiproc      — reads 9ai /event per turn; parses structured records
- *                 (turn_start, thinking, tool_start, tool_end, turn_end,
- *                  model, session_new, error) → appends formatted lines
+ * The 9ai API at /mnt/9ai/:
+ *   ctl, message, steer, output, event, status, model, models,
+ *   session/id, session/new, session/load, session/save
  *
- * All window writes go through winappend(), which holds a QLock so
- * that the three procs don't interleave partial lines.
+ * Three procs run concurrently:
+ *   outproc   — reads /mnt/9ai/output per turn; appends to window body
+ *   aiproc    — reads /mnt/9ai/event per turn; appends formatted lines
+ *   eventproc — reads /mnt/acme/<id>/event; dispatches tag commands
  *
- * ── 9ai /event record format ──────────────────────────────────────────
- *
- * Records are RS-terminated (0x1E), fields FS-separated (0x1F).
- * Field 0 is the type.  A single read(2) on /event returns exactly one
- * RS-terminated record (or 0 bytes for EOF at turn end).
- *
- * We read into a buffer, scanning for the RS byte to frame records.
- * On EOF (0-byte read), the turn is done; we re-open /event for the next.
- *
- * ── Session file format ───────────────────────────────────────────────
- *
- * ~/.cache/9ai/sessions/<uuid>  — one record per RS terminator.
- * First record: session FS uuid FS model FS timestamp.
- * First prompt record: prompt FS text.
- * We read only the first two relevant records for the Sessions picker.
+ * All threads share one OS process (threadcreate, not proccreate) so
+ * only one runs at a time.  No locking is needed for window writes.
+ * Exception: aiproc and outproc use proccreate so they are not blocked
+ * by eventproc holding the cooperative scheduler.
  */
 
 #include <u.h>
 #include <libc.h>
 #include <bio.h>
 #include <thread.h>
-#include <9pclient.h>
 
-#include "9ai.h"   /* homedir() */
-#include "prompt.h"
+#include "9ai.h"   /* homedir(), configpath() */
 #include "record.h"
 #include "render.h"
 #include "sessfile.h"
 #include "acmeevent.h"
+#include "prompt.h"
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
 enum {
 	STACK      = 65536,
-	EVBUF      = 8192,   /* acme event read buffer */
-	RECBUF     = 131072, /* 9ai event record buffer */
-	TEXTBUF    = 131072, /* /output streaming buffer */
+	RECBUF     = 131072,
+	TEXTBUF    = 131072,
 	MAXFIELDS  = 64,
-	SNIPPET    = 80,     /* max session snippet length */
 };
 
-#define TAG_EXTRA  " | Send Stop Steer New Clear Models Sessions Login"
+#define TAG_EXTRA  " | Send Stop Steer New Clear Models Sessions"
 #define SEPARATOR  "\n\n════════════════════════════════════════════════════════════\n\n"
+#define ACME       "/mnt/acme"
+#define AI9        "/mnt/9ai"
 
-/* ── Global acme connection ─────────────────────────────────────────── */
+/* ── Window state ───────────────────────────────────────────────────── */
 
-static CFsys *acmefs;
-static QLock  winlk;   /* serialises all writes to the +9ai window */
+typedef struct Win Win;
+struct Win {
+	int id;
+};
 
-/* ── Forward declarations ────────────────────────────────────────────── */
+static Win  *mainwin;
+
+/* ── Forward declarations ───────────────────────────────────────────── */
 
 static void modelswinproc(void *v);
 static void sessionswinproc(void *v);
 
-/* ── Window helpers ─────────────────────────────────────────────────── */
+/* ── Low-level acme file access ─────────────────────────────────────── */
 
-typedef struct Win Win;
-struct Win {
-	int   id;
-	CFid *ctl;
-	int   eventfd;  /* plain fd for event file — readable and writable */
-	CFid *addr;
-	CFid *data;
-	CFid *body;
-};
-
-static Win *mainwin;  /* the +9ai window */
-
-static CFid *
-wopenfile(Win *w, char *name, int mode)
+/*
+ * acmepath — build an acme file path.
+ */
+static char *
+acmepath(int id, char *file)
 {
-	char path[64];
-	snprint(path, sizeof path, "%d/%s", w->id, name);
-	CFid *f = fsopen(acmefs, path, mode);
-	if(f == nil)
-		sysfatal("fsopen %s: %r", path);
-	return f;
+	if(id == 0)
+		return smprint("%s/new/%s", ACME, file);
+	return smprint("%s/%d/%s", ACME, id, file);
 }
 
+/*
+ * acmeopen — open a window file.
+ */
+static int
+acmeopen(int id, char *file, int mode)
+{
+	char *path = acmepath(id, file);
+	int   fd   = open(path, mode);
+	free(path);
+	return fd;
+}
+
+/*
+ * acmewrite — write to a window file, returning bytes written or -1.
+ */
+static int
+acmewrite(int id, char *file, char *data, int len)
+{
+	int fd, n;
+
+	if(len < 0)
+		len = strlen(data);
+	fd = acmeopen(id, file, OWRITE);
+	if(fd < 0)
+		return -1;
+	n = write(fd, data, len);
+	close(fd);
+	return n;
+}
+
+/*
+ * newwin — create a new acme window, set its name and tag.
+ * Returns a new Win*.
+ */
 static Win *
 newwin(char *name)
 {
-	char buf[32];
 	Win *w;
+	int  fd, n;
+	char buf[32];
 
 	w = mallocz(sizeof *w, 1);
 	if(w == nil)
 		sysfatal("mallocz Win: %r");
 
-	w->ctl = fsopen(acmefs, "new/ctl", ORDWR);
-	if(w->ctl == nil)
-		sysfatal("open new/ctl: %r");
-	if(fsread(w->ctl, buf, sizeof buf) < 1)
+	fd = acmeopen(0, "ctl", ORDWR);
+	if(fd < 0)
+		sysfatal("open %s/new/ctl: %r", ACME);
+	n = read(fd, buf, sizeof buf - 1);
+	if(n < 1)
 		sysfatal("read new/ctl: %r");
+	buf[n < (int)sizeof buf ? n : (int)sizeof buf - 1] = '\0';
+	close(fd);
+
 	w->id = atoi(buf);
 
 	/* name the window */
-	fsprint(w->ctl, "name %s\n", name);
+	acmewrite(w->id, "ctl", smprint("name %s\n", name), -1);
 
-	/* set up tag */
-	fsprint(w->ctl, "cleartag\n");
-	{
-		char tagpath[64];
-		snprint(tagpath, sizeof tagpath, "%d/tag", w->id);
-		CFid *tag = fsopen(acmefs, tagpath, OWRITE);
-		if(tag != nil) {
-			fswrite(tag, TAG_EXTRA, strlen(TAG_EXTRA));
-			fsclose(tag);
-		}
-	}
-
-	{
-		char evpath[64];
-		snprint(evpath, sizeof evpath, "%d/event", w->id);
-		w->eventfd = fsopenfd(acmefs, evpath, ORDWR);
-		if(w->eventfd < 0)
-			sysfatal("fsopenfd event: %r");
-	}
-	w->body  = wopenfile(w, "body",  OWRITE);
-	/* addr and data opened on demand */
-	w->addr  = nil;
-	w->data  = nil;
+	/* set tag */
+	acmewrite(w->id, "ctl", "cleartag\n", -1);
+	acmewrite(w->id, "tag", TAG_EXTRA, strlen(TAG_EXTRA));
 
 	return w;
 }
 
 /*
- * winappend — append text to the window body.
- * Holds winlk so concurrent procs don't interleave output.
+ * winappend — append text to a window body via addr/data.
+ * Safe to call from any thread: cooperative scheduling means only
+ * one thread runs at a time, so no locking is needed.
  */
 static void
 winappend(Win *w, char *text, int len)
 {
+	int afd, dfd;
+
 	if(len < 0)
 		len = strlen(text);
 	if(len == 0)
 		return;
 
-	qlock(&winlk);
-	if(w->addr == nil) {
-		char p[64];
-		snprint(p, sizeof p, "%d/addr", w->id);
-		w->addr = fsopen(acmefs, p, OWRITE);
-		if(w->addr == nil)
-			sysfatal("open addr: %r");
+	afd = acmeopen(w->id, "addr", OWRITE);
+	dfd = acmeopen(w->id, "data", ORDWR);
+	if(afd >= 0 && dfd >= 0) {
+		write(afd, "$", 1);
+		write(dfd, text, len);
 	}
-	if(w->data == nil) {
-		char p[64];
-		snprint(p, sizeof p, "%d/data", w->id);
-		w->data = fsopen(acmefs, p, ORDWR);
-		if(w->data == nil)
-			sysfatal("open data: %r");
-	}
-	/* append at end */
-	fswrite(w->addr, "$", 1);
-	fswrite(w->data, text, len);
-	qunlock(&winlk);
+	if(afd >= 0) close(afd);
+	if(dfd >= 0) close(dfd);
 }
 
 static void
@@ -194,22 +193,16 @@ winappendstr(Win *w, char *s)
 	winappend(w, s, -1);
 }
 
-/*
- * winclean — mark window clean so it can be closed without a save prompt.
- */
 static void
 winclean(Win *w)
 {
-	fsprint(w->ctl, "clean\n");
+	acmewrite(w->id, "ctl", "clean\n", -1);
 }
 
-/*
- * windelete — force-close a window.
- */
 static void
 windelete(Win *w)
 {
-	fsprint(w->ctl, "delete\n");
+	acmewrite(w->id, "ctl", "delete\n", -1);
 }
 
 /*
@@ -218,15 +211,13 @@ windelete(Win *w)
 static char *
 winbody(Win *w, int *np)
 {
+	int   fd;
 	char *s;
 	int   n, na, m;
-	char  path[64];
-	CFid *body;
 
-	snprint(path, sizeof path, "%d/body", w->id);
-	body = fsopen(acmefs, path, OREAD);
-	if(body == nil)
-		return nil;
+	fd = acmeopen(w->id, "body", OREAD);
+	if(fd < 0)
+		return strdup("");
 
 	s  = nil;
 	na = 0;
@@ -235,13 +226,14 @@ winbody(Win *w, int *np)
 		if(na < n + 512) {
 			na += 4096;
 			s = realloc(s, na + 1);
+			if(s == nil) sysfatal("realloc winbody: %r");
 		}
-		m = fsread(body, s + n, na - n);
+		m = read(fd, s + n, na - n);
 		if(m <= 0)
 			break;
 		n += m;
 	}
-	fsclose(body);
+	close(fd);
 	if(s == nil)
 		s = strdup("");
 	else
@@ -250,16 +242,13 @@ winbody(Win *w, int *np)
 	return s;
 }
 
-/* ── Status line (line 1 of the body) ──────────────────────────────── */
+/* ── Status line ────────────────────────────────────────────────────── */
 
-/*
- * status format: "● <state> [<model>] session:<uuid8>\n"
- *
- * We maintain current model and session uuid so status() can format them.
- */
-static char curmodel[128];
-static char cursession[37];
+static char  curmodel[128];
+static char  cursession[37];
 static QLock statelk;
+
+int mainstacksize = STACK;
 
 static void
 setstatus(char *state)
@@ -282,44 +271,37 @@ setstatus(char *state)
 	snprint(buf, sizeof buf, "● %s%s%s\n", state, modstr, sesstr);
 	winappend(mainwin, buf, -1);
 }
+/* ── 9ai file access ────────────────────────────────────────────────── */
 
-/* ── 9ai service connection ─────────────────────────────────────────── */
-
-/*
- * aifsys — shared connection used by command handlers (Send, Stop, etc.)
- * outproc and aiproc create their own private connections to avoid
- * interfering with each other or with command handlers.
- */
-static CFsys *aifsys;
-static QLock  aifslk;
-
-static CFsys *
-aifs_get(void)
+static int
+aiopen(char *file, int mode)
 {
-	CFsys *fs;
-
-	qlock(&aifslk);
-	fs = aifsys;
-	qunlock(&aifslk);
-	return fs;
+	char path[256];
+	snprint(path, sizeof path, "%s/%s", AI9, file);
+	return open(path, mode);
 }
 
-static CFid *
-aiopen(char *path, int mode)
+static int
+aiwrite(char *file, char *data, int len)
 {
-	CFsys *fs = aifs_get();
-	if(fs == nil) {
-		werrstr("9ai not connected");
-		return nil;
-	}
-	return fsopen(fs, path, mode);
+	int fd, n;
+
+	if(len < 0)
+		len = strlen(data);
+	fd = aiopen(file, OWRITE);
+	if(fd < 0)
+		return -1;
+	n = write(fd, data, len);
+	close(fd);
+	return n;
 }
 
-/* ainewconn — open a fresh private connection to the 9ai service */
-static CFsys *
-ainewconn(void)
+/* ── strecpy-based safe copy helper ─────────────────────────────────── */
+
+static void
+scopy(char *dst, int dsz, char *src)
 {
-	return nsmount("9ai", nil);
+	strecpy(dst, dst + dsz, src);
 }
 
 /* ── 9ai /event reader proc ─────────────────────────────────────────── */
@@ -327,142 +309,87 @@ ainewconn(void)
 static void
 aiproc(void *v)
 {
-	CFsys *fs;
-	CFid  *evfd;
+	int   fd;
 	char  *buf;
 	char  *rec;
-	int    n;
+	char *fields[MAXFIELDS];
+	int   nf;
+	char *type;
+	int   n;
 
 	USED(v);
-
 	buf = malloc(RECBUF);
 	rec = malloc(RECBUF);
 	if(buf == nil || rec == nil)
 		sysfatal("aiproc: malloc: %r");
 
-	fs = nil;
 	for(;;) {
-		/* (re)connect if needed */
-		if(fs == nil) {
-			fs = ainewconn();
-			if(fs == nil) {
-				sleep(2000);
-				continue;
-			}
-		}
-
-		evfd = fsopen(fs, "event", OREAD);
-		if(evfd == nil) {
-			/* likely "concurrent reads" from stale conn — reconnect */
-			fsunmount(fs);
-			fs = nil;
-			sleep(500);
+		fd = aiopen("event", OREAD);
+		if(fd < 0) {
+			sleep(2000);
 			continue;
 		}
+		n = read(fd, buf, RECBUF - 1);
+		close(fd);
 
-		/* read records until EOF (turn done) */
-		for(;;) {
-			n = fsread(evfd, buf, RECBUF - 1);
-			if(n <= 0)
-				break;   /* EOF = turn end */
-			buf[n] = '\0';
+		if(n <= 0)
+			continue;
+		buf[n] = '\0';
 
-			/*
-			 * buf contains one RS-terminated record.
-			 * Parse fields in a copy because splitrec patches NULs.
-			 */
-			char *fields[MAXFIELDS];
-			int   nf;
+		memmove(rec, buf, n + 1);
+		nf = splitrec(rec, n, fields, MAXFIELDS);
+		if(nf == 0)
+			continue;
 
-			memmove(rec, buf, n + 1);
-			nf = splitrec(rec, n, fields, MAXFIELDS);
-			if(nf == 0)
-				continue;
+		type = fields[0];
 
-			char *type = fields[0];
-
-			if(strcmp(type, "turn_start") == 0) {
-				/* fields: turn_start FS uuid FS model */
-				if(nf >= 3) {
-					qlock(&statelk);
-					strlcpy(curmodel, fields[2], sizeof curmodel);
-					qunlock(&statelk);
-				}
-				setstatus("running");
-
-			} else if(strcmp(type, "thinking") == 0) {
-				/* fields: thinking FS chunk */
-				if(nf >= 2) {
-					char *out = render_thinking(fields[1]);
-					if(out != nil) {
-						winappendstr(mainwin, out);
-						free(out);
-					}
-				}
-
-			} else if(strcmp(type, "tool_start") == 0) {
-				char *out = render_tool_start(fields, nf);
-				if(out != nil) { winappendstr(mainwin, out); free(out); }
-
-			} else if(strcmp(type, "tool_end") == 0) {
-				char *out = render_tool_end(fields, nf);
-				if(out != nil) { winappendstr(mainwin, out); free(out); }
-
-			} else if(strcmp(type, "turn_end") == 0) {
-				/*
-				 * fields: turn_end FS end_turn|aborted|error
-				 * The /output proc emits the separator after [done].
-				 * We just update status here.
-				 */
-				char *reason = (nf >= 2) ? fields[1] : "end_turn";
-				if(strcmp(reason, "aborted") == 0)
-					winappendstr(mainwin, "\n⛔ Aborted.\n");
-				else if(strcmp(reason, "error") == 0)
-					winappendstr(mainwin, "\n⚠ Agent error.\n");
-				setstatus("ready");
-
-			} else if(strcmp(type, "model") == 0) {
-				/* fields: model FS name */
-				if(nf >= 2) {
-					qlock(&statelk);
-					strlcpy(curmodel, fields[1], sizeof curmodel);
-					qunlock(&statelk);
-				}
-				setstatus("ready");
-
-			} else if(strcmp(type, "session_new") == 0) {
-				/* fields: session_new FS uuid */
-				if(nf >= 2) {
-					qlock(&statelk);
-					strlcpy(cursession, fields[1], sizeof cursession);
-					qunlock(&statelk);
-				}
-				setstatus("ready");
-
-			} else if(strcmp(type, "error") == 0) {
-				if(nf >= 2) {
-					char errbuf[256];
-					snprint(errbuf, sizeof errbuf, "\n⚠ %s\n", fields[1]);
-					winappendstr(mainwin, errbuf);
-				}
-				setstatus("error");
-
-			} else if(strcmp(type, "auth_ok") == 0) {
-				winappendstr(mainwin, "\n✓ Logged in to GitHub Copilot.\n");
-				setstatus("ready");
-
-			} else if(strcmp(type, "auth_err") == 0) {
-				if(nf >= 2) {
-					char errbuf[256];
-					snprint(errbuf, sizeof errbuf, "\n⚠ Login failed: %s\n", fields[1]);
-					winappendstr(mainwin, errbuf);
-				}
-				setstatus("login required");
+		if(strcmp(type, "turn_start") == 0) {
+			if(nf >= 3) {
+				qlock(&statelk);
+				scopy(curmodel, sizeof curmodel, fields[2]);
+				qunlock(&statelk);
 			}
+			setstatus("running");
+		} else if(strcmp(type, "thinking") == 0) {
+			if(nf >= 2) {
+				char *out = render_thinking(fields[1]);
+				if(out != nil) { winappendstr(mainwin, out); free(out); }
+			}
+		} else if(strcmp(type, "tool_start") == 0) {
+			char *out = render_tool_start(fields, nf);
+			if(out != nil) { winappendstr(mainwin, out); free(out); }
+		} else if(strcmp(type, "tool_end") == 0) {
+			char *out = render_tool_end(fields, nf);
+			if(out != nil) { winappendstr(mainwin, out); free(out); }
+		} else if(strcmp(type, "turn_end") == 0) {
+			char *reason = (nf >= 2) ? fields[1] : "end_turn";
+			if(strcmp(reason, "aborted") == 0)
+				winappendstr(mainwin, "\n⛔ Aborted.\n");
+			else if(strcmp(reason, "error") == 0)
+				winappendstr(mainwin, "\n⚠ Agent error.\n");
+			setstatus("ready");
+		} else if(strcmp(type, "model") == 0) {
+			if(nf >= 2) {
+				qlock(&statelk);
+				scopy(curmodel, sizeof curmodel, fields[1]);
+				qunlock(&statelk);
+			}
+			setstatus("ready");
+		} else if(strcmp(type, "session_new") == 0) {
+			if(nf >= 2) {
+				qlock(&statelk);
+				scopy(cursession, sizeof cursession, fields[1]);
+				qunlock(&statelk);
+			}
+			setstatus("ready");
+		} else if(strcmp(type, "error") == 0) {
+			if(nf >= 2) {
+				char errbuf[256];
+				snprint(errbuf, sizeof errbuf, "\n⚠ %s\n", fields[1]);
+				winappendstr(mainwin, errbuf);
+			}
+			setstatus("error");
 		}
-
-		fsclose(evfd);
-		/* turn ended — loop to open /event again for the next turn */
 	}
 }
 
@@ -471,58 +398,38 @@ aiproc(void *v)
 static void
 outproc(void *v)
 {
-	CFsys *fs;
-	CFid  *outfd;
-	char  *buf;
-	int    n;
+	int  fd;
+	char *buf;
+	int  n;
 
 	USED(v);
-
 	buf = malloc(TEXTBUF);
 	if(buf == nil)
 		sysfatal("outproc: malloc: %r");
 
-	fs = nil;
 	for(;;) {
-		/* (re)connect if needed */
-		if(fs == nil) {
-			fs = ainewconn();
-			if(fs == nil) {
-				sleep(2000);
-				continue;
-			}
-		}
-
-		outfd = fsopen(fs, "output", OREAD);
-		if(outfd == nil) {
-			/* likely "concurrent reads" from stale conn — reconnect */
-			fsunmount(fs);
-			fs = nil;
-			sleep(500);
+		fd = aiopen("output", OREAD);
+		if(fd < 0) {
+			sleep(2000);
 			continue;
 		}
+		n = read(fd, buf, TEXTBUF - 1);
+		close(fd);
 
-		for(;;) {
-			n = fsread(outfd, buf, TEXTBUF - 1);
-			if(n < 0)
-				break;   /* error — close, reconnect */
-			if(n == 0) {
-				/* nil EOF = turn done */
-				winappendstr(mainwin, SEPARATOR);
-				winclean(mainwin);
-				break;
-			}
-			buf[n] = '\0';
+		if(n < 0)
+			continue;
+		if(n == 0)
+			continue;
+		buf[n] = '\0';
 
-			/* stream text directly to the window */
-			winappend(mainwin, buf, n);
+		if(strcmp(buf, "[done]\n") == 0) {
+			winappendstr(mainwin, SEPARATOR);
+			winclean(mainwin);
+			continue;
 		}
-
-		fsclose(outfd);
-		/* re-open for next turn */
+		winappend(mainwin, buf, n);
 	}
 }
-
 /* ── Prompt text extraction ─────────────────────────────────────────── */
 
 /*
@@ -535,15 +442,16 @@ outproc(void *v)
 static char *
 winrdsel(Win *w)
 {
-	char  path[64];
-	CFid *f;
+	char *path;
+	int   fd;
 	char *buf;
 	int   n, na, m;
 	char *s, *e;
 
-	snprint(path, sizeof path, "%d/rdsel", w->id);
-	f = fsopen(acmefs, path, OREAD);
-	if(f == nil)
+	path = acmepath(w->id, "rdsel");
+	fd   = open(path, OREAD);
+	free(path);
+	if(fd < 0)
 		return nil;
 
 	buf = nil;
@@ -553,15 +461,16 @@ winrdsel(Win *w)
 		if(na < n + 512) {
 			na += 4096;
 			buf = realloc(buf, na + 1);
+			if(buf == nil) sysfatal("realloc winrdsel: %r");
 		}
-		m = fsread(f, buf + n, na - n);
+		m = read(fd, buf + n, na - n);
 		if(m <= 0)
 			break;
 		n += m;
 	}
-	fsclose(f);
+	close(fd);
 
-	if(buf == nil || n == 0) {
+	if(n == 0) {
 		free(buf);
 		return nil;
 	}
@@ -620,7 +529,8 @@ static void
 cmd_send(void)
 {
 	char *text;
-	CFid *msgfd;
+	int   fd;
+	int   n;
 
 	text = prompttext(mainwin);
 	if(text == nil || text[0] == '\0') {
@@ -628,25 +538,24 @@ cmd_send(void)
 		return;
 	}
 
-	msgfd = aiopen("message", OWRITE);
-	if(msgfd == nil) {
-		char errbuf[128];
-		snprint(errbuf, sizeof errbuf, "\n⚠ 9ai not available: %r\n");
-		winappendstr(mainwin, errbuf);
+	fd = aiopen("message", OWRITE);
+	if(fd < 0) {
+		winappendstr(mainwin, "\n⚠ 9ai not available: cannot open /mnt/9ai/message\n");
 		free(text);
 		return;
 	}
 
-	/* display the prompt in the window */
 	{
 		char *display = smprint("\n▶ %s\n", text);
 		winappendstr(mainwin, display);
 		free(display);
 	}
 
-	fprint(2, "cmd_send: sending %d bytes: «%s»\n", (int)strlen(text), text);
-	fswrite(msgfd, text, strlen(text));
-	fsclose(msgfd);   /* clunk triggers the agent turn */
+	n = strlen(text);
+	fprint(2, "cmd_send: sending %d bytes: «%s»\n", n, text);
+	write(fd, text, n);
+	close(fd);
+	setstatus("running");
 
 	free(text);
 }
@@ -654,23 +563,17 @@ cmd_send(void)
 static void
 cmd_stop(void)
 {
-	CFid *ctlfd;
-
-	ctlfd = aiopen("ctl", OWRITE);
-	if(ctlfd == nil) {
+	if(aiwrite("ctl", "abort\n", -1) < 0)
 		winappendstr(mainwin, "\n⚠ 9ai not available\n");
-		return;
-	}
-	fswrite(ctlfd, "abort\n", 6);
-	fsclose(ctlfd);
-	setstatus("aborting");
+	else
+		setstatus("aborting");
 }
 
 static void
 cmd_steer(void)
 {
 	char *text;
-	CFid *steerfd;
+	int   fd;
 
 	text = prompttext(mainwin);
 	if(text == nil || text[0] == '\0') {
@@ -678,132 +581,107 @@ cmd_steer(void)
 		return;
 	}
 
-	steerfd = aiopen("steer", OWRITE);
-	if(steerfd == nil) {
+	fd = aiopen("steer", OWRITE);
+	if(fd < 0) {
 		winappendstr(mainwin, "\n⚠ 9ai not available\n");
 		free(text);
 		return;
 	}
-
 	{
 		char *display = smprint("\n↩ Steer: %s\n", text);
 		winappendstr(mainwin, display);
 		free(display);
 	}
-
-	fswrite(steerfd, text, strlen(text));
-	fsclose(steerfd);
+	write(fd, text, strlen(text));
+	close(fd);
 	free(text);
 }
 
 static void
 cmd_new(void)
 {
-	CFid *newfd;
-
-	newfd = aiopen("session/new", OWRITE);
-	if(newfd == nil) {
+	if(aiwrite("session/new", "new", -1) < 0)
 		winappendstr(mainwin, "\n⚠ 9ai not available\n");
-		return;
-	}
-	fswrite(newfd, "new", 3);
-	fsclose(newfd);
-	winappendstr(mainwin, "\n── New session ──\n");
+	else
+		winappendstr(mainwin, "\n── New session ──\n");
 }
 
 static void
 cmd_clear(void)
 {
-	CFid *ctlfd;
+	int afd, dfd;
 
-	ctlfd = aiopen("ctl", OWRITE);
-	if(ctlfd == nil) {
+	if(aiwrite("ctl", "clear\n", -1) < 0) {
 		winappendstr(mainwin, "\n⚠ 9ai not available\n");
 		return;
 	}
-	fswrite(ctlfd, "clear\n", 6);
-	fsclose(ctlfd);
 
-	/* clear the window body */
-	qlock(&winlk);
-	if(mainwin->addr == nil) {
-		char p[64];
-		snprint(p, sizeof p, "%d/addr", mainwin->id);
-		mainwin->addr = fsopen(acmefs, p, OWRITE);
+	/* erase body */
+	afd = acmeopen(mainwin->id, "addr", OWRITE);
+	dfd = acmeopen(mainwin->id, "data", ORDWR);
+	if(afd >= 0 && dfd >= 0) {
+		write(afd, "1,$", 3);
+		write(dfd, "", 0);
 	}
-	if(mainwin->data == nil) {
-		char p[64];
-		snprint(p, sizeof p, "%d/data", mainwin->id);
-		mainwin->data = fsopen(acmefs, p, ORDWR);
-	}
-	fswrite(mainwin->addr, "1,$", 3);
-	fswrite(mainwin->data, "", 0);
-	qunlock(&winlk);
+	if(afd >= 0) close(afd);
+	if(dfd >= 0) close(dfd);
+
 	winclean(mainwin);
 	setstatus("ready");
 }
 
-/*
- * cmd_models — open a +9ai/+models window with the current model list.
- * Each line is:  id TAB format TAB ctx TAB maxout TAB tools TAB name
- * Button-3 on the id field to switch model.
- */
 static void
 cmd_models(void)
 {
 	Win  *w;
-	CFid *modelsfd;
+	int   fd;
 	char  buf[4096];
 	int   n;
-	char  name[256];
+	char *cwd;
+	char  name[512];
 
-	snprint(name, sizeof name, "%s/+9ai/+models", getenv("cwd") ? getenv("cwd") : ".");
+	cwd = getenv("cwd");
+	snprint(name, sizeof name, "%s/+9ai/+models", cwd ? cwd : ".");
 
 	w = newwin(name);
-
 	winappendstr(w, "# Middle-click a model id to switch model.\n\n");
 
-	modelsfd = aiopen("models", OREAD);
-	if(modelsfd == nil) {
-		winappendstr(w, "⚠ Cannot read 9ai/models\n");
+	fd = aiopen("models", OREAD);
+	if(fd < 0) {
+		winappendstr(w, "⚠ Cannot read /mnt/9ai/models\n");
 	} else {
-		while((n = fsread(modelsfd, buf, sizeof buf - 1)) > 0) {
+		while((n = read(fd, buf, sizeof buf - 1)) > 0) {
 			buf[n] = '\0';
 			winappendstr(w, buf);
 		}
-		fsclose(modelsfd);
+		close(fd);
 	}
 
 	winclean(w);
-	/* open event file on the models window so we can handle button-2 clicks */
 	threadcreate(modelswinproc, w, STACK);
 }
 
-/*
- * cmd_sessions — open a +9ai/+sessions window listing available sessions.
- * Reads ~/.cache/9ai/sessions/ and formats one line per session.
- */
-static void
-cmd_sessions(void);   /* forward */
-
-/* ── Sessions window ────────────────────────────────────────────────── */
+/* ── Session listing ────────────────────────────────────────────────── */
 
 static void
 cmd_sessions(void)
 {
 	char  *sessdir;
-	char  *home;
-	Dir   *dirs;
-	long   ndirs, i;
-	Win   *w;
-	char   name[256];
 	int    dirfd;
+	Dir   *dirs;
+	long   ndirs, i, j;
+	Dir    tmp;
+	Win   *w;
+	char  *cwd;
+	char   name[256];
+	char   path[512];
+	char   uuid[37], model[64], ts[32], snippet[SESS_SNIPPET + 4];
+	char   line[256];
 
-	home = homedir();
-	sessdir = smprint("%s/.cache/9ai/sessions", home);
-	free(home);
+	sessdir = configpath("sessions");
 
-	snprint(name, sizeof name, "%s/+9ai/+sessions", getenv("cwd") ? getenv("cwd") : ".");
+	cwd = getenv("cwd");
+	snprint(name, sizeof name, "%s/+9ai/+sessions", cwd ? cwd : ".");
 	w = newwin(name);
 	winappendstr(w, "# Middle-click a session UUID to load it.\n\n");
 
@@ -819,11 +697,10 @@ cmd_sessions(void)
 	ndirs = dirreadall(dirfd, &dirs);
 	close(dirfd);
 
-	/* sort by mtime descending — newest first */
-	/* simple insertion sort: fine for a few dozen sessions */
+	/* sort by mtime descending */
 	for(i = 1; i < ndirs; i++) {
-		Dir  tmp = dirs[i];
-		long j   = i - 1;
+		tmp = dirs[i];
+		j   = i - 1;
 		while(j >= 0 && dirs[j].mtime < tmp.mtime) {
 			dirs[j+1] = dirs[j];
 			j--;
@@ -834,17 +711,12 @@ cmd_sessions(void)
 	for(i = 0; i < ndirs; i++) {
 		if(dirs[i].name[0] == '.')
 			continue;
-
-		char path[512];
-		char uuid[37], model[64], ts[32], snippet[SESS_SNIPPET + 4];
-
 		snprint(path, sizeof path, "%s/%s", sessdir, dirs[i].name);
 		if(parsesessfile(path, uuid, model, ts, snippet) < 0)
 			continue;
 		if(uuid[0] == '\0')
 			continue;
 
-		char line[256];
 		snprint(line, sizeof line, "%s\t%s\t%s\t%s\n",
 		        uuid, model, ts, snippet);
 		winappendstr(w, line);
@@ -852,253 +724,121 @@ cmd_sessions(void)
 
 	free(dirs);
 	free(sessdir);
-
 	winclean(w);
 	threadcreate(sessionswinproc, w, STACK);
 }
 
-/* ── Models window event proc ───────────────────────────────────────── */
+/* ── Models window proc ─────────────────────────────────────────────── */
 
-/*
- * modelswinproc — handle button-2 clicks in the +models window.
- *
- * Middle-clicking a word that looks like a model id switches the model.
- * Non-command events are passed back.
- */
 static void
 modelswinproc(void *v)
 {
 	Win       *w = v;
-	char       buf[EVBUF];
+	int        fd;
+	char       buf[ACMEEVENT_BUFSZ];
 	int        bufp = 0, nbuf = 0;
 	AcmeEvent  e;
+	char      *text;
+	char       newmodel[128];
+	char       msg[128];
+
+	fd = acmeopen(w->id, "event", ORDWR);
+	if(fd < 0) {
+		free(w);
+		return;
+	}
 
 	for(;;) {
-		if(!getevent(w->eventfd, buf, &bufp, &nbuf, &e))
+		if(!getevent(fd, buf, &bufp, &nbuf, &e))
 			break;
 
 		if(e.c1 == 'M' && (e.c2 == 'x' || e.c2 == 'X')) {
-			/* button-2 execute: treat text as model id */
-			char *text = e.text;
-			/* skip empty */
+			text = e.text;
 			while(*text == ' ') text++;
-			if(*text == '\0') {
-				if(e.flag & 1)
-					writeevent(w->eventfd, &e);
-				continue;
-			}
-			/* looks like a model id if it contains no spaces and no # */
-			if(ismodelid(text) && e.c2 != 'X') {  /* Mx = user execute; MX = acme built-in */
-				/* switch model: write to 9ai/model */
-				CFid *modfd = aiopen("model", OWRITE);
-				if(modfd != nil) {
-					fswrite(modfd, text, strlen(text));
-					fswrite(modfd, "\n", 1);
-					fsclose(modfd);
+
+			if(ismodelid(text) && e.c2 != 'X') {
+				snprint(newmodel, sizeof newmodel, "%s\n", text);
+				if(aiwrite("model", newmodel, -1) >= 0) {
 					qlock(&statelk);
-					strlcpy(curmodel, text, sizeof curmodel);
+					scopy(curmodel, sizeof curmodel, text);
 					qunlock(&statelk);
 					setstatus("ready");
-					char msg[128];
 					snprint(msg, sizeof msg, "\n[Model → %s]\n", text);
 					winappendstr(mainwin, msg);
 				}
 				windelete(w);
-				break;
+				close(fd);
+				free(w);
+				return;
 			} else {
-				if(e.flag & 1)
-					writeevent(w->eventfd, &e);
+				if(e.flag & 1) writeevent(fd, &e);
 			}
-		} else if(e.c2 == 'L' || e.c2 == 'l') {
-			if(e.flag & 1)
-				writeevent(w->eventfd, &e);
 		} else {
-			if(e.flag & 1)
-				writeevent(w->eventfd, &e);
+			if(e.flag & 1) writeevent(fd, &e);
 		}
 	}
 
-	close(w->eventfd);
-	fsclose(w->ctl);
+	close(fd);
 	free(w);
 }
 
-/* ── Sessions window event proc ─────────────────────────────────────── */
+/* ── Sessions window proc ───────────────────────────────────────────── */
 
-/*
- * sessionswinproc — handle button-2 clicks in the +sessions window.
- *
- * Middle-clicking a UUID (36-char hex-and-dash string) loads that session.
- */
 static void
 sessionswinproc(void *v)
 {
 	Win       *w = v;
-	char       buf[EVBUF];
+	int        fd;
+	char       buf[ACMEEVENT_BUFSZ];
 	int        bufp = 0, nbuf = 0;
 	AcmeEvent  e;
+	char      *text;
+
+	fd = acmeopen(w->id, "event", ORDWR);
+	if(fd < 0) {
+		free(w);
+		return;
+	}
 
 	for(;;) {
-		if(!getevent(w->eventfd, buf, &bufp, &nbuf, &e))
+		if(!getevent(fd, buf, &bufp, &nbuf, &e))
 			break;
 
 		if(e.c1 == 'M' && (e.c2 == 'x' || e.c2 == 'X')) {
-			char *text = e.text;
+			text = e.text;
 			while(*text == ' ') text++;
 
 			if(isuuid(text) && e.c2 != 'X') {
-				/* load session: write path to 9ai/session/load */
-				char *home   = homedir();
-				char *path   = smprint("%s/.cache/9ai/sessions/%s", home, text);
-				free(home);
+				char *path = smprint("%s/%s", AI9, text);
+				char *sessdir = configpath("sessions/");
+				int   lfd;
+				char  msg[128];
+				free(path);
+				path = smprint("%s%s", sessdir, text);
+				free(sessdir);
 
-				CFid *loadfd = aiopen("session/load", OWRITE);
-				if(loadfd != nil) {
-					fswrite(loadfd, path, strlen(path));
-					fsclose(loadfd);
-					char msg[128];
+				lfd = aiopen("session/load", OWRITE);
+				if(lfd >= 0) {
+					write(lfd, path, strlen(path));
+					close(lfd);
 					snprint(msg, sizeof msg, "\n[Loading session %.8s…]\n", text);
 					winappendstr(mainwin, msg);
 				}
 				free(path);
 				windelete(w);
-				break;
+				close(fd);
+				free(w);
+				return;
 			} else {
-				if(e.flag & 1)
-					writeevent(w->eventfd, &e);
+				if(e.flag & 1) writeevent(fd, &e);
 			}
-		} else if(e.c2 == 'L' || e.c2 == 'l') {
-			if(e.flag & 1)
-				writeevent(w->eventfd, &e);
 		} else {
-			if(e.flag & 1)
-				writeevent(w->eventfd, &e);
+			if(e.flag & 1) writeevent(fd, &e);
 		}
 	}
 
-	close(w->eventfd);
-	fsclose(w->ctl);
+	close(fd);
 	free(w);
-}
-
-/* ── Login command and proc ─────────────────────────────────────────── */
-
-/*
- * loginproc — opened in a separate thread by cmd_login.
- *
- * Flow:
- *   1. Write to /auth/poll to trigger the device-code flow in authproc.
- *   2. Read /auth/device (blocks until authproc has the device code).
- *   3. Display URL and user code in the main window.
- *   4. Return (authproc is now polling in the background; aiproc will
- *      display the auth_ok or auth_err event when the flow completes).
- */
-static void
-loginproc(void *v)
-{
-	CFsys *fs;
-	CFid  *pollfd, *devfd;
-	char   buf[512];
-	int    n;
-
-	USED(v);
-
-	fs = ainewconn();
-	if(fs == nil) {
-		winappendstr(mainwin, "\n⚠ Cannot connect to 9ai\n");
-		return;
-	}
-
-	/* trigger the device flow */
-	pollfd = fsopen(fs, "auth/poll", OWRITE);
-	if(pollfd == nil) {
-		winappendstr(mainwin, "\n⚠ Cannot open auth/poll\n");
-		fsunmount(fs);
-		return;
-	}
-	fswrite(pollfd, "start", 5);
-	fsclose(pollfd);
-
-	/* read the device code (blocks until authproc calls oauthdevicestart) */
-	devfd = fsopen(fs, "auth/device", OREAD);
-	if(devfd == nil) {
-		winappendstr(mainwin, "\n⚠ Cannot open auth/device\n");
-		fsunmount(fs);
-		return;
-	}
-
-	n = fsread(devfd, buf, sizeof buf - 1);
-	fsclose(devfd);
-	fsunmount(fs);
-
-	if(n <= 0) {
-		/* flow already done or error — aiproc will show the result */
-		return;
-	}
-	buf[n] = '\0';
-
-	/*
-	 * buf = "https://github.com/login/device\nABCD-1234\n"
-	 * Display it clearly in the window.
-	 */
-	{
-		/* parse the two lines */
-		char *nl = strchr(buf, '\n');
-		char  url[256], code[64];
-		if(nl != nil) {
-			int ulen = nl - buf;
-			if(ulen >= (int)sizeof url) ulen = sizeof url - 1;
-			memmove(url, buf, ulen);
-			url[ulen] = '\0';
-			char *codep = nl + 1;
-			char *nl2   = strchr(codep, '\n');
-			int   clen  = nl2 ? nl2 - codep : (int)strlen(codep);
-			if(clen >= (int)sizeof code) clen = sizeof code - 1;
-			memmove(code, codep, clen);
-			code[clen] = '\0';
-
-			char msg[512];
-			snprint(msg, sizeof msg,
-			        "\n── Login to GitHub Copilot ──\n"
-			        "Open:  %s\n"
-			        "Code:  %s\n"
-			        "Waiting for authorization…\n",
-			        url, code);
-			winappendstr(mainwin, msg);
-		} else {
-			winappendstr(mainwin, buf);
-		}
-	}
-	setstatus("login pending");
-}
-
-static void
-cmd_login(void)
-{
-	/* check current auth status first */
-	CFid *statfd;
-	char  buf[64];
-	int   n;
-
-	statfd = aiopen("auth/status", OREAD);
-	if(statfd != nil) {
-		n = fsread(statfd, buf, sizeof buf - 1);
-		fsclose(statfd);
-		if(n > 0) {
-			buf[n] = '\0';
-			if(strncmp(buf, "pending", 7) == 0) {
-				winappendstr(mainwin, "\n[Login already in progress]\n");
-				return;
-			}
-			if(strncmp(buf, "logged_in", 9) == 0) {
-				winappendstr(mainwin, "\n[Already logged in. Use -L flag to force re-login.]\n");
-				return;
-			}
-		}
-	}
-
-	/* spawn loginproc so we don't block the event loop */
-	threadcreate(loginproc, nil, STACK);
 }
 
 /* ── Main event proc ────────────────────────────────────────────────── */
@@ -1107,20 +847,26 @@ static void
 eventproc(void *v)
 {
 	Win       *w = v;
-	char       buf[EVBUF];
+	int        fd;
+	char       buf[ACMEEVENT_BUFSZ];
 	int        bufp = 0, nbuf = 0;
 	AcmeEvent  e;
+	char      *text;
+
+	fd = acmeopen(w->id, "event", ORDWR);
+	if(fd < 0)
+		sysfatal("open event: %r");
 
 	for(;;) {
-		if(!getevent(w->eventfd, buf, &bufp, &nbuf, &e))
+		if(!getevent(fd, buf, &bufp, &nbuf, &e))
 			break;
 
+	
+
 		if(e.c1 == 'M' && (e.c2 == 'x' || e.c2 == 'X')) {
-			char *text = e.text;
+			text = e.text;
 			while(*text == ' ') text++;
 
-
-			/* dispatch tag commands */
 			if(strcmp(text, "Send")     == 0) { cmd_send();     continue; }
 			if(strcmp(text, "Stop")     == 0) { cmd_stop();     continue; }
 			if(strcmp(text, "Steer")    == 0) { cmd_steer();    continue; }
@@ -1128,67 +874,50 @@ eventproc(void *v)
 			if(strcmp(text, "Clear")    == 0) { cmd_clear();    continue; }
 			if(strcmp(text, "Models")   == 0) { cmd_models();   continue; }
 			if(strcmp(text, "Sessions") == 0) { cmd_sessions(); continue; }
-			if(strcmp(text, "Login")    == 0) { cmd_login();    continue; }
 
-			/* unrecognised: pass back if acme can handle it */
-			if(e.flag & 1)
-				writeevent(w->eventfd, &e);
+			if(e.flag & 1) writeevent(fd, &e);
 
 		} else if(e.c2 == 'L' || e.c2 == 'l') {
-			/* look-up: pass back for normal plumbing */
-			if(e.flag & 1)
-				writeevent(w->eventfd, &e);
+			if(e.flag & 1) writeevent(fd, &e);
 		} else {
-			/* all other events: pass back if acme can handle */
-			if(e.flag & 1)
-				writeevent(w->eventfd, &e);
+			if(e.flag & 1) writeevent(fd, &e);
 		}
 	}
 
-	/* window was closed */
+	close(fd);
 	threadexitsall(nil);
 }
 
-/* ── threadmain ─────────────────────────────────────────────────────── */
+/* ── Initial state fetch ─────────────────────────────────────────────── */
 
 static void
 readinitialstate(void)
 {
-	CFid *ctlfd;
-	char  buf[512];
-	int   n;
+	int  fd;
+	char buf[512];
+	int  n;
+	char *p;
 
-	ctlfd = aiopen("ctl", OREAD);
-	if(ctlfd == nil)
+	fd = aiopen("ctl", OREAD);
+	if(fd < 0)
 		return;
-
-	n = fsread(ctlfd, buf, sizeof buf - 1);
-	fsclose(ctlfd);
+	n = read(fd, buf, sizeof buf - 1);
+	close(fd);
 	if(n <= 0)
 		return;
 	buf[n] = '\0';
 
-	/*
-	 * Parse:
-	 *   model <id>
-	 *   status <state>
-	 *   session <uuid>
-	 */
-	char *p = buf;
+	p = buf;
 	while(*p) {
 		char *eol = strchr(p, '\n');
 		if(eol) *eol = '\0';
 
 		if(strncmp(p, "model ", 6) == 0) {
-			qlock(&statelk);
-			strlcpy(curmodel, p + 6, sizeof curmodel);
-			qunlock(&statelk);
+			scopy(curmodel, sizeof curmodel, p + 6);
 		} else if(strncmp(p, "session ", 8) == 0) {
 			char *sid = p + 8;
 			if(strcmp(sid, "none") != 0) {
-				qlock(&statelk);
-				strlcpy(cursession, sid, sizeof cursession);
-				qunlock(&statelk);
+				scopy(cursession, sizeof cursession, sid);
 			}
 		}
 
@@ -1219,63 +948,37 @@ threadmain(int argc, char *argv[])
 
 	USED(argc); USED(argv);
 
-	/* connect to acme */
-	acmefs = nsmount("acme", nil);
-	if(acmefs == nil)
-		sysfatal("cannot connect to acme: %r");
+	/* verify /mnt/acme is reachable */
+	{
+		int fd = open(ACME "/index", OREAD);
+		if(fd < 0)
+			sysfatal("cannot reach acme at %s: %r", ACME);
+		close(fd);
+	}
 
-	/* connect to 9ai */
-	aifsys = nsmount("9ai", nil);
-	if(aifsys == nil)
-		sysfatal("cannot connect to 9ai: %r\n"
-		         "(start 9ai first: 9ai -m /mnt/9ai)");
+	/* verify /mnt/9ai is reachable */
+	{
+		int fd = open(AI9 "/ctl", OREAD);
+		if(fd < 0)
+			sysfatal("cannot reach 9ai at %s: %r\n"
+			         "(start 9ai first: 9ai -m /mnt/9ai)", AI9);
+		close(fd);
+	}
 
-	/* bootstrap model/session state from ctl */
 	readinitialstate();
 
-	/* create the +9ai window */
 	cwd = getenv("cwd");
-	if(cwd == nil) {
-		cwd = malloc(512);
-		if(cwd == nil) sysfatal("malloc: %r");
-		if(getwd(cwd, 512) == nil)
-			strlcpy(cwd, ".", 2);
-	}
+	if(cwd == nil)
+		cwd = ".";
 	snprint(winname, sizeof winname, "%s/+9ai", cwd);
 
 	mainwin = newwin(winname);
-	/* write initial status line */
+	acmewrite(mainwin->id, "ctl", "clean\n", -1);
+
+	proccreate(aiproc,  nil, STACK);
+	proccreate(outproc, nil, STACK);
+
 	setstatus("ready");
 
-	/* check auth status and show login prompt if needed */
-	{
-		CFid *statfd = aiopen("auth/status", OREAD);
-		if(statfd != nil) {
-			char buf[64];
-			int  n = fsread(statfd, buf, sizeof buf - 1);
-			fsclose(statfd);
-			if(n > 0) {
-				buf[n] = '\0';
-				if(strncmp(buf, "logged_out", 10) == 0) {
-					winappendstr(mainwin,
-					    "⚠ Not logged in to GitHub Copilot.\n"
-					    "  Middle-click Login in the tag, or run: 9ai -L\n");
-					setstatus("login required");
-				} else if(strncmp(buf, "pending", 7) == 0) {
-					winappendstr(mainwin,
-					    "Login in progress — check the terminal for the device code.\n");
-					setstatus("login pending");
-				}
-			}
-		}
-	}
-
-	winclean(mainwin);
-
-	/* start reader procs */
-	threadcreate(aiproc,  nil, STACK);
-	threadcreate(outproc, nil, STACK);
-
-	/* run event loop in this thread */
 	eventproc(mainwin);
 }

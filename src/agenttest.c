@@ -699,7 +699,7 @@ check_session_file(const char *sessdir, const char *uuid)
 }
 
 static void
-test_live_agent(char *sockpath, char *tokpath)
+test_live_agent(char *tokpath)
 {
 	AgentCfg     cfg;
 	OAIReq      *req;
@@ -712,21 +712,8 @@ test_live_agent(char *sockpath, char *tokpath)
 	memset(&cfg, 0, sizeof cfg);
 
 	cfg.model    = "gpt-4o";
-	cfg.sockpath = sockpath;
 	cfg.tokpath  = tokpath;
-	/* derive session dir */
-#ifdef PLAN9PORT
-	{
-		char  sockdup[512];
-		char *slash;
-		snprint(sockdup, sizeof sockdup, "%s", sockpath ? sockpath : "");
-		slash = strrchr(sockdup, '/');
-		if(slash != nil) *slash = '\0';
-		cfg.sessdir = smprint("%s/sessions/", sockdup);
-	}
-#else
-	cfg.sessdir = configpath("sessions/");
-#endif
+	cfg.sessdir  = configpath("sessions/");
 	cfg.system   = "You are a helpful assistant. "
 	               "When asked to list files, use the exec tool to run ls.";
 	cfg.ontext   = live_ontext;
@@ -793,7 +780,7 @@ test_live_agent(char *sockpath, char *tokpath)
  *          (thinking is session-file-only, not fed back to API)
  */
 static void
-test_live_agent_ant(char *sockpath, char *tokpath)
+test_live_agent_ant(char *tokpath)
 {
 	AgentCfg     cfg;
 	ANTReq      *req;
@@ -806,21 +793,8 @@ test_live_agent_ant(char *sockpath, char *tokpath)
 	memset(&cfg, 0, sizeof cfg);
 
 	cfg.model    = "claude-sonnet-4.5";
-	cfg.sockpath = sockpath;
 	cfg.tokpath  = tokpath;
-	/* derive session dir */
-#ifdef PLAN9PORT
-	{
-		char  sockdup[512];
-		char *slash;
-		snprint(sockdup, sizeof sockdup, "%s", sockpath ? sockpath : "");
-		slash = strrchr(sockdup, '/');
-		if(slash != nil) *slash = '\0';
-		cfg.sessdir = smprint("%s/sessions/", sockdup);
-	}
-#else
-	cfg.sessdir = configpath("sessions/");
-#endif
+	cfg.sessdir  = configpath("sessions/");
 	cfg.system   = "You are a helpful assistant. "
 	               "When asked to list files, use the exec tool to run ls.";
 	cfg.ontext   = live_ontext;
@@ -895,11 +869,9 @@ test_live_agent_ant(char *sockpath, char *tokpath)
 void
 threadmain(int argc, char *argv[])
 {
-	char *sockpath = nil;
 	char *tokpath  = nil;
 
 	ARGBEGIN{
-	case 's': sockpath = ARGF(); break;
 	case 't': tokpath  = ARGF(); break;
 	}ARGEND
 
@@ -927,11 +899,11 @@ threadmain(int argc, char *argv[])
 	test_sessload_trim_replay();
 	test_sessload_trim_all_then_continue();
 
-	if(sockpath != nil && tokpath != nil) {
+	if(tokpath != nil) {
 		print("\n=== Part 2: Live integration tests (OAI) ===\n");
-		test_live_agent(sockpath, tokpath);
+		test_live_agent(tokpath);
 		print("\n=== Part 3: Live integration tests (ANT/Claude) ===\n");
-		test_live_agent_ant(sockpath, tokpath);
+		test_live_agent_ant(tokpath);
 	} else {
 		print("\n(skipping live tests: pass -s <sock> -t <tok> to enable)\n");
 	}

@@ -37,7 +37,7 @@
  *
  * ── Usage ─────────────────────────────────────────────────────────────
  *
- *   AiState *ai = aiinit(cfg);   // allocate and configure global state
+ *   AiState *ai = aiinit(model, tokpath, mtpt); // allocate and configure global state
  *   aimain(ai, srvname, mtpt);   // post 9P service; never returns
  */
 
@@ -62,7 +62,6 @@ struct AgentReq {
 struct AiState {
 	/* configuration */
 	char *model;      /* current model id (heap, always non-nil) */
-	char *sockpath;   /* 9aitls proxy socket path */
 	char *tokpath;    /* GitHub refresh token path */
 	char *mtpt;       /* mount point of the 9ai FS, or nil */
 
@@ -126,15 +125,14 @@ struct AiState {
 /*
  * aiinit — allocate and initialise AiState with default values.
  *
- * model    — initial model id (e.g. "gpt-4o"); strdup'd
- * sockpath — path to 9aitls Unix socket; strdup'd
- * tokpath  — path to GitHub refresh token file; strdup'd
- * mtpt     — mount point of the 9ai FS (used to unmount from exec children
- *             when -U is passed); nil means no unmount
+ * model   — initial model id (e.g. "gpt-4o"); strdup'd
+ * tokpath — path to GitHub refresh token file; strdup'd
+ * mtpt    — mount point of the 9ai FS (used to unmount from exec children
+ *            when -U is passed); nil means no unmount
  *
  * Returns a heap-allocated AiState.  Does not start any procs.
  */
-AiState *aiinit(char *model, char *sockpath, char *tokpath, char *mtpt);
+AiState *aiinit(char *model, char *tokpath, char *mtpt);
 
 /*
  * aimain — post the 9P service and run the srv loop.

@@ -20,7 +20,7 @@
  *   2.6  ant_tool_sse: final delta is ANTDStop with "tool_use"
  *   2.7  ant_tool_sse: return ANT_DONE after stop
  *
- * Part 3: Live integration tests (requires -s sockpath -t tokenpath)
+ * Part 3: Live integration tests (requires -t tokenpath)
  *   3.1  POST claude-sonnet-4.5 "say hello world and nothing else"
  *        — ANTDText deltas received; assembled text contains "hello" and "world"
  *        — ANTDStop with stop_reason "end_turn"
@@ -885,7 +885,7 @@ test_cache_flag_cleared_after_call(void)
 
 
 static void
-test_live_text(char *sockpath, char *tokpath)
+test_live_text(char *tokpath)
 {
 	char       *refresh, *errbuf;
 	OAuthToken *tok;
@@ -915,7 +915,7 @@ test_live_text(char *sockpath, char *tokpath)
 	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
 	refresh = buf;
 
-	tok = oauthsession(refresh, sockpath);
+	tok = oauthsession(refresh);
 	if(tok == nil) {
 		rerrstr(buf, sizeof buf);
 		fprint(2, "SKIP: oauthsession: %s\n", buf);
@@ -929,8 +929,8 @@ test_live_text(char *sockpath, char *tokpath)
 	body = antreqjson(req, nil, &bodylen);
 	if(body == nil) { fprint(2, "FAIL: antreqjson nil\n"); failures++; oauthtokenfree(tok); antreqfree(req); return; }
 
-	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
-	if(c == nil) { fprint(2, "SKIP: httpdial failed\n"); free(body); oauthtokenfree(tok); antreqfree(req); return; }
+	c = tlsdial("api.individual.githubcopilot.com", "443");
+	if(c == nil) { fprint(2, "SKIP: tlsdial failed\n"); free(body); oauthtokenfree(tok); antreqfree(req); return; }
 
 	r = httppost(c, "/v1/messages", "api.individual.githubcopilot.com",
 	             hdrs, nhdrs, body, bodylen);
@@ -992,7 +992,7 @@ test_live_text(char *sockpath, char *tokpath)
 }
 
 static void
-test_live_tool(char *sockpath, char *tokpath)
+test_live_tool(char *tokpath)
 {
 	char       *refresh, *errbuf;
 	OAuthToken *tok;
@@ -1022,7 +1022,7 @@ test_live_tool(char *sockpath, char *tokpath)
 	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
 	refresh = buf;
 
-	tok = oauthsession(refresh, sockpath);
+	tok = oauthsession(refresh);
 	if(tok == nil) {
 		rerrstr(buf, sizeof buf);
 		fprint(2, "SKIP: oauthsession: %s\n", buf);
@@ -1038,8 +1038,8 @@ test_live_tool(char *sockpath, char *tokpath)
 	body = antreqjson(req, nil, &bodylen);
 	if(body == nil) { fprint(2, "FAIL: antreqjson nil\n"); failures++; oauthtokenfree(tok); antreqfree(req); return; }
 
-	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
-	if(c == nil) { fprint(2, "SKIP: httpdial failed\n"); free(body); oauthtokenfree(tok); antreqfree(req); return; }
+	c = tlsdial("api.individual.githubcopilot.com", "443");
+	if(c == nil) { fprint(2, "SKIP: tlsdial failed\n"); free(body); oauthtokenfree(tok); antreqfree(req); return; }
 
 	r = httppost(c, "/v1/messages", "api.individual.githubcopilot.com",
 	             hdrs, nhdrs, body, bodylen);
@@ -1112,13 +1112,11 @@ int mainstacksize = 65536;   /* antdelta uses ~4KB of toks[] per call; avoid ove
 void
 threadmain(int argc, char *argv[])
 {
-	char *sockpath = nil;
 	char *tokpath  = nil;
 	int   i;
 
 	for(i = 1; i < argc; i++) {
 		if(strcmp(argv[i], "-s") == 0 && i+1 < argc)
-			sockpath = argv[++i];
 		else if(strcmp(argv[i], "-t") == 0 && i+1 < argc)
 			tokpath = argv[++i];
 	}
@@ -1154,10 +1152,10 @@ threadmain(int argc, char *argv[])
 	test_cache_tool_result_not_marked();
 	test_cache_flag_cleared_after_call();
 
-	if(sockpath != nil && tokpath != nil) {
+	if(tokpath != nil) {
 		print("=== Part 3: live integration tests ===\n");
-		test_live_text(sockpath, tokpath);
-		test_live_tool(sockpath, tokpath);
+		test_live_text(tokpath);
+		test_live_tool(tokpath);
 	} else {
 		print("(skip Part 3: no -s/-t flags)\n");
 	}

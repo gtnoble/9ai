@@ -8,8 +8,7 @@
  *   github.com         POST /login/oauth/access_token
  *   api.github.com     GET  /copilot_internal/v2/token
  *
- * All three go through the 9aitls Unix-socket TLS proxy.
- * The proxy routes to the correct upstream via the Host: header.
+ * All network calls use tlsdial() directly.
  *
  * Client ID is the standard GitHub Copilot VS Code client.
  * Scope: "read:user" (minimum required for Copilot).
@@ -25,14 +24,13 @@
 #include "json.h"
 #include "oauth.h"
 
-/* GitHub Copilot VS Code client ID (base64 of "Iv1.b507a08c87ecfe98") */
 #define CLIENT_ID  "Iv1.b507a08c87ecfe98"
 #define SCOPE      "read:user"
 
 #define GITHUB_HOST     "github.com"
 #define APIGITHUB_HOST  "api.github.com"
+#define COPILOT_HOST    "api.individual.githubcopilot.com"
 
-/* Standard Copilot headers required by the API */
 static HTTPHdr copilot_hdrs[] = {
 	{ "User-Agent",             "GitHubCopilotChat/0.35.0" },
 	{ "Editor-Version",         "vscode/1.107.0"           },
@@ -45,11 +43,10 @@ enum { NCOPILOT_HDRS = nelem(copilot_hdrs) };
 
 /*
  * postjson — POST a JSON body to host/path, return parsed response.
- * toks and ntoks are output: caller provides the token array.
  * Returns freshly allocated body string (caller must free), or nil.
  */
 static char *
-postjson(char *sockpath, char *host, char *path,
+postjson(char *host, char *path,
          HTTPHdr *hdrs, int nhdrs,
          char *body,
          jsmntok_t *toks, int maxtok, int *ntoks_out)
@@ -60,7 +57,7 @@ postjson(char *sockpath, char *host, char *path,
 	char *js;
 	int n;
 
-	c = portdial(host, "443", sockpath);
+	c = tlsdial(host, "443");
 	if(c == nil)
 		return nil;
 
@@ -75,7 +72,7 @@ postjson(char *sockpath, char *host, char *path,
 		return nil;
 	}
 	js = r->body;
-	r->body = nil;   /* take ownership */
+	r->body = nil;
 	httprespfree(r);
 	httpclose(c);
 
@@ -92,10 +89,9 @@ postjson(char *sockpath, char *host, char *path,
 
 /*
  * getjson — GET host/path, return parsed response body.
- * Same ownership semantics as postjson.
  */
 static char *
-getjson(char *sockpath, char *host, char *path,
+getjson(char *host, char *path,
         HTTPHdr *hdrs, int nhdrs,
         jsmntok_t *toks, int maxtok, int *ntoks_out)
 {
@@ -105,7 +101,7 @@ getjson(char *sockpath, char *host, char *path,
 	char *js;
 	int n;
 
-	c = portdial(host, "443", sockpath);
+	c = tlsdial(host, "443");
 	if(c == nil)
 		return nil;
 
@@ -137,11 +133,10 @@ getjson(char *sockpath, char *host, char *path,
 
 /* ── Phase 1: device code flow ────────────────────────────────────────── */
 
-/* DeviceCode is the public OAuthDeviceCode typedef from oauth.h */
 typedef OAuthDeviceCode DeviceCode;
 
 static int
-startdeviceflow(char *sockpath, DeviceCode *dc)
+startdeviceflow(DeviceCode *dc)
 {
 	enum { MAXTOK = 64 };
 	jsmntok_t toks[MAXTOK];
@@ -156,20 +151,17 @@ startdeviceflow(char *sockpath, DeviceCode *dc)
 		CLIENT_ID, SCOPE);
 
 	nhdrs = 0;
-	hdrs[nhdrs].name  = "Accept";
-	hdrs[nhdrs].value = "application/json";       nhdrs++;
-	hdrs[nhdrs].name  = "Content-Type";
-	hdrs[nhdrs].value = "application/json";       nhdrs++;
-	hdrs[nhdrs].name  = "User-Agent";
-	hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0"; nhdrs++;
+	hdrs[nhdrs].name  = "Accept";        hdrs[nhdrs].value = "application/json";         nhdrs++;
+	hdrs[nhdrs].name  = "Content-Type";  hdrs[nhdrs].value = "application/json";         nhdrs++;
+	hdrs[nhdrs].name  = "User-Agent";    hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0"; nhdrs++;
 
-	js = postjson(sockpath, GITHUB_HOST, "/login/device/code",
+	js = postjson(GITHUB_HOST, "/login/device/code",
 	              hdrs, nhdrs, body, toks, MAXTOK, &ntoks);
 	if(js == nil)
 		return -1;
 
 	vi = jsonget(js, toks, ntoks, 0, "device_code");
-	if(vi < 0) { werrstr("oauth: no device_code in response"); free(js); return -1; }
+	if(vi < 0) { werrstr("oauth: no device_code"); free(js); return -1; }
 	jsonstr(js, &toks[vi], dc->device_code, sizeof dc->device_code);
 
 	vi = jsonget(js, toks, ntoks, 0, "user_code");
@@ -192,12 +184,8 @@ startdeviceflow(char *sockpath, DeviceCode *dc)
 	return 0;
 }
 
-/*
- * pollaccesstoken — poll until GitHub grants the token.
- * Returns allocated token string on success, nil on error/timeout.
- */
 static char *
-pollaccesstoken(char *sockpath, DeviceCode *dc)
+pollaccesstoken(DeviceCode *dc)
 {
 	enum { MAXTOK = 64 };
 	jsmntok_t toks[MAXTOK];
@@ -213,12 +201,9 @@ pollaccesstoken(char *sockpath, DeviceCode *dc)
 	deadline = time(0) + dc->expires_in;
 
 	nhdrs = 0;
-	hdrs[nhdrs].name  = "Accept";
-	hdrs[nhdrs].value = "application/json";         nhdrs++;
-	hdrs[nhdrs].name  = "Content-Type";
-	hdrs[nhdrs].value = "application/json";         nhdrs++;
-	hdrs[nhdrs].name  = "User-Agent";
-	hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0"; nhdrs++;
+	hdrs[nhdrs].name  = "Accept";        hdrs[nhdrs].value = "application/json";         nhdrs++;
+	hdrs[nhdrs].name  = "Content-Type";  hdrs[nhdrs].value = "application/json";         nhdrs++;
+	hdrs[nhdrs].name  = "User-Agent";    hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0"; nhdrs++;
 
 	snprint(body, sizeof body,
 		"{\"client_id\":\"%s\","
@@ -229,13 +214,11 @@ pollaccesstoken(char *sockpath, DeviceCode *dc)
 	while(time(0) < deadline) {
 		sleep(interval_ms / 1000);
 
-		js = postjson(sockpath, GITHUB_HOST,
-		              "/login/oauth/access_token",
+		js = postjson(GITHUB_HOST, "/login/oauth/access_token",
 		              hdrs, nhdrs, body, toks, MAXTOK, &ntoks);
 		if(js == nil)
 			return nil;
 
-		/* success: access_token present */
 		vi = jsonget(js, toks, ntoks, 0, "access_token");
 		if(vi >= 0) {
 			char *tok = mallocz(toks[vi].end - toks[vi].start + 1, 1);
@@ -245,24 +228,19 @@ pollaccesstoken(char *sockpath, DeviceCode *dc)
 			return tok;
 		}
 
-		/* error field */
 		vi = jsonget(js, toks, ntoks, 0, "error");
 		if(vi >= 0) {
 			jsonstr(js, &toks[vi], errbuf, sizeof errbuf);
 			free(js);
-
 			if(strcmp(errbuf, "authorization_pending") == 0)
 				continue;
-
 			if(strcmp(errbuf, "slow_down") == 0) {
 				interval_ms += 5000;
 				continue;
 			}
-
 			werrstr("oauth: device flow failed: %s", errbuf);
 			return nil;
 		}
-
 		free(js);
 	}
 
@@ -270,15 +248,12 @@ pollaccesstoken(char *sockpath, DeviceCode *dc)
 	return nil;
 }
 
-/* ── writetoken — persist token to file ────────────────────────────────── */
-
 static int
 writetoken(char *tokpath, char *token)
 {
-	int fd;
+	int  fd;
 	long n;
 
-	/* Create with mode 0600 */
 	fd = create(tokpath, OWRITE, 0600);
 	if(fd < 0)
 		return -1;
@@ -287,33 +262,31 @@ writetoken(char *tokpath, char *token)
 		close(fd);
 		return -1;
 	}
-	/* trailing newline for readability */
 	write(fd, "\n", 1);
 	close(fd);
 	return 0;
 }
 
-/* ── oauthlogin ──────────────────────────────────────────────────────── */
+/* ── Public API ───────────────────────────────────────────────────────── */
 
 int
-oauthlogin(char *sockpath, char *tokpath)
+oauthlogin(char *tokpath)
 {
 	DeviceCode dc;
 	char *token;
 
-	if(startdeviceflow(sockpath, &dc) < 0)
+	if(startdeviceflow(&dc) < 0)
 		return -1;
 
 	print("Open this URL in your browser:\n\n  %s\n\n", dc.verification_uri);
 	print("Enter code: %s\n\n", dc.user_code);
 	print("Waiting for authorization");
-	/* flush stdout so the message appears before we block in the poll loop */
 	{
 		Biobuf *b = Bfdopen(1, OWRITE);
 		if(b != nil) { Bflush(b); Bterm(b); }
 	}
 
-	token = pollaccesstoken(sockpath, &dc);
+	token = pollaccesstoken(&dc);
 	if(token == nil) {
 		print("\n");
 		return -1;
@@ -330,10 +303,8 @@ oauthlogin(char *sockpath, char *tokpath)
 	return 0;
 }
 
-/* ── oauthsession ─────────────────────────────────────────────────────── */
-
 OAuthToken *
-oauthsession(char *refresh, char *sockpath)
+oauthsession(char *refresh)
 {
 	enum { MAXTOK = 128 };
 	jsmntok_t toks[MAXTOK];
@@ -348,19 +319,15 @@ oauthsession(char *refresh, char *sockpath)
 	snprint(authbuf, sizeof authbuf, "Bearer %s", refresh);
 
 	nhdrs = 0;
-	hdrs[nhdrs].name  = "Accept";
-	hdrs[nhdrs].value = "application/json";  nhdrs++;
-	hdrs[nhdrs].name  = "Authorization";
-	hdrs[nhdrs].value = authbuf;             nhdrs++;
-	/* append standard Copilot headers */
+	hdrs[nhdrs].name  = "Accept";         hdrs[nhdrs].value = "application/json"; nhdrs++;
+	hdrs[nhdrs].name  = "Authorization";  hdrs[nhdrs].value = authbuf;            nhdrs++;
 	{
 		int i;
 		for(i = 0; i < NCOPILOT_HDRS && nhdrs < 8; i++)
 			hdrs[nhdrs++] = copilot_hdrs[i];
 	}
 
-	js = getjson(sockpath, APIGITHUB_HOST,
-	             "/copilot_internal/v2/token",
+	js = getjson(APIGITHUB_HOST, "/copilot_internal/v2/token",
 	             hdrs, nhdrs, toks, MAXTOK, &ntoks);
 	if(js == nil)
 		return nil;
@@ -375,33 +342,25 @@ oauthsession(char *refresh, char *sockpath)
 
 	ot = mallocz(sizeof *ot, 1);
 	if(ot == nil) { free(js); return nil; }
-
 	ot->token = strdup(tokbuf);
 
 	vi = jsonget(js, toks, ntoks, 0, "expires_at");
-	if(vi >= 0)
-		ot->expires_at = jsonint(js, &toks[vi]);
+	if(vi >= 0) ot->expires_at = jsonint(js, &toks[vi]);
 
 	vi = jsonget(js, toks, ntoks, 0, "refresh_in");
-	if(vi >= 0)
-		ot->refresh_in = jsonint(js, &toks[vi]);
+	if(vi >= 0) ot->refresh_in = jsonint(js, &toks[vi]);
 
 	free(js);
 	return ot;
 }
 
-/* ── oauthtokenfree ───────────────────────────────────────────────────── */
-
 void
 oauthtokenfree(OAuthToken *t)
 {
-	if(t == nil)
-		return;
+	if(t == nil) return;
 	free(t->token);
 	free(t);
 }
-
-/* ── oauthtokenexists ─────────────────────────────────────────────────── */
 
 int
 oauthtokenexists(char *tokpath)
@@ -411,34 +370,28 @@ oauthtokenexists(char *tokpath)
 	int  n;
 
 	fd = open(tokpath, OREAD);
-	if(fd < 0)
-		return 0;
+	if(fd < 0) return 0;
 	n = read(fd, buf, sizeof buf);
 	close(fd);
 	return n > 0;
 }
 
-/* ── oauthdevicestart ─────────────────────────────────────────────────── */
-
 OAuthDeviceCode *
-oauthdevicestart(char *sockpath)
+oauthdevicestart(void)
 {
 	OAuthDeviceCode *dc;
 
 	dc = mallocz(sizeof *dc, 1);
-	if(dc == nil)
-		return nil;
-	if(startdeviceflow(sockpath, dc) < 0) {
+	if(dc == nil) return nil;
+	if(startdeviceflow(dc) < 0) {
 		free(dc);
 		return nil;
 	}
 	return dc;
 }
 
-/* ── oauthdevicepoll ──────────────────────────────────────────────────── */
-
 int
-oauthdevicepoll(OAuthDeviceCode *dc, char *sockpath, char *tokpath, int *done)
+oauthdevicepoll(OAuthDeviceCode *dc, char *tokpath, int *done)
 {
 	enum { MAXTOK = 64 };
 	jsmntok_t toks[MAXTOK];
@@ -451,9 +404,7 @@ oauthdevicepoll(OAuthDeviceCode *dc, char *sockpath, char *tokpath, int *done)
 
 	*done = 0;
 
-	/* deadline check */
 	if(dc->expires_in > 0) {
-		/* we track relative remaining time; decrement per poll */
 		dc->expires_in -= dc->interval;
 		if(dc->expires_in <= 0) {
 			werrstr("oauth: device flow timed out");
@@ -463,12 +414,9 @@ oauthdevicepoll(OAuthDeviceCode *dc, char *sockpath, char *tokpath, int *done)
 	}
 
 	nhdrs = 0;
-	hdrs[nhdrs].name  = "Accept";
-	hdrs[nhdrs].value = "application/json";         nhdrs++;
-	hdrs[nhdrs].name  = "Content-Type";
-	hdrs[nhdrs].value = "application/json";         nhdrs++;
-	hdrs[nhdrs].name  = "User-Agent";
-	hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0"; nhdrs++;
+	hdrs[nhdrs].name  = "Accept";        hdrs[nhdrs].value = "application/json";         nhdrs++;
+	hdrs[nhdrs].name  = "Content-Type";  hdrs[nhdrs].value = "application/json";         nhdrs++;
+	hdrs[nhdrs].name  = "User-Agent";    hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0"; nhdrs++;
 
 	snprint(body, sizeof body,
 		"{\"client_id\":\"%s\","
@@ -476,15 +424,10 @@ oauthdevicepoll(OAuthDeviceCode *dc, char *sockpath, char *tokpath, int *done)
 		"\"grant_type\":\"urn:ietf:params:oauth:grant-type:device_code\"}",
 		CLIENT_ID, dc->device_code);
 
-	js = postjson(sockpath, GITHUB_HOST,
-	              "/login/oauth/access_token",
+	js = postjson(GITHUB_HOST, "/login/oauth/access_token",
 	              hdrs, nhdrs, body, toks, MAXTOK, &ntoks);
-	if(js == nil) {
-		*done = 1;
-		return -1;
-	}
+	if(js == nil) { *done = 1; return -1; }
 
-	/* success: access_token present */
 	vi = jsonget(js, toks, ntoks, 0, "access_token");
 	if(vi >= 0) {
 		int   tlen = toks[vi].end - toks[vi].start;
@@ -503,38 +446,30 @@ oauthdevicepoll(OAuthDeviceCode *dc, char *sockpath, char *tokpath, int *done)
 		return 0;
 	}
 
-	/* error field */
 	vi = jsonget(js, toks, ntoks, 0, "error");
 	if(vi >= 0) {
 		jsonstr(js, &toks[vi], errbuf, sizeof errbuf);
 		free(js);
-
 		if(strcmp(errbuf, "authorization_pending") == 0)
-			return 0;   /* done=0: keep polling */
-
+			return 0;
 		if(strcmp(errbuf, "slow_down") == 0) {
 			dc->interval += 5;
-			return 0;   /* done=0: keep polling at new rate */
+			return 0;
 		}
-
 		werrstr("oauth: device flow failed: %s", errbuf);
 		*done = 1;
 		return -1;
 	}
 
 	free(js);
-	return 0;   /* unexpected response: keep polling */
+	return 0;
 }
-
-/* ── oauthdevcodefree ─────────────────────────────────────────────────── */
 
 void
 oauthdevcodefree(OAuthDeviceCode *dc)
 {
 	free(dc);
 }
-
-/* ── oauthenablemodels ────────────────────────────────────────────────── */
 
 /*
  * oauthenablemodels — POST /models/<id>/policy {"state":"enabled"} for
@@ -544,17 +479,13 @@ oauthdevcodefree(OAuthDeviceCode *dc)
  * Errors are silently ignored — best-effort only.
  */
 void
-oauthenablemodels(char *session, char *sockpath)
+oauthenablemodels(char *session)
 {
-	/* We need to fetch the model list first, then enable each one.
-	 * Import is circular (models.h ↔ oauth.h), so we inline a minimal
-	 * /models fetch here: just collect the "id" strings, nothing else. */
 	HTTPConn *c;
 	HTTPResp *r;
 	char authbuf[1100];
 	HTTPHdr hdrs[8];
 	int nhdrs;
-
 	enum { MAXTOK = 6000 };
 	jsmntok_t *toks;
 	jsmn_parser p;
@@ -564,18 +495,16 @@ oauthenablemodels(char *session, char *sockpath)
 	snprint(authbuf, sizeof authbuf, "Bearer %s", session);
 
 	nhdrs = 0;
-	hdrs[nhdrs].name  = "Authorization";           hdrs[nhdrs].value = authbuf;                    nhdrs++;
-	hdrs[nhdrs].name  = "Content-Type";            hdrs[nhdrs].value = "application/json";          nhdrs++;
-	hdrs[nhdrs].name  = "User-Agent";              hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0";  nhdrs++;
-	hdrs[nhdrs].name  = "Editor-Version";          hdrs[nhdrs].value = "vscode/1.107.0";            nhdrs++;
-	hdrs[nhdrs].name  = "Editor-Plugin-Version";   hdrs[nhdrs].value = "copilot-chat/0.35.0";       nhdrs++;
-	hdrs[nhdrs].name  = "Copilot-Integration-Id";  hdrs[nhdrs].value = "vscode-chat";               nhdrs++;
+	hdrs[nhdrs].name  = "Authorization";          hdrs[nhdrs].value = authbuf;                    nhdrs++;
+	hdrs[nhdrs].name  = "Content-Type";           hdrs[nhdrs].value = "application/json";          nhdrs++;
+	hdrs[nhdrs].name  = "User-Agent";             hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0";  nhdrs++;
+	hdrs[nhdrs].name  = "Editor-Version";         hdrs[nhdrs].value = "vscode/1.107.0";            nhdrs++;
+	hdrs[nhdrs].name  = "Editor-Plugin-Version";  hdrs[nhdrs].value = "copilot-chat/0.35.0";       nhdrs++;
+	hdrs[nhdrs].name  = "Copilot-Integration-Id"; hdrs[nhdrs].value = "vscode-chat";               nhdrs++;
 
-	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
-	if(c == nil)
-		return;
-
-	r = httpget(c, "/models", "api.individual.githubcopilot.com", hdrs, nhdrs);
+	c = tlsdial(COPILOT_HOST, "443");
+	if(c == nil) return;
+	r = httpget(c, "/models", COPILOT_HOST, hdrs, nhdrs);
 	if(r == nil || r->code != 200) {
 		if(r != nil) httprespfree(r);
 		httpclose(c);
@@ -587,25 +516,21 @@ oauthenablemodels(char *session, char *sockpath)
 		return;
 	}
 	httpclose(c);
-
 	js = r->body;
 	r->body = nil;
 	httprespfree(r);
 
 	toks = mallocz(MAXTOK * sizeof(jsmntok_t), 1);
 	if(toks == nil) { free(js); return; }
-
 	jsmn_init(&p);
 	ntoks = jsmn_parse(&p, js, strlen(js), toks, MAXTOK);
 	if(ntoks < 0) { free(toks); free(js); return; }
 
-	/* walk the "data" array; for each element extract "id" and POST policy */
 	{
 		int data_arr = jsonget(js, toks, ntoks, 0, "data");
 		if(data_arr < 0 || toks[data_arr].type != JSMN_ARRAY) {
 			free(toks); free(js); return;
 		}
-
 		int arr_size = toks[data_arr].size;
 		int elem = data_arr + 1;
 		int ei;
@@ -614,46 +539,37 @@ oauthenablemodels(char *session, char *sockpath)
 			int id_vi = jsonget(js, toks, ntoks, elem, "id");
 			if(id_vi >= 0) {
 				char id_buf[128];
+				char path[256];
+				char body2[32];
+				HTTPConn *c2;
+				HTTPResp *r2;
+				HTTPHdr hdrs2[8];
+				int nh2;
+
 				jsonstr(js, &toks[id_vi], id_buf, sizeof id_buf);
+				snprint(path,  sizeof path,  "/models/%s/policy", id_buf);
+				snprint(body2, sizeof body2, "{\"state\":\"enabled\"}");
 
-				/* POST /models/<id>/policy {"state":"enabled"} */
-				{
-					char path[256];
-					char body2[32];
-					HTTPConn *c2;
-					HTTPResp *r2;
-					HTTPHdr hdrs2[8];
-					int nh2;
+				nh2 = 0;
+				hdrs2[nh2].name  = "Authorization";          hdrs2[nh2].value = authbuf;                    nh2++;
+				hdrs2[nh2].name  = "Content-Type";           hdrs2[nh2].value = "application/json";          nh2++;
+				hdrs2[nh2].name  = "User-Agent";             hdrs2[nh2].value = "GitHubCopilotChat/0.35.0";  nh2++;
+				hdrs2[nh2].name  = "Editor-Version";         hdrs2[nh2].value = "vscode/1.107.0";            nh2++;
+				hdrs2[nh2].name  = "Editor-Plugin-Version";  hdrs2[nh2].value = "copilot-chat/0.35.0";       nh2++;
+				hdrs2[nh2].name  = "Copilot-Integration-Id"; hdrs2[nh2].value = "vscode-chat";               nh2++;
+				hdrs2[nh2].name  = "openai-intent";          hdrs2[nh2].value = "chat-policy";               nh2++;
 
-					snprint(path, sizeof path, "/models/%s/policy", id_buf);
-					snprint(body2, sizeof body2, "{\"state\":\"enabled\"}");
-
-					nh2 = 0;
-					hdrs2[nh2].name  = "Authorization";          hdrs2[nh2].value = authbuf;                    nh2++;
-					hdrs2[nh2].name  = "Content-Type";           hdrs2[nh2].value = "application/json";          nh2++;
-					hdrs2[nh2].name  = "User-Agent";             hdrs2[nh2].value = "GitHubCopilotChat/0.35.0";  nh2++;
-					hdrs2[nh2].name  = "Editor-Version";         hdrs2[nh2].value = "vscode/1.107.0";            nh2++;
-					hdrs2[nh2].name  = "Editor-Plugin-Version";  hdrs2[nh2].value = "copilot-chat/0.35.0";       nh2++;
-					hdrs2[nh2].name  = "Copilot-Integration-Id"; hdrs2[nh2].value = "vscode-chat";               nh2++;
-					hdrs2[nh2].name  = "openai-intent";          hdrs2[nh2].value = "chat-policy";               nh2++;
-
-					c2 = portdial("api.individual.githubcopilot.com", "443", sockpath);
-					if(c2 != nil) {
-						r2 = httppost(c2, path,
-						             "api.individual.githubcopilot.com",
-						             hdrs2, nh2,
-						             body2, strlen(body2));
-						if(r2 != nil) httprespfree(r2);
-						httpclose(c2);
-					}
+				c2 = tlsdial(COPILOT_HOST, "443");
+				if(c2 != nil) {
+					r2 = httppost(c2, path, COPILOT_HOST,
+					             hdrs2, nh2, body2, strlen(body2));
+					if(r2 != nil) httprespfree(r2);
+					httpclose(c2);
 				}
 			}
-			/* skip to next array element: elem + 1 skips the object token,
-			 * then we need to advance past all children */
+			/* advance past this array element and all its children */
 			if(toks[elem].type == JSMN_OBJECT || toks[elem].type == JSMN_ARRAY) {
-				/* jsonnext would work here; we replicate it inline */
-				int skip = elem + 1;
-				int depth = 1;
+				int skip = elem + 1, depth = 1;
 				while(skip < ntoks && depth > 0) {
 					if(toks[skip].type == JSMN_OBJECT || toks[skip].type == JSMN_ARRAY)
 						depth += toks[skip].size;

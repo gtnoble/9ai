@@ -62,10 +62,8 @@
 #include <thread.h>
 #include <9p.h>
 
-#ifndef PLAN9PORT
 #define chansendp(c, v)  sendp(c, v)
 #define chanrecvp(c)     recvp(c)
-#endif
 
 #include "9ai.h"
 #include "http.h"
@@ -1384,9 +1382,7 @@ agent_onevent(const char *rec, long len, void *aux)
  * the note arrives during a syscall, between turns, or at any other point.
  */
 extern volatile int g_aborted;     /* agent.c */
-#ifndef PLAN9PORT
 extern int          _abortkill_pid; /* exec.c  */
-#endif
 
 static int
 abortkill(void *v, char *s)
@@ -1395,10 +1391,8 @@ abortkill(void *v, char *s)
 	if(strstr(s, "interrupt") == nil)
 		return 0;
 	g_aborted = 1;
-#ifndef PLAN9PORT
 	if(_abortkill_pid > 0)
 		postnote(PNPROC, _abortkill_pid, "kill");
-#endif
 	return 1;
 }
 
@@ -1464,7 +1458,6 @@ agentproc(void *v)
 		memset(&cfg, 0, sizeof cfg);
 		qlock(&g->lk);
 		cfg.model     = strdup(g->model);
-		cfg.sockpath  = g->sockpath ? strdup(g->sockpath) : nil;
 		cfg.tokpath   = strdup(g->tokpath);
 		cfg.system    = buildsystem();
 		memmove(cfg.uuid, g->uuid, 37);
@@ -1501,7 +1494,6 @@ agentproc(void *v)
 		qunlock(&g->lk);
 
 		free(cfg.model);
-		free(cfg.sockpath);
 		free(cfg.tokpath);
 		free(cfg.system);
 		/* do not free cfg.sess_bio — still owned by g */
@@ -1594,13 +1586,12 @@ authproc(void *v)
 		g->authuri[0]  = '\0';
 		g->authdev[0]  = '\0';
 		g->autherr[0]  = '\0';
-		char sockpath[512], tokpath[512];
-		snprint(sockpath, sizeof sockpath, "%s", g->sockpath ? g->sockpath : "");
-		snprint(tokpath,  sizeof tokpath,  "%s", g->tokpath);
+		char tokpath[512];
+		snprint(tokpath, sizeof tokpath, "%s", g->tokpath);
 		qunlock(&g->lk);
 
 		/* step 1: start device flow */
-		OAuthDeviceCode *dc = oauthdevicestart(sockpath[0] ? sockpath : nil);
+		OAuthDeviceCode *dc = oauthdevicestart();
 		if(dc == nil) {
 			char errbuf[256];
 			rerrstr(errbuf, sizeof errbuf);
@@ -1636,7 +1627,7 @@ authproc(void *v)
 		int rc   = 0;
 		while(!done) {
 			sleep(dc->interval * 1000);
-			rc = oauthdevicepoll(dc, sockpath[0] ? sockpath : nil, tokpath, &done);
+			rc = oauthdevicepoll(dc, tokpath, &done);
 		}
 		oauthdevcodefree(dc);
 
@@ -1674,9 +1665,9 @@ authproc(void *v)
 					while(n > 0 && (buf[n-1]=='\n'||buf[n-1]=='\r'||buf[n-1]==' '))
 						buf[--n] = '\0';
 					refresh = buf;
-					OAuthToken *tok = oauthsession(refresh, sockpath[0] ? sockpath : nil);
+					OAuthToken *tok = oauthsession(refresh);
 					if(tok != nil) {
-						oauthenablemodels(tok->token, sockpath[0] ? sockpath : nil);
+						oauthenablemodels(tok->token);
 						oauthtokenfree(tok);
 					}
 				}
@@ -1702,7 +1693,7 @@ authproc(void *v)
 /* ── aiinit / aimain ───────────────────────────────────────────────────── */
 
 AiState *
-aiinit(char *model, char *sockpath, char *tokpath, char *mtpt)
+aiinit(char *model, char *tokpath, char *mtpt)
 {
 	AiState *ai;
 
@@ -1711,7 +1702,6 @@ aiinit(char *model, char *sockpath, char *tokpath, char *mtpt)
 		sysfatal("mallocz AiState: %r");
 
 	ai->model    = strdup(model);
-	ai->sockpath = sockpath ? strdup(sockpath) : nil;
 	ai->tokpath  = strdup(tokpath);
 	ai->mtpt     = mtpt ? strdup(mtpt) : nil;
 	ai->oaireq   = oaireqnew(model);
@@ -1778,13 +1768,13 @@ modelswatcher(void *v)
 			tokbuf[--n] = '\0';
 		refresh = tokbuf;
 
-		tok = oauthsession(refresh, g->sockpath);
+		tok = oauthsession(refresh);
 		if(tok == nil) {
 			respond(r, "oauthsession failed");
 			continue;
 		}
 
-		mlist = modelsfetch(tok->token, g->sockpath);
+		mlist = modelsfetch(tok->token);
 		oauthtokenfree(tok);
 		if(mlist == nil) {
 			respond(r, "modelsfetch failed");

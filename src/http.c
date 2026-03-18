@@ -1,46 +1,53 @@
 /*
- * http.c — HTTP/1.1 client over a Unix domain socket proxy
- *
- * 9ai never speaks TLS directly.  All connections go through 9aitls,
- * a local proxy that accepts plain HTTP on a Unix socket and forwards
- * to the upstream API over TLS.
+ * http.c — HTTP/1.1 client for 9ai
  *
  * One Biobuf per HTTPConn, allocated at dial time and used for all
  * reads on that connection.  Writes use a short-lived local Biobuf in
  * OWRITE mode (safe: the read Biobuf hasn't consumed any bytes yet
  * when we write the request).
  *
- * Connection lifetime: one request/response, then close.  The proxy
- * handles TLS teardown on its side.
+ * Connection lifetime: one request/response, then close.
  */
 
 #include <u.h>
 #include <libc.h>
 #include <bio.h>
+#include <libsec.h>
 
 #include "http.h"
 
 /*
- * httpdial — connect to the proxy over a Unix domain socket.
+ * tlsdial — open a TLS connection to host:port.
  *
- * sockpath is the filesystem path of the proxy's socket,
- * e.g. "/home/user/lib/9ai/proxy.sock".
- *
- * plan9port dial() understands "unix!<path>" on Linux.
- * On native Plan 9 a pipe posted in /srv would be used instead;
- * the C code is unchanged, only the address string differs.
+ * Dials tcp!host!port and wraps with tlsClient().
+ * Returns a new HTTPConn on success, nil on failure (werrstr set).
  */
 HTTPConn *
-httpdial(char *sockpath)
+tlsdial(char *host, char *port)
 {
 	HTTPConn *c;
-	char      addr[512];
+	TLSconn   conn;
+	char      addr[256];
 	int       fd;
 
-	snprint(addr, sizeof addr, "unix!%s", sockpath);
+	snprint(addr, sizeof addr, "tcp!%s!%s", host, port);
 	fd = dial(addr, nil, nil, nil);
-	if(fd < 0)
+	if(fd < 0) {
+		werrstr("tlsdial: dial %s: %r", addr);
 		return nil;
+	}
+
+	memset(&conn, 0, sizeof conn);
+	conn.serverName = smprint("%s", host);
+	fd = tlsClient(fd, &conn);
+	if(fd < 0) {
+		werrstr("tlsdial: tlsClient %s: %r", host);
+		free(conn.serverName);
+		return nil;
+	}
+	free(conn.cert);
+	free(conn.sessionID);
+	free(conn.serverName);
 
 	c = mallocz(sizeof *c, 1);
 	if(c == nil) {
@@ -48,7 +55,7 @@ httpdial(char *sockpath)
 		return nil;
 	}
 	c->fd   = fd;
-	c->host = strdup(sockpath);
+	c->host = strdup(host);
 	c->bio  = mallocz(sizeof(Biobuf), 1);
 	if(c->bio == nil) {
 		close(fd);
@@ -173,13 +180,11 @@ skipheaders(HTTPConn *c, int *chunkedp)
 		n = Blinelen(c->bio);
 		if(n == 1 || (n == 2 && line[0] == '\r'))
 			break;
-		/* null-terminate for cistrstr; strip \r\n */
 		if(n >= 2 && line[n-2] == '\r') line[n-2] = '\0';
 		else line[n-1] = '\0';
 		if(cistrstr(line, "Transfer-Encoding") != nil &&
 		   cistrstr(line, "chunked") != nil)
 			*chunkedp = 1;
-		/* restore — not strictly needed since Brdline owns the buffer */
 	}
 	return 0;
 }
@@ -250,16 +255,11 @@ httpreadbody(HTTPResp *r)
 		return -1;
 
 	if(r->chunked) {
-		/*
-		 * Chunked transfer encoding: read "<hex-size>\r\n<data>\r\n" until
-		 * a zero-size chunk ("0\r\n\r\n") signals end of body.
-		 */
 		char *line;
 		int   llen;
 		long  chunklen;
 
 		for(;;) {
-			/* read chunk-size line */
 			line = Brdline(r->conn->bio, '\n');
 			if(line == nil)
 				break;
@@ -267,37 +267,27 @@ httpreadbody(HTTPResp *r)
 			if(llen >= 2 && line[llen-2] == '\r') line[llen-2] = '\0';
 			else line[llen-1] = '\0';
 
-			/* chunk extensions (after ';') are ignored */
 			chunklen = strtol(line, nil, 16);
 			if(chunklen <= 0)
-				break;  /* last chunk */
+				break;
 
-			/* grow buffer if needed */
 			if(len + chunklen + 1 > cap) {
 				long newcap = cap * 2 + chunklen + 1;
 				char *tmp = realloc(buf, newcap + 1);
-				if(tmp == nil) {
-					free(buf);
-					return -1;
-				}
+				if(tmp == nil) { free(buf); return -1; }
 				buf = tmp;
 				cap = newcap;
 			}
 
-			/* read exactly chunklen bytes */
 			n = Bread(r->conn->bio, buf + len, chunklen);
 			if(n < chunklen) {
-				/* short read — take what we got */
 				if(n > 0) len += n;
 				break;
 			}
 			len += n;
-
-			/* consume trailing \r\n after chunk data */
-			Brdline(r->conn->bio, '\n');
+			Brdline(r->conn->bio, '\n');  /* consume trailing \r\n */
 		}
 	} else {
-		/* Identity encoding: read until EOF */
 		for(;;) {
 			if(len + CHUNK > cap) {
 				cap *= 2;

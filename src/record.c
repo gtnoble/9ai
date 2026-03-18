@@ -6,9 +6,6 @@
 
 #include <u.h>
 #include <libc.h>
-#ifndef PLAN9
-#include <stdarg.h>
-#endif
 #include "record.h"
 
 /*

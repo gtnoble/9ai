@@ -474,7 +474,7 @@ test_comments(void)
 /* ── Integration test ────────────────────────────────────────────────── */
 
 static void
-test_live_oai(char *session, char *sockpath)
+test_live_oai(char *session)
 {
 	HTTPConn *c;
 	HTTPResp *r;
@@ -502,8 +502,8 @@ test_live_oai(char *session, char *sockpath)
 	hdrs[nhdrs].name = "Copilot-Integration-Id"; hdrs[nhdrs].value = "vscode-chat";               nhdrs++;
 	hdrs[nhdrs].name = "Openai-Intent";          hdrs[nhdrs].value = "conversation-edits";        nhdrs++;
 
-	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
-	if(c == nil) sysfatal("httpdial: %r");
+	c = tlsdial("api.individual.githubcopilot.com", "443");
+	if(c == nil) sysfatal("tlsdial: %r");
 
 	r = httppost(c, "/chat/completions", "api.individual.githubcopilot.com",
 	             hdrs, nhdrs, body, strlen(body));
@@ -556,7 +556,7 @@ test_live_oai(char *session, char *sockpath)
 }
 
 static void
-test_live_ant(char *session, char *sockpath)
+test_live_ant(char *session)
 {
 	HTTPConn *c;
 	HTTPResp *r;
@@ -583,8 +583,8 @@ test_live_ant(char *session, char *sockpath)
 	hdrs[nhdrs].name = "Editor-Plugin-Version";  hdrs[nhdrs].value = "copilot-chat/0.35.0";       nhdrs++;
 	hdrs[nhdrs].name = "Copilot-Integration-Id"; hdrs[nhdrs].value = "vscode-chat";               nhdrs++;
 
-	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
-	if(c == nil) sysfatal("httpdial: %r");
+	c = tlsdial("api.individual.githubcopilot.com", "443");
+	if(c == nil) sysfatal("tlsdial: %r");
 
 	r = httppost(c, "/v1/messages", "api.individual.githubcopilot.com",
 	             hdrs, nhdrs, body, strlen(body));
@@ -641,7 +641,7 @@ test_live_ant(char *session, char *sockpath)
 }
 
 static void
-test_live(char *sockpath, char *tokpath)
+test_live(char *tokpath)
 {
 	char buf[4096];
 	int fd;
@@ -659,11 +659,11 @@ test_live(char *sockpath, char *tokpath)
 	while(len > 0 && (buf[len-1]=='\n'||buf[len-1]=='\r'||buf[len-1]==' '))
 		buf[--len] = '\0';
 
-	ot = oauthsession(buf, sockpath);
+	ot = oauthsession(buf);
 	if(ot == nil) sysfatal("oauthsession: %r");
 
-	test_live_oai(ot->token, sockpath);
-	test_live_ant(ot->token, sockpath);
+	test_live_oai(ot->token);
+	test_live_ant(ot->token);
 
 	oauthtokenfree(ot);
 	print("integration tests done\n\n");
@@ -674,10 +674,9 @@ test_live(char *sockpath, char *tokpath)
 void
 threadmain(int argc, char *argv[])
 {
-	char *sockpath = nil, *tokpath = nil;
+	char *tokpath = nil;
 
 	ARGBEGIN{
-	case 's': sockpath = ARGF(); break;
 	case 't': tokpath  = ARGF(); break;
 	}ARGEND
 	USED(argv);
@@ -691,10 +690,10 @@ threadmain(int argc, char *argv[])
 	test_comments();
 	print("unit tests done\n\n");
 
-	if(sockpath != nil && tokpath != nil)
-		test_live(sockpath, tokpath);
+	if(tokpath != nil)
+		test_live(tokpath);
 	else
-		print("(skipping integration tests: pass -s sockpath -t tokenfile)\n");
+		print("(skipping integration tests: pass -t tokenfile)\n");
 
 	if(failures > 0) {
 		fprint(2, "\n%d failure(s)\n", failures);

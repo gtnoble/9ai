@@ -4,7 +4,7 @@
  * ── Test structure ────────────────────────────────────────────────────
  *
  * Part 1: Unit tests — mount the server in-process, exercise each file
- *   via the plan9port 9pclient API (fsopen/fsread/fswrite/fsclose).
+ *   via the 9pclient API (nsmount/fsopen/fsread/fswrite/fsclose).
  *   The agent proc is started but /message is never written, so no
  *   actual LLM API calls are made.
  *
@@ -423,13 +423,11 @@ test_live(void)
  * the history reconstruction without a running server.
  */
 static void
-test_session_persistence(char *sockpath)
+test_session_persistence(void)
 {
 	char    *out, *uuid_orig, *uuid_after_load;
 	char     savepath[256];
 	Channel *outch;
-
-	USED(sockpath);
 
 	print("\n=== Part 3: Session persistence tests ===\n");
 
@@ -603,34 +601,25 @@ test_session_persistence(char *sockpath)
 void
 threadmain(int argc, char *argv[])
 {
-	char *sockpath = nil;
 	char  srvname[64];
 	int   tries;
 	AiState *ai;
 
 	ARGBEGIN {
-	case 's':
-		sockpath = ARGF();
-		break;
 	case 't':
 		tokpath = ARGF();
 		break;
 	} ARGEND
 	USED(argc); USED(argv);
 
-#ifdef PLAN9PORT
-	if(sockpath == nil) sockpath = smprint("%s/.cache/9ai/proxy.sock", getenv("HOME"));
-	if(tokpath  == nil) tokpath  = smprint("%s/.cache/9ai/token",      getenv("HOME"));
-#else
-	if(sockpath == nil) sockpath = nil;   /* portdial uses TLS directly */
-	if(tokpath  == nil) tokpath  = configpath("token");
-#endif
+	if(tokpath == nil)
+		tokpath = configpath("token");
 
 	/* unique srvname to avoid clashing with a running 9ai */
 	snprint(srvname, sizeof srvname, "9ai-test");
 
 	/* init and post the server; aimain returns after threadpostmountsrv */
-	ai = aiinit("gpt-4o", sockpath, tokpath, nil);
+	ai = aiinit("gpt-4o", tokpath, nil);
 	aimain(ai, srvname, nil);
 
 	/* mount the posted service */
@@ -643,10 +632,10 @@ threadmain(int argc, char *argv[])
 		sysfatal("nsmount %s: %r", srvname);
 
 	test_unit();
-	/* live tests only if proxy and token are accessible */
-	if(access(sockpath, AEXIST) == 0 && access(tokpath, AEXIST) == 0) {
+	/* live tests only if token is accessible */
+	if(access(tokpath, AEXIST) == 0) {
 		test_live();
-		test_session_persistence(sockpath);
+		test_session_persistence(nil);
 	} else {
 		print("\n(skipping live tests: proxy or token not found)\n");
 	}

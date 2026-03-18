@@ -214,7 +214,7 @@ parsemodels(const char *js, jsmntok_t *toks, int ntoks)
 /* ── Public API ─────────────────────────────────────────────────────── */
 
 Model *
-modelsfetch(char *session, char *sockpath)
+modelsfetch(char *session)
 {
 	HTTPConn   *c;
 	HTTPResp   *r;
@@ -228,14 +228,14 @@ modelsfetch(char *session, char *sockpath)
 	snprint(auth, sizeof auth, "Bearer %s", session);
 
 	nhdrs = 0;
-	hdrs[nhdrs].name  = "Authorization";         hdrs[nhdrs].value = auth;                        nhdrs++;
-	hdrs[nhdrs].name  = "Content-Type";          hdrs[nhdrs].value = "application/json";          nhdrs++;
-	hdrs[nhdrs].name  = "User-Agent";            hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0";  nhdrs++;
-	hdrs[nhdrs].name  = "Editor-Version";        hdrs[nhdrs].value = "vscode/1.107.0";            nhdrs++;
-	hdrs[nhdrs].name  = "Editor-Plugin-Version"; hdrs[nhdrs].value = "copilot-chat/0.35.0";       nhdrs++;
-	hdrs[nhdrs].name  = "Copilot-Integration-Id"; hdrs[nhdrs].value = "vscode-chat";              nhdrs++;
+	hdrs[nhdrs].name  = "Authorization";          hdrs[nhdrs].value = auth;                        nhdrs++;
+	hdrs[nhdrs].name  = "Content-Type";           hdrs[nhdrs].value = "application/json";          nhdrs++;
+	hdrs[nhdrs].name  = "User-Agent";             hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0";  nhdrs++;
+	hdrs[nhdrs].name  = "Editor-Version";         hdrs[nhdrs].value = "vscode/1.107.0";            nhdrs++;
+	hdrs[nhdrs].name  = "Editor-Plugin-Version";  hdrs[nhdrs].value = "copilot-chat/0.35.0";       nhdrs++;
+	hdrs[nhdrs].name  = "Copilot-Integration-Id"; hdrs[nhdrs].value = "vscode-chat";               nhdrs++;
 
-	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
+	c = tlsdial(COPILOT_HOST, "443");
 	if(c == nil)
 		return nil;
 

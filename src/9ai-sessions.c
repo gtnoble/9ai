@@ -166,9 +166,6 @@ void
 main(int argc, char *argv[])
 {
 	char *sessdir;
-#ifdef PLAN9PORT
-	char *home;
-#endif
 	int   dirfd;
 	Dir  *dirs;
 	long  ndirs, i;
@@ -176,14 +173,7 @@ main(int argc, char *argv[])
 	if(argc >= 2) {
 		sessdir = strdup(argv[1]);
 	} else {
-#ifdef PLAN9PORT
-		home    = getenv("HOME");
-		if(home == nil || home[0] == '\0')
-			home = smprint("/home/%s", getuser());
-		sessdir = smprint("%s/.cache/9ai/sessions", home);
-#else
 		sessdir = configpath("sessions");
-#endif
 	}
 
 	dirfd = open(sessdir, OREAD);

@@ -1,8 +1,8 @@
-<$PLAN9/src/mkhdr
+</$objtype/mkfile
 
+BIN=/$objtype/bin
 TARG=9ai
-
-CFLAGS=$CFLAGS -DPLAN9PORT
+CFLAGS=-DPLAN9
 
 OFILES=\
 	main.$O\
@@ -39,104 +39,85 @@ HFILES=\
 	sessfile.h\
 	acmeevent.h\
 
-<$PLAN9/src/mkone
+</sys/src/cmd/mkone
 
-# Stage 1: smoke-test port.c helpers
-test-port:V: $O.$TARG
-	./$O.$TARG
+MAN=../man
 
-# Stage 2: test HTTP client via 9aitls proxy
-# Start proxy first:  ./9aitls &
-# Requires ~/lib/9ai/token (GitHub access token)
-$O.httptest: httptest.$O port.$O http.$O json.$O
+install: $BIN/$TARG $BIN/9ai-acme $BIN/9ai-sessions maninstall
+
+maninstall:V:
+	cp $MAN/man1/9ai.1 /sys/man/1/9ai
+	cp $MAN/man1/9ai-acme.1 /sys/man/1/9ai-acme
+
+# ── offline unit tests (no network required) ──────────────────────────────
+
+$O.acmetest: acmetest.$O prompt.$O record.$O render.$O sessfile.$O acmeevent.$O
 	$LD $LDFLAGS -o $target $prereq
 
-test-http:V: $O.httptest
-	./$O.httptest
+test-acme:V: $O.acmetest
+	./$O.acmetest
 
-# Stage 3: unit-test JSON helpers
 $O.jsontest: jsontest.$O json.$O port.$O http.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-json:V: $O.jsontest
 	./$O.jsontest
 
-# Stage 4: OAuth device flow + session token
-$O.oauthtest: oauthtest.$O port.$O http.$O json.$O oauth.$O
-	$LD $LDFLAGS -o $target $prereq
-
-test-oauth:V: $O.oauthtest
-	./$O.oauthtest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
-
-# Stage 5: /models fetch + parser
-$O.modelstest: modelstest.$O port.$O http.$O json.$O oauth.$O models.$O
-	$LD $LDFLAGS -o $target $prereq
-
-test-models:V: $O.modelstest
-	./$O.modelstest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
-
-# Stage 6: SSE line parser
 $O.ssetest: ssetest.$O port.$O http.$O json.$O oauth.$O sse.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-sse:V: $O.ssetest
-	./$O.ssetest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
+	./$O.ssetest
 
-# Stage 7: OpenAI Completions request builder + SSE delta parser
-$O.oaitest: oaitest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O
-	$LD $LDFLAGS -o $target $prereq
-
-test-oai:V: $O.oaitest
-	./$O.oaitest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
-
-# Stage 8: exec tool — parse args, threadspawn, collect output
 $O.exectest: exectest.$O port.$O http.$O json.$O exec.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-exec:V: $O.exectest
 	./$O.exectest
 
-# Stage 9: agent loop (OAI format) — tool loop, emit_event, write_session
-$O.agenttest: agenttest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O ant.$O exec.$O agent.$O record.$O
+$O.oaitest: oaitest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O
 	$LD $LDFLAGS -o $target $prereq
 
-test-agent:V: $O.agenttest
-	./$O.agenttest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
+test-oai:V: $O.oaitest
+	./$O.oaitest
 
-# Stage 11: 9P server
-$O.fstest: fstest.$O port.$O http.$O json.$O oauth.$O models.$O sse.$O oai.$O ant.$O exec.$O agent.$O record.$O skill.$O fs.$O
-	$LD $LDFLAGS -o $target $prereq
-
-test-fs:V: $O.fstest
-	./$O.fstest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
-
-# Stage 13: Anthropic Messages request builder + SSE delta parser
 $O.anttest: anttest.$O port.$O http.$O json.$O oauth.$O sse.$O ant.$O
 	$LD $LDFLAGS -o $target $prereq
 
 test-ant:V: $O.anttest
-	./$O.anttest -s ~/.cache/9ai/proxy.sock -t ~/.cache/9ai/token
+	./$O.anttest
 
-# Stage 15: 9ai-acme — acme integration client
+$O.agenttest: agenttest.$O port.$O http.$O json.$O oauth.$O sse.$O oai.$O ant.$O exec.$O agent.$O record.$O
+	$LD $LDFLAGS -o $target $prereq
+
+test-agent:V: $O.agenttest
+	./$O.agenttest
+
+# run all offline unit tests
+test:V: test-acme test-json test-sse test-exec test-oai test-ant test-agent
+
+# ── network/credential tests (require -t tokenpath) ───────────────────────
+
+$O.httptest: httptest.$O port.$O http.$O json.$O
+	$LD $LDFLAGS -o $target $prereq
+
+$O.oauthtest: oauthtest.$O port.$O http.$O json.$O oauth.$O
+	$LD $LDFLAGS -o $target $prereq
+
+$O.modelstest: modelstest.$O port.$O http.$O json.$O oauth.$O models.$O
+	$LD $LDFLAGS -o $target $prereq
+
+$O.fstest: fstest.$O port.$O http.$O json.$O oauth.$O models.$O sse.$O oai.$O ant.$O exec.$O agent.$O record.$O skill.$O fs.$O
+	$LD $LDFLAGS -o $target $prereq
+
 $O.9ai-acme: 9ai-acme.$O prompt.$O record.$O render.$O sessfile.$O acmeevent.$O port.$O http.$O
-	$LD $LDFLAGS -o $target $prereq -l9pclient
+	$LD $LDFLAGS -o $target $prereq
 
-9ai-acme:V: $O.9ai-acme
-	cp $O.9ai-acme $HOME/bin/acme/9ai-acme
+$BIN/9ai-acme: $O.9ai-acme
+	cp $O.9ai-acme $BIN/9ai-acme
 
-# Stage 15b: unit tests for 9ai-acme pure-string helpers (no acme/9pclient needed)
-$O.acmetest: acmetest.$O prompt.$O record.$O render.$O sessfile.$O acmeevent.$O
-	$LD $LDFLAGS -o $target $prereq -lthread -lbio
-
-test-acme:V: $O.acmetest
-	./$O.acmetest
-
-# Stage 16: 9ai-sessions — session listing companion
 $O.9ai-sessions: 9ai-sessions.$O port.$O http.$O record.$O
 	$LD $LDFLAGS -o $target $prereq
 
-test-sessions:V: $O.9ai-sessions
-	./$O.9ai-sessions
-
-9ai-sessions:V: $O.9ai-sessions
-	cp $O.9ai-sessions $HOME/bin/9ai-sessions
+$BIN/9ai-sessions: $O.9ai-sessions
+	cp $O.9ai-sessions $BIN/9ai-sessions

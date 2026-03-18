@@ -15,17 +15,10 @@
  *   → token (tid=...;exp=...;...), expires_at
  *   Use token as Bearer for all Copilot API calls.
  *   Refresh when expires_at approaches (refresh_in seconds hint).
- *
- * The C client only needs Phase 1 for login and Phase 2 before each
- * API request.  Phase 1 is interactive; Phase 2 is automatic.
  */
 
 typedef struct OAuthToken OAuthToken;
 
-/*
- * OAuthToken — a live Copilot session token.
- * All strings are smprint/strdup-allocated; free with oauthtokenfree().
- */
 struct OAuthToken {
 	char *token;      /* tid=...;exp=...;... — Bearer value for API */
 	long  expires_at; /* unix timestamp; refresh before this */
@@ -35,16 +28,12 @@ struct OAuthToken {
 /*
  * oauthlogin — run the full device code flow interactively.
  *
- * Writes the obtained GitHub access token (refresh token) to tokpath.
- * Prints the verification URL and user code to stdout for the user.
- * Polls until authorised or expired.
- *
- * sockpath  — path to the 9aitls Unix socket
- * tokpath   — destination file for the token (e.g. ~/lib/9ai/token)
+ * Prints the verification URL and user code, polls until authorised,
+ * and writes the GitHub access token to tokpath.
  *
  * Returns 0 on success, -1 on error (sets errstr).
  */
-int oauthlogin(char *sockpath, char *tokpath);
+int oauthlogin(char *tokpath);
 
 /*
  * OAuthDeviceCode — in-progress device-code flow state.
@@ -63,44 +52,36 @@ struct OAuthDeviceCode {
 /*
  * oauthdevicestart — start the device-code flow, return codes for display.
  *
- * sockpath — path to the 9aitls Unix socket
- *
  * Returns a heap-allocated OAuthDeviceCode on success, nil on error.
- * The caller displays dc->verification_uri and dc->user_code, then
- * calls oauthdevicepoll() in a loop to wait for the user to authorise.
+ * Caller displays dc->verification_uri and dc->user_code, then calls
+ * oauthdevicepoll() in a loop.
  */
-OAuthDeviceCode *oauthdevicestart(char *sockpath);
+OAuthDeviceCode *oauthdevicestart(void);
 
 /*
  * oauthdevicepoll — poll once for the access token.
  *
- * dc       — the OAuthDeviceCode from oauthdevicestart()
- * sockpath — path to the 9aitls Unix socket
- * tokpath  — where to persist the token on success
- * done     — set to 1 if flow completed (success or terminal error);
- *             set to 0 if still pending (caller should sleep dc->interval)
+ * dc      — the OAuthDeviceCode from oauthdevicestart()
+ * tokpath — where to persist the token on success
+ * done    — set to 1 if flow completed (success or terminal error)
  *
- * Returns 0 if the token was obtained and written to tokpath.
- * Returns -1 on terminal error (sets errstr).
- * When done=0 and return value is 0, the caller should sleep and retry.
- * When done=1, the return value indicates success (0) or failure (-1).
+ * Returns 0 on success or still-pending; -1 on terminal error.
  */
-int oauthdevicepoll(OAuthDeviceCode *dc, char *sockpath, char *tokpath, int *done);
+int oauthdevicepoll(OAuthDeviceCode *dc, char *tokpath, int *done);
 
 /*
  * oauthenablemodels — POST /models/<id>/policy {"state":"enabled"} for
  * every model returned by the Copilot /models endpoint.
  *
  * Required after first login to unlock Claude and Grok models.
- * Errors from individual POSTs are silently ignored.
+ * Errors are silently ignored.
  *
- * session  — Copilot session token (Bearer)
- * sockpath — path to the 9aitls Unix socket
+ * session — Copilot session token (Bearer)
  */
-void oauthenablemodels(char *session, char *sockpath);
+void oauthenablemodels(char *session);
 
 /*
- * oauthtokenexists — return 1 if tokpath exists and is non-empty, 0 otherwise.
+ * oauthtokenexists — return 1 if tokpath exists and is non-empty.
  */
 int oauthtokenexists(char *tokpath);
 
@@ -112,12 +93,11 @@ void oauthdevcodefree(OAuthDeviceCode *dc);
 /*
  * oauthsession — exchange a refresh token for a Copilot session token.
  *
- * refresh   — the GitHub access token (ghu_...)
- * sockpath  — path to the 9aitls Unix socket
+ * refresh — the GitHub access token (ghu_...)
  *
  * Returns a heap-allocated OAuthToken on success, nil on error.
  */
-OAuthToken *oauthsession(char *refresh, char *sockpath);
+OAuthToken *oauthsession(char *refresh);
 
 /*
  * oauthtokenfree — release an OAuthToken.

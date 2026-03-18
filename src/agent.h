@@ -68,7 +68,6 @@ typedef struct AgentCfg AgentCfg;
 
 struct AgentCfg {
 	char *model;       /* model id, e.g. "gpt-4o" */
-	char *sockpath;    /* path to 9aitls Unix socket */
 	char *tokpath;     /* path to GitHub refresh token file */
 	char *system;      /* system prompt (may be nil) */
 	char *sessdir;     /* session directory override (nil → ~/lib/9ai/sessions/) */
@@ -111,7 +110,6 @@ int isctxoverflow(const char *body);
 
 /*
  * genuuid — generate a random UUID v4 string into buf (must be ≥37 bytes).
- * Uses truerand() which reads /dev/random on plan9port.
  */
 void genuuid(char *buf);
 

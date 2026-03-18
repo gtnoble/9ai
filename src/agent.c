@@ -48,9 +48,6 @@
 #include <libc.h>
 #include <bio.h>
 #include <thread.h>
-#ifndef PLAN9
-#include <stdarg.h>
-#endif
 
 #include "9ai.h"
 #include "http.h"
@@ -740,7 +737,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 		return -1;
 	}
 
-	tok = oauthsession(refresh, cfg->sockpath);
+	tok = oauthsession(refresh);
 	free(refresh);
 	if(tok == nil) {
 		werrstr("agentrun: oauthsession: %r");
@@ -778,7 +775,7 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 		if(iteration > 0 && time(0) > tok->expires_at - 300) {
 			char *ref2 = loadrefresh(cfg);
 			if(ref2 != nil) {
-				OAuthToken *newtok = oauthsession(ref2, cfg->sockpath);
+				OAuthToken *newtok = oauthsession(ref2);
 				free(ref2);
 				if(newtok != nil) {
 					oauthtokenfree(tok);
@@ -797,12 +794,12 @@ agentrun(char *prompt, OAIReq *req, AgentCfg *cfg)
 			return -1;
 		}
 
-		c = portdial("api.individual.githubcopilot.com", "443", cfg->sockpath);
+		c = tlsdial("api.individual.githubcopilot.com", "443");
 		if(c == nil) {
 			free(body);
 			oauthtokenfree(tok);
 			free(textbuf); free(argsbuf);
-			werrstr("agentrun: portdial: %r");
+			werrstr("agentrun: tlsdial: %r");
 			return -1;
 		}
 
@@ -1206,7 +1203,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 		return -1;
 	}
 
-	tok = oauthsession(refresh, cfg->sockpath);
+	tok = oauthsession(refresh);
 	free(refresh);
 	if(tok == nil) {
 		werrstr("agentrunant: oauthsession: %r");
@@ -1243,7 +1240,7 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 		if(iteration > 0 && time(0) > tok->expires_at - 300) {
 			char *ref2 = loadrefresh(cfg);
 			if(ref2 != nil) {
-				OAuthToken *newtok = oauthsession(ref2, cfg->sockpath);
+				OAuthToken *newtok = oauthsession(ref2);
 				free(ref2);
 				if(newtok != nil) {
 					oauthtokenfree(tok);
@@ -1262,12 +1259,12 @@ agentrunant(char *prompt, ANTReq *req, AgentCfg *cfg)
 			return -1;
 		}
 
-		c = portdial("api.individual.githubcopilot.com", "443", cfg->sockpath);
+		c = tlsdial("api.individual.githubcopilot.com", "443");
 		if(c == nil) {
 			free(body);
 			oauthtokenfree(tok);
 			free(textbuf); free(argsbuf);
-			werrstr("agentrunant: portdial: %r");
+			werrstr("agentrunant: tlsdial: %r");
 			return -1;
 		}
 

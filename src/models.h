@@ -43,13 +43,12 @@ struct Model {
  * modelsfetch — GET /models from the Copilot API.
  *
  * session  — Copilot session token (tid=...) used as Bearer
- * sockpath — path to 9aitls Unix socket
  *
  * Returns a linked list of Model structs (heap-allocated).
  * Only models with model_picker_enabled=true are included.
  * Returns nil on error (sets errstr).
  */
-Model *modelsfetch(char *session, char *sockpath);
+Model *modelsfetch(char *session);
 
 /*
  * modelsfmt — format the model list as a /models file body.

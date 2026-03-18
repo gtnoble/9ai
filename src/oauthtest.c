@@ -5,10 +5,10 @@
  *   mk o.oauthtest
  *
  *   # Test session token exchange (requires existing ~/lib/9ai/token):
- *   ./o.oauthtest -s ~/.cache/9ai/proxy.sock [-t tokenfile]
+ *   ./o.oauthtest [-t tokenfile]
  *
  *   # Test full device flow login (interactive, writes new token):
- *   ./o.oauthtest -s ~/.cache/9ai/proxy.sock -l [-t tokenfile]
+ *   ./o.oauthtest -l [-t tokenfile]
  *
  * The session test prints the session token fields and verifies that a
  * subsequent GET /models with the session token returns HTTP 200.
@@ -47,7 +47,7 @@ readfile(char *path)
 }
 
 static void
-test_session(char *sockpath, char *tokpath)
+test_session(char *tokpath)
 {
 	OAuthToken *ot;
 	char *refresh;
@@ -62,7 +62,7 @@ test_session(char *sockpath, char *tokpath)
 	refresh = readfile(tokpath);
 	print("refresh token: %.20s...\n", refresh);
 
-	ot = oauthsession(refresh, sockpath);
+	ot = oauthsession(refresh);
 	if(ot == nil)
 		sysfatal("oauthsession: %r");
 
@@ -73,16 +73,16 @@ test_session(char *sockpath, char *tokpath)
 	/* Verify: use session token to GET /models */
 	snprint(auth, sizeof auth, "Bearer %s", ot->token);
 	nhdrs = 0;
-	hdrs[nhdrs].name  = "Authorization";       hdrs[nhdrs].value = auth;                        nhdrs++;
-	hdrs[nhdrs].name  = "Content-Type";        hdrs[nhdrs].value = "application/json";          nhdrs++;
-	hdrs[nhdrs].name  = "User-Agent";          hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0";  nhdrs++;
-	hdrs[nhdrs].name  = "Editor-Version";      hdrs[nhdrs].value = "vscode/1.107.0";            nhdrs++;
-	hdrs[nhdrs].name  = "Editor-Plugin-Version"; hdrs[nhdrs].value = "copilot-chat/0.35.0";     nhdrs++;
-	hdrs[nhdrs].name  = "Copilot-Integration-Id"; hdrs[nhdrs].value = "vscode-chat";            nhdrs++;
+	hdrs[nhdrs].name  = "Authorization";         hdrs[nhdrs].value = auth;                        nhdrs++;
+	hdrs[nhdrs].name  = "Content-Type";          hdrs[nhdrs].value = "application/json";          nhdrs++;
+	hdrs[nhdrs].name  = "User-Agent";            hdrs[nhdrs].value = "GitHubCopilotChat/0.35.0";  nhdrs++;
+	hdrs[nhdrs].name  = "Editor-Version";        hdrs[nhdrs].value = "vscode/1.107.0";            nhdrs++;
+	hdrs[nhdrs].name  = "Editor-Plugin-Version"; hdrs[nhdrs].value = "copilot-chat/0.35.0";       nhdrs++;
+	hdrs[nhdrs].name  = "Copilot-Integration-Id"; hdrs[nhdrs].value = "vscode-chat";              nhdrs++;
 
-	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
+	c = tlsdial(COPILOT_HOST, "443");
 	if(c == nil)
-		sysfatal("httpdial: %r");
+		sysfatal("tlsdial: %r");
 
 	r = httpget(c, "/models", COPILOT_HOST, hdrs, nhdrs);
 	if(r == nil)
@@ -108,17 +108,13 @@ test_session(char *sockpath, char *tokpath)
 void
 threadmain(int argc, char *argv[])
 {
-	char *sockpath, *tokpath;
+	char *tokpath;
 	int   do_login;
 
-	sockpath  = nil;
-	tokpath   = nil;
-	do_login  = 0;
+	tokpath  = nil;
+	do_login = 0;
 
 	ARGBEGIN{
-	case 's':
-		sockpath = ARGF();
-		break;
 	case 't':
 		tokpath = ARGF();
 		break;
@@ -129,18 +125,16 @@ threadmain(int argc, char *argv[])
 
 	USED(argv);
 
-	if(sockpath == nil)
-		sockpath = configpath("proxy.sock");
 	if(tokpath == nil)
 		tokpath = configpath("token");
 
 	if(do_login) {
 		print("=== oauthlogin test ===\n");
-		if(oauthlogin(sockpath, tokpath) < 0)
+		if(oauthlogin(tokpath) < 0)
 			sysfatal("oauthlogin: %r");
 		print("login test passed\n\n");
 	}
 
-	test_session(sockpath, tokpath);
+	test_session(tokpath);
 	threadexitsall(nil);
 }

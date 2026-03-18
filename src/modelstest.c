@@ -5,13 +5,13 @@
  *         Tests filteringmodel_picker_enabled), format detection
  *         (ant preference when both endpoints present), field extraction.
  *
- * Part 2: Integration test (requires 9aitls proxy + valid token).
+ * Part 2: Integration test (requires valid token).
  *         Fetches live /models, verifies count > 0 and prints the table.
  *
  * Usage:
  *   mk o.modelstest
  *   ./o.modelstest                           # unit tests only
- *   ./o.modelstest -s sockpath -t tokenfile  # unit + integration
+ *   ./o.modelstest -t tokenfile  # unit + integration
  */
 
 #include <u.h>
@@ -256,7 +256,7 @@ test_parse_fixture(void)
 /* ── Integration test ────────────────────────────────────────────────── */
 
 static void
-test_live(char *sockpath, char *tokpath)
+test_live(char *tokpath)
 {
 	char *refresh;
 	OAuthToken *ot;
@@ -282,12 +282,12 @@ test_live(char *sockpath, char *tokpath)
 	refresh = strdup(buf);
 
 	/* get session token */
-	ot = oauthsession(refresh, sockpath);
+	ot = oauthsession(refresh);
 	if(ot == nil) sysfatal("oauthsession: %r");
 	print("session token: %.30s...\n", ot->token);
 
 	/* fetch models */
-	list = modelsfetch(ot->token, sockpath);
+	list = modelsfetch(ot->token);
 	if(list == nil) sysfatal("modelsfetch: %r");
 
 	count = 0;
@@ -327,15 +327,10 @@ test_live(char *sockpath, char *tokpath)
 void
 threadmain(int argc, char *argv[])
 {
-	char *sockpath, *tokpath;
-
-	sockpath = nil;
-	tokpath  = nil;
+	char *tokpath;
+	tokpath = nil;
 
 	ARGBEGIN{
-	case 's':
-		sockpath = ARGF();
-		break;
 	case 't':
 		tokpath = ARGF();
 		break;
@@ -345,10 +340,10 @@ threadmain(int argc, char *argv[])
 
 	test_parse_fixture();
 
-	if(sockpath != nil && tokpath != nil)
-		test_live(sockpath, tokpath);
+	if(tokpath != nil)
+		test_live(tokpath);
 	else
-		print("(skipping integration test: pass -s sockpath -t tokenfile)\n");
+		print("(skipping integration test: pass -t tokenfile)\n");
 
 	if(failures > 0) {
 		fprint(2, "\n%d failure(s)\n", failures);

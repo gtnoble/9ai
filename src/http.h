@@ -1,18 +1,14 @@
 /*
  * http.h — HTTP/1.1 client interface for 9ai
  *
- * 9ai never speaks TLS directly.  All connections are made to 9aitls,
- * a local proxy that accepts plain HTTP on a Unix domain socket and
- * forwards to the upstream API over TLS.
- *
- * One HTTPConn = one Unix socket connection = one request/response.
- * After httprespfree(), call httpclose() and httpdial() again for the
+ * One HTTPConn = one TLS connection = one request/response.
+ * After httprespfree(), call httpclose() and tlsdial() again for the
  * next request.
  *
  * Usage:
  *
- *   HTTPConn *c = httpdial("/home/user/lib/9ai/proxy.sock");
- *   if(c == nil) sysfatal("dial: %r");
+ *   HTTPConn *c = tlsdial("api.individual.githubcopilot.com", "443");
+ *   if(c == nil) sysfatal("tlsdial: %r");
  *
  *   HTTPResp *r = httpget(c, "/models", "api.individual.githubcopilot.com",
  *                         hdrs, nhdrs);
@@ -23,7 +19,7 @@
  *   httpclose(c);
  *
  *   // Streaming SSE:
- *   HTTPConn *c = httpdial(sockpath);
+ *   HTTPConn *c = tlsdial(host, "443");
  *   HTTPResp *r = httppost(c, "/chat/completions", host, hdrs, nhdrs,
  *                          body, bodylen);
  *   char *line;
@@ -42,8 +38,8 @@ struct HTTPHdr {
 };
 
 struct HTTPConn {
-	int      fd;    /* Unix socket file descriptor */
-	char    *host;  /* strdup of sockpath */
+	int      fd;    /* TLS file descriptor */
+	char    *host;  /* strdup of host name */
 	Biobuf  *bio;   /* single read Biobuf, lives for the connection */
 };
 
@@ -55,9 +51,7 @@ struct HTTPResp {
 	HTTPConn *conn;     /* back-pointer; response does not own conn */
 };
 
-/* http.c / port.c */
-HTTPConn *httpdial(char *sockpath);
-HTTPConn *portdial(char *host, char *port, char *sockpath);
+HTTPConn *tlsdial(char *host, char *port);
 void      httpclose(HTTPConn *c);
 HTTPResp *httpget(HTTPConn *c, char *path, char *host,
                   HTTPHdr *hdrs, int nhdrs);

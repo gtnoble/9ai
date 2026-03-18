@@ -8,7 +8,7 @@
  *   1.3  Delta parser driven from captured OAI text fixture
  *   1.4  Delta parser driven from captured OAI tool fixture
  *
- * Part 2: Live integration test (requires -s <sockpath> -t <tokenpath>).
+ * Part 2: Live integration test (requires -t <tokenpath>).
  *   2.1  POST gpt-4o with user message "say hello world and nothing else"
  *        Verify: OAIDText deltas received, assembled text contains "hello"
  *        and "world".  OAIDStop with stop_reason "stop".
@@ -795,7 +795,7 @@ test_trim_empty_noop(void)
 /* ── Part 2: Live integration tests ───────────────────────────────────── */
 
 static void
-test_live_text(char *sockpath, char *tokpath)
+test_live_text(char *tokpath)
 {
 	char       refresh[256], *p;
 	OAuthToken *tok;
@@ -830,7 +830,7 @@ test_live_text(char *sockpath, char *tokpath)
 	close(fd);
 	USED(p);
 
-	tok = oauthsession(refresh, sockpath);
+	tok = oauthsession(refresh);
 	if(tok == nil) { fprint(2, "SKIP: oauthsession failed: %r\n"); return; }
 
 	req = oaireqnew("gpt-4o");
@@ -840,9 +840,9 @@ test_live_text(char *sockpath, char *tokpath)
 	body = oaireqjson(req, nil, &bodylen);
 	CHECK(body != nil, "live: request JSON serialised");
 
-	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
+	c = tlsdial("api.individual.githubcopilot.com", "443");
 	if(c == nil) {
-		fprint(2, "SKIP: httpdial failed: %r\n");
+		fprint(2, "SKIP: tlsdial failed: %r\n");
 		free(body);
 		oaireqfree(req);
 		oauthtokenfree(tok);
@@ -904,7 +904,7 @@ test_live_text(char *sockpath, char *tokpath)
 }
 
 static void
-test_live_tool(char *sockpath, char *tokpath)
+test_live_tool(char *tokpath)
 {
 	char       refresh[256];
 	OAuthToken *tok;
@@ -936,7 +936,7 @@ test_live_tool(char *sockpath, char *tokpath)
 	}
 	close(fd);
 
-	tok = oauthsession(refresh, sockpath);
+	tok = oauthsession(refresh);
 	if(tok == nil) { fprint(2, "SKIP: oauthsession failed: %r\n"); return; }
 
 	req = oaireqnew("gpt-4o");
@@ -947,9 +947,9 @@ test_live_tool(char *sockpath, char *tokpath)
 	body = oaireqjson(req, nil, &bodylen);
 	CHECK(body != nil, "live tool: request JSON serialised");
 
-	c = portdial("api.individual.githubcopilot.com", "443", sockpath);
+	c = tlsdial("api.individual.githubcopilot.com", "443");
 	if(c == nil) {
-		fprint(2, "SKIP: httpdial failed: %r\n");
+		fprint(2, "SKIP: tlsdial failed: %r\n");
 		free(body);
 		oaireqfree(req);
 		oauthtokenfree(tok);
@@ -1017,14 +1017,12 @@ test_live_tool(char *sockpath, char *tokpath)
 void
 threadmain(int argc, char *argv[])
 {
-	char *sockpath = nil;
 	char *tokpath  = nil;
 
 	ARGBEGIN{
-	case 's': sockpath = ARGF(); break;
 	case 't': tokpath  = ARGF(); break;
 	default:
-		fprint(2, "usage: %s [-s sockpath] [-t tokenpath]\n", argv0);
+		fprint(2, "usage: %s [-t tokenpath]\n", argv0);
 		threadexitsall("usage");
 	}ARGEND
 
@@ -1053,12 +1051,12 @@ threadmain(int argc, char *argv[])
 	test_trim_msgtail_updated();
 	test_trim_empty_noop();
 
-	if(sockpath != nil && tokpath != nil) {
+	if(tokpath != nil) {
 		print("\n=== Part 2: live integration tests ===\n");
-		test_live_text(sockpath, tokpath);
-		test_live_tool(sockpath, tokpath);
+		test_live_text(tokpath);
+		test_live_tool(tokpath);
 	} else {
-		print("\n(skip live tests: pass -s sockpath -t tokenpath to enable)\n");
+		print("\n(skip live tests: pass -t tokenpath to enable)\n");
 	}
 
 	if(failures > 0) {

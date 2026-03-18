@@ -1,13 +1,11 @@
 /*
- * httptest.c — Stage 2 test: GET /models from the Copilot API via 9aitls
+ * httptest.c — Stage 2 test: GET /models from the Copilot API
  *
  * Requires:
- *   - 9aitls running:  ./9aitls &
- *   - token file:      ~/lib/9ai/token  (or -t path)
- *   - proxy socket:    ~/lib/9ai/proxy.sock  (or -s path)
+ *   - token file:  ~/lib/9ai/token  (or -t path)
  *
  * Usage:
- *   mk o.httptest && ./o.httptest [-t tokenfile] [-s sockpath]
+ *   mk o.httptest && ./o.httptest [-t tokenfile]
  */
 
 #include <u.h>
@@ -19,7 +17,6 @@
 #include "http.h"
 
 #define COPILOT_HOST  "api.individual.githubcopilot.com"
-#define DEFAULT_SOCK  "proxy.sock"   /* relative to configpath dir */
 
 static char *
 readfile(char *path)
@@ -44,7 +41,7 @@ readfile(char *path)
 void
 threadmain(int argc, char *argv[])
 {
-	char     *tokfile, *sockfile;
+	char     *tokfile;
 	char     *token;
 	char      auth[4096];
 	HTTPConn *c;
@@ -52,15 +49,11 @@ threadmain(int argc, char *argv[])
 	HTTPHdr   hdrs[8];
 	int       nhdrs;
 
-	tokfile  = nil;
-	sockfile = nil;
+	tokfile = nil;
 
 	ARGBEGIN{
 	case 't':
 		tokfile = ARGF();
-		break;
-	case 's':
-		sockfile = ARGF();
 		break;
 	}ARGEND
 
@@ -68,17 +61,15 @@ threadmain(int argc, char *argv[])
 
 	if(tokfile == nil)
 		tokfile = configpath("token");
-	if(sockfile == nil)
-		sockfile = configpath("proxy.sock");
 
 	token = readfile(tokfile);
 	snprint(auth, sizeof auth, "Bearer %s", token);
 	free(token);
 
-	print("dialing proxy %s...\n", sockfile);
-	c = portdial("api.individual.githubcopilot.com", "443", sockfile);
+	print("dialing %s...\n", COPILOT_HOST);
+	c = tlsdial(COPILOT_HOST, "443");
 	if(c == nil)
-		sysfatal("httpdial: %r");
+		sysfatal("tlsdial: %r");
 	print("connected\n");
 
 	nhdrs = 0;
@@ -99,14 +90,11 @@ threadmain(int argc, char *argv[])
 	r = httpget(c, "/models", COPILOT_HOST, hdrs, nhdrs);
 	if(r == nil)
 		sysfatal("httpget: %r");
-	print("HTTP %d\n", r->code);
 
+	print("status: %d\n", r->code);
 	if(httpreadbody(r) < 0)
 		sysfatal("httpreadbody: %r");
-
-	write(1, r->body, r->bodylen);
-	write(1, "\n", 1);
-
+	print("body (%ld bytes):\n%s\n", r->bodylen, r->body);
 	httprespfree(r);
 	httpclose(c);
 	threadexitsall(nil);

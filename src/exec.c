@@ -78,90 +78,6 @@
 
 /* ── platform spawn/wait helpers ────────────────────────────────────── */
 
-#ifdef PLAN9PORT
-
-static int
-spawnchild(int child_fds[3], int close_fds[2], char *prog, char *argv[],
-           const char *unmount_mtpt)
-{
-	/*
-	 * When unmount_mtpt is nil, use threadspawn() as before.
-	 *
-	 * When unmount_mtpt is set, we need to run pre-exec code in the
-	 * child (unshare + umount on Linux) that threadspawn() doesn't
-	 * support.  Fall back to a plain fork()/exec() in that case:
-	 *   1. fork()
-	 *   2. In child: close parent-side pipe ends, dup child fds to 0/1/2.
-	 *   3. On Linux: unshare(CLONE_NEWNS) + umount2(mtpt, MNT_DETACH).
-	 *   4. exec the program.
-	 *
-	 * threadspawn() is still used for the common (no-unmount) path
-	 * because it integrates with libthread's fd-closing bookkeeping.
-	 */
-	if(unmount_mtpt == nil) {
-		USED(close_fds);
-		return threadspawn(child_fds, prog, argv);
-	}
-
-	/* manual fork path for unmount */
-	{
-		int pid;
-
-		pid = fork();
-		if(pid < 0) {
-			werrstr("spawnchild: fork: %r");
-			return -1;
-		}
-		if(pid == 0) {
-			/* child: close parent-side pipe ends */
-			close(close_fds[0]);
-			close(close_fds[1]);
-			/* dup child fds to stdin/stdout/stderr */
-			dup2(child_fds[0], 0);
-			dup2(child_fds[1], 1);
-			dup2(child_fds[2], 2);
-			if(child_fds[0] > 2) close(child_fds[0]);
-			if(child_fds[1] > 2) close(child_fds[1]);
-			if(child_fds[2] > 2 && child_fds[2] != child_fds[1]) close(child_fds[2]);
-#ifdef __linux__
-			/*
-			 * Detach from the parent's mount namespace and unmount
-			 * the 9ai FS.  MNT_DETACH makes the unmount lazy —
-			 * any processes already using the mount point are not
-			 * disturbed, but new lookups will not see it.
-			 * Errors are intentionally ignored: if unshare or
-			 * umount2 fails (e.g. not mounted, no permission), the
-			 * exec still proceeds — the unmount is best-effort.
-			 */
-			unshare(CLONE_NEWNS);
-			umount2((char*)unmount_mtpt, MNT_DETACH);
-#endif
-			execvp(prog, argv);
-			_exit(1);
-		}
-		/* parent: close the child-side pipe ends */
-		close(child_fds[0]);
-		close(child_fds[1]);
-		if(child_fds[2] != child_fds[1])
-			close(child_fds[2]);
-		return pid;
-	}
-}
-
-static Waitmsg *
-waitchild(int pid)
-{
-	return procwait(pid);
-}
-
-static Waitmsg *
-waitpolled(void)
-{
-	return waitnohang();
-}
-
-#else
-
 /*
  * execpath — try to exec prog, searching $path for bare names.
  *
@@ -321,8 +237,6 @@ alarmkill(void *v, char *s)
  * runs in the same proc (agentproc) that calls execrun.
  */
 int _abortkill_pid;
-
-#endif
 
 /* ── execparse ──────────────────────────────────────────────────────── */
 
@@ -611,29 +525,12 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 	 * Parent now owns:
 	 *   stdin_pipe[1]  — write end (child's stdin)
 	 *   out_pipe[0]    — read end  (child's stdout+stderr)
-	 *
-	 * threadspawn closed: stdin_pipe[0], out_pipe[1] (both copies)
 	 */
 
-#ifdef PLAN9PORT
-	/* write stdin then close — plan9port pipes are large enough or
-	 * threadspawn runs the child in a real thread so no deadlock. */
-	if(stdin_str[0] != '\0') {
-		long slen    = strlen(stdin_str);
-		long written = 0, n;
-		while(written < slen) {
-			n = write(stdin_pipe[1], stdin_str + written, slen - written);
-			if(n <= 0)
-				break;
-			written += n;
-		}
-	}
-	close(stdin_pipe[1]);
-#else
 	/*
-	 * On 9front, writing and reading must be concurrent: if stdin is
-	 * larger than the pipe buffer, the parent blocks writing while the
-	 * child blocks writing output — deadlock.
+	 * Writing and reading must be concurrent: if stdin is larger than the
+	 * pipe buffer, the parent blocks writing while the child blocks writing
+	 * output — deadlock.
 	 *
 	 * Spawn a writer proc with rfork(RFPROC|RFFDG|RFNOWAIT).
 	 * RFFDG gives the child a separate fd table (CoW copy of the address
@@ -669,7 +566,6 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 	}
 	/* parent: close our copy of stdin_pipe[1] now that the writer owns it */
 	close(stdin_pipe[1]);
-#endif
 
 	/* allocate result */
 	r = mallocz(sizeof *r, 1);
@@ -681,59 +577,16 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 	r->pid = pid;
 
 	/*
-	 * Timeout: arrange to kill the child after timeout_ms milliseconds.
-	 *
-	 * plan9port/Linux: fork a watcher process that sleeps then postnotes
-	 * "kill" to the child.  fork() is used (not rfork) so the watcher is
-	 * a plain OS process with no libthread state.
-	 *
-	 * 9front: use alarm(timeout_ms) + threadnotify(alarmkill).  This is
-	 * the canonical Plan 9 idiom.  alarm() delivers an "alarm" note to
-	 * this proc after the delay, which _threadnote routes to alarmkill()
-	 * via threadnotify.  alarmkill() postnotes "kill" to the child and
-	 * returns 1 (consume), so the interrupted read() in collectoutput()
-	 * returns with an error and the function unblocks.  alarm(0) cancels
-	 * the alarm if the child exits before the deadline.
-	 *
-	 * A raw rfork-based watcher is wrong on 9front: the rfork'd child
-	 * inherits libthread's _threadnote handler but has no Proc* (privalloc
-	 * TLS is nil), so any note it receives causes noted(NDFLT), killing
-	 * the entire process group.
+	 * Timeout: use alarm(timeout_ms) + threadnotify(alarmkill).
+	 * alarm() delivers an "alarm" note to this proc after the delay,
+	 * which _threadnote routes to alarmkill() via threadnotify.
+	 * alarmkill() postnotes "kill" to the child and returns 1 (consume),
+	 * so the interrupted read() in collectoutput() returns with an error
+	 * and the function unblocks.  alarm(0) cancels the alarm if the child
+	 * exits before the deadline.
 	 */
 	startns = nsec();
 
-#ifdef PLAN9PORT
-	{
-		int wpid = fork();
-		if(wpid == 0) {
-			/* watcher child */
-			sleep((int)timeout_ms);
-			postnote(PNPROC, pid, "kill");
-			_exit(0);
-		}
-		/* parent: if fork failed just skip the watcher */
-		USED(wpid);
-	}
-
-	/* collect combined output */
-	r->output = collectoutput(out_pipe[0], maxout, &r->outputlen, &r->truncated);
-	close(out_pipe[0]);
-#else
-	/*
-	 * On 9front the canonical timeout idiom is alarm(ms) + threadnotify.
-	 * alarm() sends an "alarm" note to this proc after timeout_ms ms,
-	 * which interrupts the blocking read() inside collectoutput(), causing
-	 * it to return with an error.  The threadnotify callback kills the
-	 * child so its write end of out_pipe closes and collectoutput returns.
-	 *
-	 * A raw rfork-based watcher is wrong here: the rfork'd child inherits
-	 * libthread's _threadnote handler but has no libthread Proc* (privalloc
-	 * TLS is unset), so any note delivered to it causes _threadnote to call
-	 * noted(NDFLT), killing the entire process group.
-	 *
-	 * execrun is not re-entrant, so a file-scope static is safe for
-	 * passing pid to the module-level alarmkill callback.
-	 */
 	_alarmkill_pid = pid;
 	_abortkill_pid = pid;
 	threadnotify(alarmkill, 1);
@@ -746,7 +599,6 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 	alarm(0);
 	threadnotify(alarmkill, 0);
 	_abortkill_pid = 0;
-#endif
 
 	if(r->output == nil) {
 		werrstr("exec: collectoutput: %r");
@@ -758,17 +610,14 @@ execrun(const char *args_json, int args_len, long maxout, ExecOpts *opts)
 	w = waitchild(pid);
 	if(w != nil) {
 		/*
-		 * On 9front, the kernel formats Waitmsg.msg as:
+		 * The kernel formats Waitmsg.msg as:
 		 *   ""                            → success (exitcode 0)
 		 *   "<progname> <pid>: <exitstr>" → non-zero exit
 		 *
-		 * So our sentinel "__exec_failed__" appears as a substring,
+		 * Our sentinel "__exec_failed__" appears as a substring,
 		 * not the full msg — use strstr, not strcmp.
 		 * For ordinary failures we scan backward for trailing digits
 		 * to extract the exit code.
-		 *
-		 * On plan9port, msg looks like "exit status N" for non-zero exits.
-		 * The trailing-number scan handles both formats.
 		 */
 		if(w->msg != nil && w->msg[0] != '\0') {
 			if(strstr(w->msg, "__exec_failed__") != nil) {
