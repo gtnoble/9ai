@@ -21,23 +21,21 @@
  *
  * ── Concurrency ───────────────────────────────────────────────────────
  *
- * Three procs:
- *   - 9P srv loop (lib9p dispatch, main proc)
- *   - Agent proc  (HTTP, tool loop, session I/O)
- *   - Auth proc   (token refresh — deferred to v2; phase 11 reads token inline)
+ * Two dedicated procs beyond the lib9p srv loop:
+ *   - agentproc: runs the AI agent (HTTP, tool loop, session I/O).
+ *     Must be a separate OS proc with its own note handler for abort.
+ *   - authproc:  OAuth device-code flow; sleeps between polls.
  *
- * Channels:
- *   reqchan   — main → agent: AgentReq (prompt or steer)
- *   outchan   — agent → main: text chunk strings (nil = turn done)
- *   eventchan — agent → main: RS-terminated event records
+ * reqchan (agentproc only): main → agent, carries AgentReq* prompts.
  *
- * /output and /event reads park a Req* (pending_output, pending_event).
- * When the agent sends on outchan/eventchan, the srv loop responds to
- * the parked Req*.
+ * Blocking reads (/output, /event, /auth/device, /models) use
+ * srvrelease/srvacquire so the srv loop stays live while this proc
+ * blocks.  agentproc and authproc wake blocked reads directly via
+ * Rendez, writing data into staging fields under g->lk.
  *
  * ── Usage ─────────────────────────────────────────────────────────────
  *
- *   AiState *ai = aiinit(model, tokpath, mtpt); // allocate and configure global state
+ *   AiState *ai = aiinit(model, tokpath, mtpt);
  *   aimain(ai, srvname, mtpt);   // post 9P service; never returns
  */
 
@@ -74,39 +72,57 @@ struct AiState {
 	char  uuid[37];   /* current session UUID, or "" */
 	Biobuf *sess_bio; /* open session file, or nil */
 
-	/* channels */
+	/* agentproc → srv: prompt request channel */
 	Channel *reqchan;    /* AgentReq* */
-	Channel *outchan;    /* char* (text chunks; nil = turn done) */
-	Channel *eventchan;  /* char* (RS records; nil = turn done) */
 
 	/* agentproc OS pid — written once at agentproc startup; read by fswrite */
 	int agentprocpid;
 
-	/* pending 9P reads */
-	Req *pending_output;  /* parked /output read, or nil */
-	Req *pending_event;   /* parked /event read, or nil */
-
-	/* QLock for state fields accessed from both srv and agent procs */
+	/* QLock for all state fields below; also used as the lock for all Rendez */
 	QLock lk;
+
+	/*
+	 * /output — streaming agent text.
+	 *
+	 * agentproc writes outchunk (malloc'd string, or nil for EOF) under lk,
+	 * then rwakeup(&outrend).  fsread blocks in rsleep(&outrend) until
+	 * outready is set, then takes outchunk.
+	 *
+	 * outeof is set when the turn ends; cleared at the start of each turn.
+	 * outbusy is set while a read is blocking; prevents concurrent reads.
+	 */
+	Rendez  outrend;
+	char   *outchunk;  /* staged chunk, or nil = EOF sentinel */
+	int     outready;  /* 1 when outchunk is valid and waiting */
+	int     outeof;    /* 1 after turn-end nil has been consumed */
+	int     outbusy;   /* 1 while an fsread is sleeping on outrend */
+
+	/*
+	 * /event — agent event records.
+	 *
+	 * Same pattern as /output.
+	 */
+	Rendez  eventrend;
+	char   *evchunk;
+	int     evready;
+	int     eveof;
+	int     evbusy;
 
 	/* conversation history */
 	OAIReq *oaireq;   /* OpenAI Completions history (Fmt_Oai models) */
 	ANTReq *antreq;   /* Anthropic Messages history (Fmt_Ant models) */
 	int     fmt;      /* Fmt_Oai or Fmt_Ant — derived from model on each switch */
-	long    ctx_k;    /* context window of current model, in thousands of tokens (0 = unknown)
-	                   * /context output: "tokens ~<est>\nlimit <ctx_k>k\nusage <pct>%\nmessages <n>\n" */
+	long    ctx_k;    /* context window in thousands of tokens (0 = unknown) */
 
 	/*
 	 * Auth subtree state.
 	 *
 	 * authstatus: 0 = logged_out, 1 = pending (flow in progress), 2 = logged_in
 	 *
-	 * loginreqchan: main → authproc: int (1 = start login)
-	 * devchan:      authproc → main: char* (URL\x1fCODE\x00, or nil on done/err)
-	 * devpending:   parked /auth/device read, waiting for device code
+	 * loginreqchan: main → authproc: int (1 = start login).
 	 *
-	 * devcode/devuri are written by authproc under lk after oauthdevicestart()
-	 * succeeds; they are read by fsread on /auth/device.
+	 * /auth/device: fsread blocks on devrend until authproc writes devdata
+	 * (malloc'd "uri\ncode\n", or nil for EOF) under lk and rwakeup's.
 	 */
 	int   authstatus;    /* 0=logged_out 1=pending 2=logged_in */
 	char  authdev[128];  /* user code, e.g. "ABCD-1234" */
@@ -114,12 +130,11 @@ struct AiState {
 	char  autherr[256];  /* last auth error, or "" */
 
 	Channel *loginreqchan;  /* int (1 = start login) */
-	Channel *devchan;       /* char* url\x1fcode (nil = done/error) */
-	Req     *devpending;    /* parked /auth/device read */
 
-	/* /models: parked read, woken by modelschan signal */
-	Channel *modelschan;    /* int (1 = fetch requested) */
-	Req     *pending_models; /* parked /models read, or nil */
+	Rendez  devrend;
+	char   *devdata;   /* staged "uri\ncode\n" or nil (EOF), set by authproc */
+	int     devready;  /* 1 when devdata is valid and waiting */
+	int     devbusy;   /* 1 while an fsread is sleeping on devrend */
 };
 
 /*

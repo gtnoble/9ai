@@ -1116,8 +1116,7 @@ threadmain(int argc, char *argv[])
 	int   i;
 
 	for(i = 1; i < argc; i++) {
-		if(strcmp(argv[i], "-s") == 0 && i+1 < argc)
-		else if(strcmp(argv[i], "-t") == 0 && i+1 < argc)
+		if(strcmp(argv[i], "-t") == 0 && i+1 < argc)
 			tokpath = argv[++i];
 	}
 
@@ -1157,7 +1156,7 @@ threadmain(int argc, char *argv[])
 		test_live_text(tokpath);
 		test_live_tool(tokpath);
 	} else {
-		print("(skip Part 3: no -s/-t flags)\n");
+		print("(skip Part 3: no -t flag)\n");
 	}
 
 	if(failures == 0)

@@ -17,13 +17,10 @@
  *
  * ── /output and /event ────────────────────────────────────────────────
  *
- * Each read parks a Req* in ai->pending_output or ai->pending_event.
- * Only one pending read per file is allowed (concurrent reads return error).
- * The agent proc sends chunks on outchan/eventchan; the srv loop picks
- * them up via a channel watcher thread and responds to the parked Req*.
- *
- * Turn end is signalled by the agent sending nil on the channel.  On nil,
- * we respond with 0 bytes (EOF) to the parked Req*, if any.
+ * Each read calls srvrelease() and blocks on a Rendez (outrend/eventrend)
+ * until agentproc stages a chunk under g->lk and rwakeup()s.
+ * Only one concurrent read per file is allowed.
+ * A nil chunk signals end-of-turn; the read responds with 0 bytes (EOF).
  *
  * ── /ctl ──────────────────────────────────────────────────────────────
  *
@@ -47,7 +44,7 @@
  * ── /session/new ──────────────────────────────────────────────────────
  *
  * Write anything → close current session, open a fresh one.
- * Emits session_new event on eventchan if agent is idle.
+ * Emits session_new event via eventrend if agent is idle.
  *
  * ── /session/load, /session/save ──────────────────────────────────────
  *
@@ -61,9 +58,6 @@
 #include <fcall.h>
 #include <thread.h>
 #include <9p.h>
-
-#define chansendp(c, v)  sendp(c, v)
-#define chanrecvp(c)     recvp(c)
 
 #include "9ai.h"
 #include "http.h"
@@ -250,10 +244,6 @@ static FileEntry authtab[] = {
 /* ── Global state pointer ──────────────────────────────────────────────── */
 
 static AiState *g;
-
-/* ── Forward declarations for buffer helpers (defined near watchers) ───── */
-static int outbuf_pop(char **chunkp);
-static int evbuf_pop(char **recp);
 
 /* ── WriteBuf — accumulates writes to /message, /steer, /session/load etc ─ */
 
@@ -586,18 +576,124 @@ fsread(Req *r)
 
 	case Qmodels: {
 		/*
-		 * Park the request; modelswatcher will do the HTTP work on its
-		 * own large stack and call respond() when done.
+		 * Fetch the models list live.  This involves OAuth + HTTPS so
+		 * we release the srv lock first; the current proc keeps running
+		 * on its own stack.  A custom forker (largesrvforker, set in
+		 * aimain) gives spawned srvwork procs enough stack for TLS.
 		 */
-		qlock(&g->lk);
-		if(g->pending_models != nil) {
-			qunlock(&g->lk);
-			respond(r, "concurrent reads on /models not supported");
+		char  tokbuf[512];
+		int   n, fd;
+		char *refresh;
+		OAuthToken *tok;
+		Model *mlist;
+		char  *mbuf;
+		long   mcap, mlen;
+		int    nr;
+		Srv   *srv;
+
+		srv = r->srv;
+		srvrelease(srv);
+
+		fd = open(g->tokpath, OREAD);
+		if(fd < 0) {
+			srvacquire(srv);
+			respond(r, "cannot read token");
 			return;
 		}
-		g->pending_models = r;
-		qunlock(&g->lk);
-		chansendp(g->modelschan, (void*)(uintptr)1);
+		n = read(fd, tokbuf, sizeof tokbuf - 1);
+		close(fd);
+		if(n <= 0) {
+			srvacquire(srv);
+			respond(r, "empty token");
+			return;
+		}
+		tokbuf[n] = '\0';
+		while(n > 0 && (tokbuf[n-1]=='\n'||tokbuf[n-1]=='\r'||tokbuf[n-1]==' '))
+			tokbuf[--n] = '\0';
+		refresh = tokbuf;
+
+		tok = oauthsession(refresh);
+		if(tok == nil) {
+			srvacquire(srv);
+			respond(r, "oauthsession failed");
+			return;
+		}
+
+		mlist = modelsfetch(tok->token);
+		oauthtokenfree(tok);
+		if(mlist == nil) {
+			srvacquire(srv);
+			respond(r, "modelsfetch failed");
+			return;
+		}
+
+		/* cache ctx_k for the current model */
+		{
+			Model *m;
+			char   curmodel[128];
+			qlock(&g->lk);
+			snprint(curmodel, sizeof curmodel, "%s", g->model);
+			qunlock(&g->lk);
+			for(m = mlist; m != nil; m = m->next) {
+				if(strcmp(m->id, curmodel) == 0) {
+					qlock(&g->lk);
+					g->ctx_k = m->ctx_k;
+					qunlock(&g->lk);
+					break;
+				}
+			}
+		}
+
+		/* format model list into a heap buffer via Biobuf + pipe */
+		{
+			int pfd[2];
+			Biobuf bio;
+
+			if(pipe(pfd) < 0) {
+				modelsfree(mlist);
+				srvacquire(srv);
+				respond(r, "pipe: %r");
+				return;
+			}
+			Binit(&bio, pfd[1], OWRITE);
+			modelsfmt(mlist, &bio);
+			modelsfree(mlist);
+			Bflush(&bio);
+			Bterm(&bio);
+			close(pfd[1]);
+
+			mcap = 4096;
+			mlen = 0;
+			mbuf = malloc(mcap);
+			if(mbuf == nil) {
+				close(pfd[0]);
+				srvacquire(srv);
+				respond(r, "malloc");
+				return;
+			}
+			while((nr = read(pfd[0], mbuf + mlen, mcap - mlen - 1)) > 0) {
+				mlen += nr;
+				if(mlen + 1 >= mcap) {
+					char *tmp;
+					mcap *= 2;
+					tmp = realloc(mbuf, mcap);
+					if(tmp == nil) {
+						free(mbuf);
+						close(pfd[0]);
+						srvacquire(srv);
+						respond(r, "realloc");
+						return;
+					}
+					mbuf = tmp;
+				}
+			}
+			close(pfd[0]);
+			mbuf[mlen] = '\0';
+			readbuf(r, mbuf, mlen);
+			free(mbuf);
+		}
+		srvacquire(srv);
+		respond(r, nil);
 		return;
 	}
 
@@ -641,81 +737,145 @@ fsread(Req *r)
 		 * authuri is set), respond immediately with:
 		 *   "<verification_uri>\n<user_code>\n"
 		 *
-		 * Otherwise park the request; authproc will respond when the
-		 * device code arrives (via devchan).
-		 *
-		 * Returns 0 bytes (EOF) when the flow completes (success or error).
+		 * Otherwise block on devrend until authproc stages devdata.
+		 * devdata == nil means the flow completed (success or error) — EOF.
 		 */
+		Srv  *srv;
+		char *data;
+
 		qlock(&g->lk);
 		if(g->authstatus == 1 && g->authuri[0] != '\0') {
-			/* device code already available */
 			snprint(buf, sizeof buf, "%s\n%s\n", g->authuri, g->authdev);
 			qunlock(&g->lk);
 			readstr(r, buf);
 			respond(r, nil);
 			return;
 		}
-		if(g->devpending != nil) {
+		if(g->devbusy) {
 			qunlock(&g->lk);
 			respond(r, "concurrent reads on /auth/device not supported");
 			return;
 		}
-		g->devpending = r;
+		g->devbusy = 1;
+		srv = r->srv;
+		srvrelease(srv);
+
+		/* g->lk is held entering rsleep; released inside, re-acquired on wake */
+		while(!g->devready)
+			rsleep(&g->devrend);
+		data = g->devdata;
+		g->devdata  = nil;
+		g->devready = 0;
+		g->devbusy  = 0;
 		qunlock(&g->lk);
-		/* devwatcher will respond when authproc sends on devchan */
+
+		srvacquire(srv);
+		r->ifcall.offset = 0;
+		if(data == nil) {
+			r->ofcall.count = 0;
+			respond(r, nil);
+		} else {
+			readstr(r, data);
+			free(data);
+			respond(r, nil);
+		}
 		return;
 	}
 
 	case Qoutput: {
+		/*
+		 * Block on outrend until agentproc stages a chunk.
+		 * nil chunk = end-of-turn EOF.
+		 */
+		Srv  *srv;
 		char *chunk;
-		/* if a chunk is already buffered, respond immediately */
+
 		qlock(&g->lk);
-		if(outbuf_pop(&chunk)) {
-			qunlock(&g->lk);
-			r->ifcall.offset = 0;
-			if(chunk == nil) {
-				r->ofcall.count = 0;
-			} else {
-				readstr(r, chunk);
-				free(chunk);
-			}
-			respond(r, nil);
-			return;
-		}
-		/* no buffered data — park the request */
-		if(g->pending_output != nil) {
+		if(g->outbusy) {
 			qunlock(&g->lk);
 			respond(r, "concurrent reads on /output not supported");
 			return;
 		}
-		g->pending_output = r;
+		if(g->outeof) {
+			/* turn already ended; return EOF immediately */
+			qunlock(&g->lk);
+			r->ifcall.offset = 0;
+			r->ofcall.count  = 0;
+			respond(r, nil);
+			return;
+		}
+		g->outbusy = 1;
+		srv = r->srv;
+		srvrelease(srv);
+
+		while(!g->outready)
+			rsleep(&g->outrend);
+		chunk = g->outchunk;
+		g->outchunk  = nil;
+		g->outready  = 0;
+		if(chunk == nil)
+			g->outeof = 1;
+		g->outbusy = 0;
 		qunlock(&g->lk);
-		/* do not respond now; outwatcher will respond when data arrives */
+
+		srvacquire(srv);
+		r->ifcall.offset = 0;
+		if(chunk == nil) {
+			r->ofcall.count = 0;
+			respond(r, nil);
+		} else {
+			readstr(r, chunk);
+			free(chunk);
+			respond(r, nil);
+		}
 		return;
 	}
 
 	case Qevent: {
+		/*
+		 * Block on eventrend until agentproc stages a record.
+		 * nil record = end-of-turn EOF.
+		 */
+		Srv  *srv;
 		char *rec;
+
 		qlock(&g->lk);
-		if(evbuf_pop(&rec)) {
-			qunlock(&g->lk);
-			r->ifcall.offset = 0;
-			if(rec == nil) {
-				r->ofcall.count = 0;
-			} else {
-				readbuf(r, rec, strlen(rec));
-				free(rec);
-			}
-			respond(r, nil);
-			return;
-		}
-		if(g->pending_event != nil) {
+		if(g->evbusy) {
 			qunlock(&g->lk);
 			respond(r, "concurrent reads on /event not supported");
 			return;
 		}
-		g->pending_event = r;
+		if(g->eveof) {
+			qunlock(&g->lk);
+			r->ifcall.offset = 0;
+			r->ofcall.count  = 0;
+			respond(r, nil);
+			return;
+		}
+		g->evbusy = 1;
+		srv = r->srv;
+		srvrelease(srv);
+
+		while(!g->evready)
+			rsleep(&g->eventrend);
+		rec = g->evchunk;
+		g->evchunk  = nil;
+		g->evready  = 0;
+		if(rec == nil)
+			g->eveof = 1;
+		g->evbusy = 0;
 		qunlock(&g->lk);
+
+		srvacquire(srv);
+		r->ifcall.offset = 0;
+		if(rec == nil) {
+			r->ofcall.count = 0;
+			respond(r, nil);
+		} else {
+			readbuf(r, rec, strlen(rec));
+			free(rec);
+			respond(r, nil);
+		}
 		return;
 	}
 
@@ -913,7 +1073,7 @@ fsdestroyfid(Fid *fid)
 			if(req != nil) {
 				req->type = (path == Qmessage) ? AgentReqPrompt : AgentReqSteer;
 				req->text = strdup(w->buf);
-				chansendp(g->reqchan, req);
+				sendp(g->reqchan, req);
 			}
 		}
 		wbuffree(w);
@@ -954,9 +1114,15 @@ fsdestroyfid(Fid *fid)
 				sess_new_ev = strdup(evbuf);
 			}
 			qunlock(&g->lk);
-			/* send outside the lock so we cannot block with lk held */
-			if(sess_new_ev != nil)
-				chansendp(g->eventchan, sess_new_ev);
+			/* stage the event and wake any blocked /event reader */
+			if(sess_new_ev != nil) {
+				qlock(&g->lk);
+				free(g->evchunk);
+				g->evchunk  = sess_new_ev;
+				g->evready  = 1;
+				rwakeup(&g->eventrend);
+				qunlock(&g->lk);
+			}
 			wbuffree(w);
 			fid->aux = nil;
 		}
@@ -1045,8 +1211,13 @@ fsdestroyfid(Fid *fid)
 						snprint(evbuf2, sizeof evbuf2, "session_new\x1f%s\x1e", g->uuid);
 						char *evcopy2 = strdup(evbuf2);
 						qunlock(&g->lk);
-						/* send outside the lock so we cannot block with lk held */
-						chansendp(g->eventchan, evcopy2);
+						/* stage the event and wake any blocked /event reader */
+						qlock(&g->lk);
+						free(g->evchunk);
+						g->evchunk  = evcopy2;
+						g->evready  = 1;
+						rwakeup(&g->eventrend);
+						qunlock(&g->lk);
 					} else {
 						/* load failed — restore a fresh state */
 						oaireqfree(newreq);
@@ -1122,7 +1293,7 @@ fsdestroyfid(Fid *fid)
 		 */
 		if(w != nil && (fid->omode & 3) == OWRITE) {
 			int one = 1;
-			chansendp(g->loginreqchan, (void*)(uintptr)one);
+			sendp(g->loginreqchan, (void*)(uintptr)one);
 		}
 		wbuffree(w);
 		fid->aux = nil;
@@ -1192,181 +1363,45 @@ static Srv fs = {
 	.destroyfid  = fsdestroyfid,
 };
 
-/* ── Channel watcher procs ─────────────────────────────────────────────── */
-
-/*
- * outwatcher — runs in its own proc; relays chunks from outchan to
- * the parked pending_output Req*.  nil chunk = EOF (turn done).
- *
- * If no reader is parked when a chunk arrives, the chunk is buffered
- * in outbuf_head/tail.  When a reader arrives (fsread on /output),
- * it checks outbuf_head first and responds immediately if non-empty.
- */
-typedef struct OutBuf OutBuf;
-struct OutBuf {
-	char   *chunk;   /* nil = EOF sentinel */
-	OutBuf *next;
-};
-
-static OutBuf *outbuf_head = nil;
-static OutBuf *outbuf_tail = nil;
-
-/* call with g->lk held */
-static void
-outbuf_push(char *chunk)
-{
-	OutBuf *b = mallocz(sizeof *b, 1);
-	if(b == nil) { free(chunk); return; }
-	b->chunk = chunk;
-	b->next  = nil;
-	if(outbuf_tail != nil) outbuf_tail->next = b;
-	else                   outbuf_head = b;
-	outbuf_tail = b;
-}
-
-/* call with g->lk held; returns 1 if an item was popped, 0 if empty */
-static int
-outbuf_pop(char **chunkp)
-{
-	OutBuf *b;
-	if(outbuf_head == nil) return 0;
-	b = outbuf_head;
-	outbuf_head = b->next;
-	if(outbuf_head == nil) outbuf_tail = nil;
-	*chunkp = b->chunk;
-	free(b);
-	return 1;
-}
-
-static void
-outwatcher(void *v)
-{
-	char *chunk;
-	Req  *r;
-
-	USED(v);
-	for(;;) {
-		chunk = chanrecvp(g->outchan);
-		qlock(&g->lk);
-		r = g->pending_output;
-		if(r != nil) {
-			g->pending_output = nil;
-			qunlock(&g->lk);
-			r->ifcall.offset = 0;
-			if(chunk == nil) {
-				r->ofcall.count = 0;
-				respond(r, nil);
-			} else {
-				readstr(r, chunk);
-				respond(r, nil);
-				free(chunk);
-			}
-		} else {
-			/* no reader parked — buffer the chunk for fsread to pick up */
-			outbuf_push(chunk);
-			qunlock(&g->lk);
-		}
-	}
-}
-
-/*
- * eventwatcher — same pattern as outwatcher for /event records.
- */
-typedef struct EvBuf EvBuf;
-struct EvBuf {
-	char  *rec;
-	EvBuf *next;
-};
-
-static EvBuf *evbuf_head = nil;
-static EvBuf *evbuf_tail = nil;
-
-static void
-evbuf_push(char *rec)
-{
-	EvBuf *b = mallocz(sizeof *b, 1);
-	if(b == nil) { free(rec); return; }
-	b->rec  = rec;
-	b->next = nil;
-	if(evbuf_tail != nil) evbuf_tail->next = b;
-	else                  evbuf_head = b;
-	evbuf_tail = b;
-}
-
-static int
-evbuf_pop(char **recp)
-{
-	EvBuf *b;
-	if(evbuf_head == nil) return 0;
-	b = evbuf_head;
-	evbuf_head = b->next;
-	if(evbuf_head == nil) evbuf_tail = nil;
-	*recp = b->rec;
-	free(b);
-	return 1;
-}
-
-static void
-eventwatcher(void *v)
-{
-	char *rec;
-	Req  *r;
-
-	USED(v);
-	for(;;) {
-		rec = chanrecvp(g->eventchan);
-		qlock(&g->lk);
-		r = g->pending_event;
-		if(r != nil) {
-			g->pending_event = nil;
-			qunlock(&g->lk);
-			r->ifcall.offset = 0;
-			if(rec == nil) {
-				r->ofcall.count = 0;
-				respond(r, nil);
-			} else {
-				readbuf(r, rec, strlen(rec));
-				respond(r, nil);
-				free(rec);
-			}
-		} else {
-			evbuf_push(rec);
-			qunlock(&g->lk);
-		}
-	}
-}
-
 /* ── Agent proc ────────────────────────────────────────────────────────── */
 
 /*
- * agent_ontext — callback from agentrun(); sends text chunk to outchan.
- * The chunk is duplicated because agentrun's buffer is stack/heap local.
+ * agent_ontext — callback from agentrun(); stages chunk for /output reader.
+ * Called from agentproc.  Wakes any fsread blocked on outrend.
  */
 static void
 agent_ontext(const char *text, void *aux)
 {
 	USED(aux);
-	chansendp(g->outchan, strdup((char*)text));
+	qlock(&g->lk);
+	free(g->outchunk);
+	g->outchunk = strdup((char*)text);
+	g->outready = 1;
+	rwakeup(&g->outrend);
+	qunlock(&g->lk);
 }
 
 /*
- * agent_onevent — callback from agentrun(); sends RS record to eventchan.
+ * agent_onevent — callback from agentrun(); stages event record for /event.
  */
 static void
 agent_onevent(const char *rec, long len, void *aux)
 {
-	char *copy;
 	USED(aux); USED(len);
-	copy = strdup((char*)rec);
-	chansendp(g->eventchan, copy);
+	qlock(&g->lk);
+	free(g->evchunk);
+	g->evchunk = strdup((char*)rec);
+	g->evready = 1;
+	rwakeup(&g->eventrend);
+	qunlock(&g->lk);
 }
 
 /*
  * agentproc — main agent loop proc.
  *
  * Waits for AgentReq messages on reqchan.  For each PROMPT, runs
- * agentrun().  On completion, signals EOF on outchan and eventchan
- * (nil pointers) so parked readers get EOF for the turn.
+ * agentrun().  On completion, stages nil on outrend/eventrend
+ * so blocked /output and /event readers receive EOF for the turn.
  *
  * STEER: not yet wired (phase 14); accepted but ignored.
  */
@@ -1411,7 +1446,7 @@ agentproc(void *v)
 	atnotify(abortkill, 1);
 
 	for(;;) {
-		req = chanrecvp(g->reqchan);
+		req = recvp(g->reqchan);
 		if(req == nil)
 			continue;
 
@@ -1423,10 +1458,12 @@ agentproc(void *v)
 			continue;
 		}
 
-		/* set busy */
+		/* set busy; clear end-of-turn flags for the new turn */
 		qlock(&g->lk);
 		g->busy = 1;
 		g->errmsg[0] = '\0';
+		g->outeof = 0;
+		g->eveof  = 0;
 		qunlock(&g->lk);
 
 		/* open session if not already open */
@@ -1501,45 +1538,20 @@ agentproc(void *v)
 		free(req->text);
 		free(req);
 
-		/* signal end-of-turn to watchers */
-		chansendp(g->outchan,  nil);
-		chansendp(g->eventchan, nil);
-	}
-}
-
-/* ── devwatcher — relays devchan → parked /auth/device Req* ───────────── */
-
-static void
-devwatcher(void *v)
-{
-	char *payload;  /* "uri\ncode\n" or nil (flow done/error) */
-	Req  *r;
-
-	USED(v);
-	for(;;) {
-		payload = chanrecvp(g->devchan);
+		/* signal end-of-turn: stage nil chunk and wake blocked readers */
 		qlock(&g->lk);
-		r = g->devpending;
-		if(r != nil) {
-			g->devpending = nil;
-			qunlock(&g->lk);
-			r->ifcall.offset = 0;
-			if(payload == nil) {
-				/* flow done or error — EOF */
-				r->ofcall.count = 0;
-				respond(r, nil);
-			} else {
-				readstr(r, payload);
-				respond(r, nil);
-				free(payload);
-			}
-		} else {
-			/* no reader parked: if payload non-nil, drop it (client
-			 * will read authuri/authdev fields from /auth/status next open) */
-			if(payload != nil)
-				free(payload);
-			qunlock(&g->lk);
-		}
+		free(g->outchunk);
+		g->outchunk = nil;
+		g->outready = 1;
+		rwakeup(&g->outrend);
+		qunlock(&g->lk);
+
+		qlock(&g->lk);
+		free(g->evchunk);
+		g->evchunk = nil;
+		g->evready = 1;
+		rwakeup(&g->eventrend);
+		qunlock(&g->lk);
 	}
 }
 
@@ -1551,15 +1563,14 @@ devwatcher(void *v)
  *
  *   1. oauthdevicestart() → OAuthDeviceCode
  *   2. Update g->authstatus=1, g->authuri, g->authdev under lk
- *   3. Send "uri\ncode\n" on devchan (wakes any parked /auth/device reader)
+ *   3. Stage "uri\ncode\n" in g->devdata and rwakeup(&g->devrend)
  *   4. Poll oauthdevicepoll() with sleep(interval)
  *   5. On success: get session token, enable models, set authstatus=2
- *      Emit auth_ok event on eventchan.
- *   6. On error: set authstatus=0, autherr; emit auth_err event.
- *   7. Send nil on devchan (EOF for any still-parked /auth/device reader).
+ *      Stage auth_ok event on eventrend.
+ *   6. On error: set authstatus=0, autherr; stage auth_err event.
+ *   7. Stage nil in devdata (EOF for any blocked /auth/device reader).
  *
- * A new loginreqchan signal while a flow is in progress is ignored
- * (the current flow continues).
+ * A new loginreqchan signal while a flow is in progress is ignored.
  */
 static void
 authproc(void *v)
@@ -1568,13 +1579,12 @@ authproc(void *v)
 
 	for(;;) {
 		/* wait for a login request */
-		chanrecvp(g->loginreqchan);
+		recvp(g->loginreqchan);
 
 		/* check if already logged in */
 		qlock(&g->lk);
 		if(g->authstatus == 2) {
 			qunlock(&g->lk);
-			/* already logged in — nothing to do */
 			continue;
 		}
 		if(g->authstatus == 1) {
@@ -1598,16 +1608,21 @@ authproc(void *v)
 			qlock(&g->lk);
 			g->authstatus = 0;
 			snprint(g->autherr, sizeof g->autherr, "%s", errbuf);
-			qunlock(&g->lk);
-			/* emit error event */
+			/* stage auth_err event */
 			{
 				char *fields[2] = {"auth_err", errbuf};
 				long  len;
-				char *ev = fmtrecfields(fields, 2, &len);
-				chansendp(g->eventchan, ev);
+				free(g->evchunk);
+				g->evchunk = fmtrecfields(fields, 2, &len);
+				g->evready = 1;
+				rwakeup(&g->eventrend);
 			}
-			/* EOF for any parked /auth/device reader */
-			chansendp(g->devchan, nil);
+			/* EOF for any blocked /auth/device reader */
+			free(g->devdata);
+			g->devdata  = nil;
+			g->devready = 1;
+			rwakeup(&g->devrend);
+			qunlock(&g->lk);
 			continue;
 		}
 
@@ -1615,12 +1630,11 @@ authproc(void *v)
 		qlock(&g->lk);
 		snprint(g->authuri, sizeof g->authuri, "%s", dc->verification_uri);
 		snprint(g->authdev, sizeof g->authdev, "%s", dc->user_code);
+		free(g->devdata);
+		g->devdata  = smprint("%s\n%s\n", dc->verification_uri, dc->user_code);
+		g->devready = 1;
+		rwakeup(&g->devrend);
 		qunlock(&g->lk);
-
-		{
-			char *payload = smprint("%s\n%s\n", dc->verification_uri, dc->user_code);
-			chansendp(g->devchan, payload);
-		}
 
 		/* step 4: poll loop */
 		int done = 0;
@@ -1632,20 +1646,26 @@ authproc(void *v)
 		oauthdevcodefree(dc);
 
 		if(rc < 0) {
-			/* error */
 			char errbuf[256];
 			rerrstr(errbuf, sizeof errbuf);
 			qlock(&g->lk);
 			g->authstatus = 0;
 			snprint(g->autherr, sizeof g->autherr, "%s", errbuf);
-			qunlock(&g->lk);
+			/* stage auth_err event */
 			{
 				char *fields[2] = {"auth_err", errbuf};
 				long  len;
-				char *ev = fmtrecfields(fields, 2, &len);
-				chansendp(g->eventchan, ev);
+				free(g->evchunk);
+				g->evchunk = fmtrecfields(fields, 2, &len);
+				g->evready = 1;
+				rwakeup(&g->eventrend);
 			}
-			chansendp(g->devchan, nil);
+			/* EOF for any blocked /auth/device reader */
+			free(g->devdata);
+			g->devdata  = nil;
+			g->devready = 1;
+			rwakeup(&g->devrend);
+			qunlock(&g->lk);
 			continue;
 		}
 
@@ -1678,15 +1698,17 @@ authproc(void *v)
 		g->authstatus = 2;
 		g->authuri[0] = '\0';
 		g->authdev[0] = '\0';
+		/* stage auth_ok event */
+		free(g->evchunk);
+		g->evchunk = smprint("auth_ok\x1e");
+		g->evready = 1;
+		rwakeup(&g->eventrend);
+		/* EOF for any still-blocked /auth/device reader */
+		free(g->devdata);
+		g->devdata  = nil;
+		g->devready = 1;
+		rwakeup(&g->devrend);
 		qunlock(&g->lk);
-
-		/* emit auth_ok event */
-		{
-			char *ev = smprint("auth_ok\x1e");
-			chansendp(g->eventchan, ev);
-		}
-		/* EOF for any still-parked /auth/device reader */
-		chansendp(g->devchan, nil);
 	}
 }
 
@@ -1708,12 +1730,14 @@ aiinit(char *model, char *tokpath, char *mtpt)
 	ai->antreq   = antreqnew(model);
 	ai->fmt      = Fmt_Oai;  /* default; switched when model changes */
 
-	ai->reqchan      = chancreate(sizeof(void*), 8);  /* buffered: fsdestroyfid must not block srv */
-	ai->outchan      = chancreate(sizeof(void*), 16);
-	ai->eventchan    = chancreate(sizeof(void*), 16);
+	/* reqchan is buffered so fsdestroyfid never blocks the srv loop */
+	ai->reqchan      = chancreate(sizeof(void*), 8);
 	ai->loginreqchan = chancreate(sizeof(void*), 4);
-	ai->devchan      = chancreate(sizeof(void*), 4);
-	ai->modelschan   = chancreate(sizeof(void*), 4);
+
+	/* Rendez fields share g->lk as their lock */
+	ai->outrend.l   = &ai->lk;
+	ai->eventrend.l = &ai->lk;
+	ai->devrend.l   = &ai->lk;
 
 	/* initialise auth status based on whether a token already exists */
 	ai->authstatus = oauthtokenexists(tokpath) ? 2 : 0;
@@ -1722,132 +1746,14 @@ aiinit(char *model, char *tokpath, char *mtpt)
 }
 
 /*
- * modelswatcher — runs in its own proc with a large stack.
- * Woken by a signal on modelschan; does the OAuth + HTTP fetch that
- * would overflow the 32 KB srv stack if done inline in fsread.
+ * largesrvforker — forker for threadpostmountsrv that gives each
+ * spawned srvwork proc a stack large enough for TLS + OAuth + HTTP.
+ * The default threadsrvforker uses 32 KB which is tight for tlsClient.
  */
 static void
-modelswatcher(void *v)
+largesrvforker(void (*fn)(void*), void *arg, int rflag)
 {
-	USED(v);
-	for(;;) {
-		int   fd, n;
-		char  tokbuf[512];
-		char *refresh;
-		OAuthToken *tok;
-		Model *mlist;
-		char  *mbuf;
-		long   mcap, mlen;
-		int    nr;
-		Req   *r;
-
-		chanrecvp(g->modelschan);
-
-		qlock(&g->lk);
-		r = g->pending_models;
-		g->pending_models = nil;
-		qunlock(&g->lk);
-
-		if(r == nil)
-			continue;
-
-		/* read refresh token */
-		fd = open(g->tokpath, OREAD);
-		if(fd < 0) {
-			respond(r, "cannot read token");
-			continue;
-		}
-		n = read(fd, tokbuf, sizeof tokbuf - 1);
-		close(fd);
-		if(n <= 0) {
-			respond(r, "empty token");
-			continue;
-		}
-		tokbuf[n] = '\0';
-		while(n > 0 && (tokbuf[n-1]=='\n'||tokbuf[n-1]=='\r'||tokbuf[n-1]==' '))
-			tokbuf[--n] = '\0';
-		refresh = tokbuf;
-
-		tok = oauthsession(refresh);
-		if(tok == nil) {
-			respond(r, "oauthsession failed");
-			continue;
-		}
-
-		mlist = modelsfetch(tok->token);
-		oauthtokenfree(tok);
-		if(mlist == nil) {
-			respond(r, "modelsfetch failed");
-			continue;
-		}
-
-		/* cache ctx_k for the current model before freeing the list */
-		{
-			Model *m;
-			char   curmodel[128];
-			qlock(&g->lk);
-			snprint(curmodel, sizeof curmodel, "%s", g->model);
-			qunlock(&g->lk);
-			for(m = mlist; m != nil; m = m->next) {
-				if(strcmp(m->id, curmodel) == 0) {
-					qlock(&g->lk);
-					g->ctx_k = m->ctx_k;
-					qunlock(&g->lk);
-					break;
-				}
-			}
-		}
-
-		/* format model list into a heap buffer via Biobuf + pipe */
-		{
-			int   pfd[2];
-			Biobuf bio;
-
-			if(pipe(pfd) < 0) {
-				modelsfree(mlist);
-				respond(r, "pipe: %r");
-				continue;
-			}
-			Binit(&bio, pfd[1], OWRITE);
-			modelsfmt(mlist, &bio);
-			modelsfree(mlist);
-			Bflush(&bio);
-			Bterm(&bio);
-			close(pfd[1]);
-
-			mcap = 4096;
-			mlen = 0;
-			mbuf = malloc(mcap);
-			if(mbuf == nil) {
-				close(pfd[0]);
-				respond(r, "malloc");
-				continue;
-			}
-			while((nr = read(pfd[0], mbuf + mlen, mcap - mlen - 1)) > 0) {
-				mlen += nr;
-				if(mlen + 1 >= mcap) {
-					char *tmp;
-					mcap *= 2;
-					tmp = realloc(mbuf, mcap);
-					if(tmp == nil) {
-						free(mbuf);
-						close(pfd[0]);
-						respond(r, "realloc");
-						mbuf = nil;
-						break;
-					}
-					mbuf = tmp;
-				}
-			}
-			close(pfd[0]);
-			if(mbuf == nil)
-				continue;
-			mbuf[mlen] = '\0';
-			readbuf(r, mbuf, mlen);
-			free(mbuf);
-		}
-		respond(r, nil);
-	}
+	procrfork(fn, arg, 128*1024, rflag);
 }
 
 void
@@ -1855,23 +1761,16 @@ aimain(AiState *ai, char *srvname, char *mtpt)
 {
 	g = ai;
 
-	/* start agent proc */
+	/* start agent and auth procs */
 	proccreate(agentproc, nil, 524288);
-
-	/* start channel watcher procs */
-	proccreate(outwatcher,    nil, 16384);
-	proccreate(eventwatcher,  nil, 16384);
-	proccreate(devwatcher,    nil, 16384);
-	proccreate(modelswatcher, nil, 131072);  /* needs large stack: OAuth + HTTP */
-
-	/* start auth proc */
-	proccreate(authproc, nil, 65536);
+	proccreate(authproc,  nil, 65536);
 
 	/* if no token exists, immediately kick off the login flow */
 	if(ai->authstatus == 0)
-		chansendp(ai->loginreqchan, (void*)(uintptr)1);
+		sendp(ai->loginreqchan, (void*)(uintptr)1);
 
-	/* post 9P service; proccreate's the srv loop and returns */
-	fs.aux = ai;
-	threadpostmountsrv(&fs, srvname, mtpt, MREPL);
+	/* post 9P service with a larger srvwork stack for /models TLS work */
+	fs.aux    = ai;
+	fs.forker = largesrvforker;
+	postmountsrv(&fs, srvname, mtpt, MREPL);
 }

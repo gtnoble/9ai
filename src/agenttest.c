@@ -23,7 +23,7 @@
  *
  * Usage:
  *   ./o.agenttest                     (unit tests only)
- *   ./o.agenttest -s <sock> -t <tok>  (unit + live)
+ *   ./o.agenttest -t <tok>  (unit + live)
  */
 
 #include <u.h>
@@ -905,7 +905,7 @@ threadmain(int argc, char *argv[])
 		print("\n=== Part 3: Live integration tests (ANT/Claude) ===\n");
 		test_live_agent_ant(tokpath);
 	} else {
-		print("\n(skipping live tests: pass -s <sock> -t <tok> to enable)\n");
+		print("\n(skipping live tests: pass -t <tok> to enable)\n");
 	}
 
 	if(failures > 0) {

@@ -18,7 +18,7 @@
  *   - ssestep returns SSE_DONE as the last result
  *   - SSEEvent fields are valid
  *
- * Part 2: live integration test (optional; -s/-t flags).
+ * Part 2: live integration test (optional; -t flag).
  *   POSTs to /chat/completions (gpt-4o) and /v1/messages (claude-sonnet-4.5),
  *   drives the SSE parser, and verifies text content is received.
  */
