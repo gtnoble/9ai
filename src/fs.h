@@ -29,9 +29,8 @@
  * reqchan (agentproc only): main → agent, carries AgentReq* prompts.
  *
  * Blocking reads (/output, /event, /auth/device, /models) use
- * srvrelease/srvacquire so the srv loop stays live while this proc
- * blocks.  agentproc and authproc wake blocked reads directly via
- * Rendez, writing data into staging fields under g->lk.
+ * srvrelease + recvp/sendp on unbuffered channels so the srv loop
+ * stays live and no locking is needed in the hot path.
  *
  * ── Usage ─────────────────────────────────────────────────────────────
  *
@@ -78,35 +77,20 @@ struct AiState {
 	/* agentproc OS pid — written once at agentproc startup; read by fswrite */
 	int agentprocpid;
 
-	/* QLock for all state fields below; also used as the lock for all Rendez */
+	/* QLock for fields accessed from both srv and agent/auth procs */
 	QLock lk;
 
 	/*
-	 * /output — streaming agent text.
+	 * /output — streaming agent text chunks.
+	 * /event  — agent event records (RS-terminated).
 	 *
-	 * agentproc writes outchunk (malloc'd string, or nil for EOF) under lk,
-	 * then rwakeup(&outrend).  fsread blocks in rsleep(&outrend) until
-	 * outready is set, then takes outchunk.
-	 *
-	 * outeof is set when the turn ends; cleared at the start of each turn.
-	 * outbusy is set while a read is blocking; prevents concurrent reads.
+	 * Unbuffered channels (depth 0): sendp blocks until recvp is ready,
+	 * giving natural backpressure.  nil = end-of-turn EOF sentinel.
+	 * fsread calls srvrelease, then recvp, then srvacquire.
+	 * agent_ontext/agent_onevent just call sendp — no locks needed.
 	 */
-	Rendez  outrend;
-	char   *outchunk;  /* staged chunk, or nil = EOF sentinel */
-	int     outready;  /* 1 when outchunk is valid and waiting */
-	int     outeof;    /* 1 after turn-end nil has been consumed */
-	int     outbusy;   /* 1 while an fsread is sleeping on outrend */
-
-	/*
-	 * /event — agent event records.
-	 *
-	 * Same pattern as /output.
-	 */
-	Rendez  eventrend;
-	char   *evchunk;
-	int     evready;
-	int     eveof;
-	int     evbusy;
+	Channel *outchan;    /* char* text chunks; nil = turn done */
+	Channel *eventchan;  /* char* RS records;  nil = turn done */
 
 	/* conversation history */
 	OAIReq *oaireq;   /* OpenAI Completions history (Fmt_Oai models) */
@@ -121,8 +105,9 @@ struct AiState {
 	 *
 	 * loginreqchan: main → authproc: int (1 = start login).
 	 *
-	 * /auth/device: fsread blocks on devrend until authproc writes devdata
-	 * (malloc'd "uri\ncode\n", or nil for EOF) under lk and rwakeup's.
+	 * /auth/device: fsread calls srvrelease then recvp(devchan).
+	 * authproc sends "uri\ncode\n" when the flow starts, nil when done/error.
+	 * Unbuffered so authproc blocks until a reader is waiting.
 	 */
 	int   authstatus;    /* 0=logged_out 1=pending 2=logged_in */
 	char  authdev[128];  /* user code, e.g. "ABCD-1234" */
@@ -130,11 +115,7 @@ struct AiState {
 	char  autherr[256];  /* last auth error, or "" */
 
 	Channel *loginreqchan;  /* int (1 = start login) */
-
-	Rendez  devrend;
-	char   *devdata;   /* staged "uri\ncode\n" or nil (EOF), set by authproc */
-	int     devready;  /* 1 when devdata is valid and waiting */
-	int     devbusy;   /* 1 while an fsread is sleeping on devrend */
+	Channel *devchan;       /* char* "uri\ncode\n" or nil; unbuffered */
 };
 
 /*
